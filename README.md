@@ -35,6 +35,8 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 target/release/shiinario_engine --project-dir /path/to/game
 # Optional bounded native startup run.
 target/release/shiinario_engine --project-dir /path/to/game --run-for-ms 18000
+# Export runtime-modified SCNs for research; the destination must be new.
+target/release/shiinario_engine --project-dir /path/to/game --scenario-dump /tmp/rio-scn-dump
 
 # Inspect CP932 configuration and list the original archive entries.
 target/release/shiinario_tool inspect --project-dir /path/to/game

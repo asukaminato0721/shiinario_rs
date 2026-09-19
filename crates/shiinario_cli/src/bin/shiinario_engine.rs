@@ -9,6 +9,9 @@ struct Args {
     /// Close after this many milliseconds (native startup smoke test).
     #[arg(long)]
     run_for_ms: Option<u64>,
+    /// Write modified SCN buffers on exit to a new directory outside the game.
+    #[arg(long)]
+    scenario_dump: Option<PathBuf>,
 }
 fn main() -> Result<()> {
     env_logger::init();
@@ -18,6 +21,7 @@ fn main() -> Result<()> {
         &project,
         shiinario_runtime::native::Options {
             run_for: args.run_for_ms.map(std::time::Duration::from_millis),
+            scenario_dump: args.scenario_dump,
         },
     )
 }

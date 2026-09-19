@@ -52,6 +52,9 @@ impl Session {
     pub fn location(&self) -> shiinario_scenario::Location {
         self.vm.location()
     }
+    pub fn scenario_buffers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.vm.scenario_buffers()
+    }
     pub fn digests(&self, mut emit: impl FnMut(&Event) -> Result<()>) -> Result<()> {
         for (name, data) in self.vm.scenario_buffers() {
             emit(&Event::ScenarioDigest {

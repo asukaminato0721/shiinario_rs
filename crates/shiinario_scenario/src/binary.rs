@@ -431,6 +431,7 @@ pub struct BinaryVm {
     message_mode: u32,
     background_mode: u32,
     archive_paths: Vec<String>,
+    text_style: crate::text::TextStyle,
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -482,6 +483,7 @@ impl BinaryVm {
             pending_sizes: None,
             pending_timer: None,
             task_timers: Default::default(),
+            text_style: Default::default(),
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -1841,6 +1843,15 @@ impl BinaryVm {
                 let duration = self.read(&mut cursor)?;
                 let epoch = *self.task_timers.get(&self.current_task).unwrap_or(&0);
                 request = Some(PlatformRequest::WaitTaskTimer { epoch, duration });
+            }
+            0x0084 => {
+                let surface = self.read(&mut cursor)?;
+                ensure!(
+                    surface == u32::MAX,
+                    "text drawing to surfaces is unresolved"
+                );
+                let controls = self.string_bytes(self.read(&mut cursor)?)?;
+                self.text_style = self.text_style.configure(&controls)?;
             }
             0x0547 => {
                 let id = self.read(&mut cursor)?;
@@ -3681,6 +3692,32 @@ mod tests {
             assert_eq!(vm.pc, 0);
             assert_eq!(vm.banks[&12][0], 127);
         }
+    }
+
+    #[test]
+    fn text_color_controls_match_original_without_skipping_unknown_text() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/text-style-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("text.scn", code).unwrap();
+            vm.step().unwrap();
+            assert_eq!(serde_json::json!(vm.text_style.color), case["color"]);
+            assert_eq!(serde_json::json!(vm.text_style.opacity), case["opacity"]);
+            assert_eq!(vm.pc as u64, case["next_offset"].as_u64().unwrap());
+        }
+        let mut args = immediate(u32::MAX);
+        args.extend(b"\x10_c1,2,3_text\0");
+        let mut vm = BinaryVm::new("unknown-text.scn", instruction(0x84, &args)).unwrap();
+        assert!(vm.step().is_err());
+        assert_eq!(vm.pc, 0);
+        assert_eq!(vm.text_style, crate::text::TextStyle::default());
     }
 
     #[test]

@@ -7,10 +7,11 @@ use crate::{
     session::{Host, Session},
     viewport::ViewportTransform,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use shiinario_assets::project::Project;
 use shiinario_scenario::{Event, MouseButtonMapping, PlatformRequest, SoundCommand};
 use std::{
+    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -27,8 +28,28 @@ use winit::{
 pub struct Options {
     /// Optional bounded native smoke run, measured from window creation.
     pub run_for: Option<Duration>,
+    /// Optional new directory outside the installation for modified SCN buffers.
+    pub scenario_dump: Option<PathBuf>,
 }
 pub fn run(project: &Project, options: Options) -> Result<()> {
+    let dump = if let Some(path) = &options.scenario_dump {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(std::path::Path::new("."));
+        let resolved = parent.canonicalize()?.join(
+            path.file_name()
+                .context("dump requires a new directory name")?,
+        );
+        ensure!(
+            !resolved.starts_with(project.root.canonicalize()?),
+            "scenario dump must be outside the game installation"
+        );
+        std::fs::create_dir(&resolved).context("scenario dump directory must not already exist")?;
+        Some(resolved)
+    } else {
+        None
+    };
     let session = Session::new(project, &project.config.startup)?;
     let mut app = App {
         project,
@@ -54,6 +75,15 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
             host.streams_started,
             host.audio.as_ref().map_or(0, AudioOutput::rendered_frames)
         );
+    }
+    if let Some(directory) = dump {
+        use std::io::Write;
+        let mut manifest = std::fs::File::create_new(directory.join("index.txt"))?;
+        for (index, (name, data)) in app.session.scenario_buffers().enumerate() {
+            let filename = format!("{index:03}.scn");
+            std::fs::File::create_new(directory.join(&filename))?.write_all(data)?;
+            writeln!(manifest, "{filename}\t{name}")?;
+        }
     }
     if let Some(error) = app.error {
         return Err(error);
