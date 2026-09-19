@@ -1,11 +1,16 @@
 //! Verified arithmetic subset shared by inline operands and command 03de.
 use anyhow::{Context, Result, bail, ensure};
 
-pub fn evaluate(bytes: &[u8], variable: impl Fn(&[u8]) -> Result<u32>) -> Result<u32> {
+pub enum Variable<'a> {
+    Named(&'a [u8]),
+    Bank { bank: u8, index: u16 },
+}
+
+pub fn evaluate(bytes: &[u8], variable: impl Fn(Variable<'_>) -> Result<u32>) -> Result<u32> {
     Ok(evaluate_real(bytes, variable)? as i64 as u32)
 }
 
-pub fn evaluate_real(bytes: &[u8], variable: impl Fn(&[u8]) -> Result<u32>) -> Result<f64> {
+pub fn evaluate_real(bytes: &[u8], variable: impl Fn(Variable<'_>) -> Result<u32>) -> Result<f64> {
     ensure!(bytes.len() <= 4096, "expression exceeds 4096 bytes");
     let mut parser = Parser {
         bytes,
@@ -26,7 +31,7 @@ struct Parser<'a, F> {
     at: usize,
     variable: F,
 }
-impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
+impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
     fn spaces(&mut self) {
         while self
             .bytes
@@ -81,6 +86,21 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
             })?;
         }
     }
+    fn variable_value(&mut self, variable: Variable<'_>) -> Result<f64> {
+        let value = (self.variable)(variable)?;
+        let value = match self.bytes.get(self.at) {
+            Some(b'i') => {
+                self.at += 1;
+                f64::from(value as i32)
+            }
+            Some(b'f') => {
+                self.at += 1;
+                f64::from(f32::from_bits(value))
+            }
+            _ => f64::from(value),
+        };
+        Self::checked(value)
+    }
     fn atom(&mut self, depth: usize) -> Result<f64> {
         ensure!(depth < 64, "expression nesting exceeds 64");
         self.spaces();
@@ -123,19 +143,32 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
                 );
                 let name = &self.bytes[start..self.at];
                 self.at += 1;
-                let value = (self.variable)(name)?;
-                let value = match self.bytes.get(self.at) {
-                    Some(b'i') => {
-                        self.at += 1;
-                        f64::from(value as i32)
-                    }
-                    Some(b'f') => {
-                        self.at += 1;
-                        f64::from(f32::from_bits(value))
-                    }
-                    _ => f64::from(value),
+                self.variable_value(Variable::Named(name))
+            }
+            b'_' => {
+                self.spaces();
+                let bank = match self.bytes.get(self.at).map(u8::to_ascii_uppercase) {
+                    Some(b'M') => 2,
+                    Some(b'Z') => 8,
+                    Some(b'D') => 10,
+                    Some(b'L') => 12,
+                    Some(b'S') => 14,
+                    _ => bail!("unsupported expression bank"),
                 };
-                Self::checked(value)
+                self.at += 1;
+                let digits = self
+                    .bytes
+                    .get(self.at..self.at + 3)
+                    .context("truncated expression bank index")?;
+                ensure!(
+                    digits.iter().all(u8::is_ascii_digit),
+                    "expression bank index requires three digits"
+                );
+                self.at += 3;
+                let index = digits
+                    .iter()
+                    .fold(0u16, |v, digit| v * 10 + u16::from(digit - b'0'));
+                self.variable_value(Variable::Bank { bank, index })
             }
             b'0'..=b'9' => {
                 let mut value = f64::from(byte - b'0');
@@ -198,6 +231,10 @@ mod tests {
             b"1+",
             b"(1",
             b"9007199254740992+1",
+            b"_Q000",
+            b"_Z0",
+            b"_L00x",
+            b"_D1000",
         ] {
             assert!(evaluate(bytes, |_| bail!("undefined variable")).is_err());
         }

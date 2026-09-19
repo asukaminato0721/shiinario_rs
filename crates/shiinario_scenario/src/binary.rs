@@ -1102,11 +1102,8 @@ impl BinaryVm {
                     .position(|&b| b == 0)
                     .context("unterminated inline expression")?;
                 let bytes = &cursor.data[cursor.pc..cursor.pc + length];
-                let value = crate::expression::evaluate(bytes, |name| {
-                    let address = self.named_address(name)?;
-                    Ok(u32::from_le_bytes(
-                        self.memory_read(address, 4)?.as_slice().try_into()?,
-                    ))
+                let value = crate::expression::evaluate(bytes, |variable| {
+                    self.expression_variable(variable)
                 })?;
                 cursor.pc += length + 1;
                 return Ok(value);
@@ -1168,6 +1165,19 @@ impl BinaryVm {
             bytes.push(byte);
         }
         bail!("unterminated string within 64 KiB cap")
+    }
+    fn expression_variable(&self, variable: crate::expression::Variable<'_>) -> Result<u32> {
+        match variable {
+            crate::expression::Variable::Named(name) => {
+                let address = self.named_address(name)?;
+                Ok(u32::from_le_bytes(
+                    self.memory_read(address, 4)?.as_slice().try_into()?,
+                ))
+            }
+            crate::expression::Variable::Bank { bank, index } => {
+                Ok(self.banks[&bank][self.bank_index(bank, index)?])
+            }
+        }
     }
     fn named_address(&self, name: &[u8]) -> Result<u32> {
         for scope in self.named_scopes.iter().rev() {
@@ -1902,23 +1912,40 @@ impl BinaryVm {
                 );
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0304 => {
+            0x0304 | 0x030a | 0x030c => {
                 let address = self.read(&mut cursor)?;
-                let value = u32::from(self.memory_read(address, 1)?[0]);
+                let offset = if opcode == 0x0304 {
+                    0
+                } else {
+                    self.read(&mut cursor)?
+                };
+                let width = if opcode == 0x030c { 2 } else { 1 };
+                let bytes = self.memory_read(address.wrapping_add(offset), width)?;
+                let value = if width == 1 {
+                    u32::from(bytes[0])
+                } else {
+                    u32::from(u16::from_le_bytes(bytes.try_into().unwrap()))
+                };
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0305 => {
+            0x0305 | 0x030b | 0x030d => {
                 let address = self.read(&mut cursor)?;
-                let value = self.read(&mut cursor)? as u8;
-                memory_write = Some((self.memory_range(address, 1)?, vec![value]));
+                let offset = if opcode == 0x0305 {
+                    0
+                } else {
+                    self.read(&mut cursor)?
+                };
+                let width = if opcode == 0x030d { 2 } else { 1 };
+                let value = self.read(&mut cursor)?;
+                memory_write = Some((
+                    self.memory_range(address.wrapping_add(offset), width)?,
+                    value.to_le_bytes()[..width].to_vec(),
+                ));
             }
             0x03de => {
                 let expression = self.string_bytes(self.read(&mut cursor)?)?;
-                let value = crate::expression::evaluate_real(&expression, |name| {
-                    let address = self.named_address(name)?;
-                    Ok(u32::from_le_bytes(
-                        self.memory_read(address, 4)?.as_slice().try_into()?,
-                    ))
+                let value = crate::expression::evaluate_real(&expression, |variable| {
+                    self.expression_variable(variable)
                 })?;
                 let mode = cursor.byte()?;
                 let value = if mode == 0 {
@@ -3166,10 +3193,10 @@ mod tests {
             });
             cases.push(code);
         }
-        for opcode in [0x308, 0x309] {
+        for opcode in [0x308, 0x309, 0x30a, 0x30b, 0x30c, 0x30d] {
             let mut code = instruction(opcode, &immediate(0xffff_fffe));
             code.extend(immediate(1));
-            code.extend(if opcode == 0x308 {
+            code.extend(if opcode & 1 == 0 {
                 vec![12, 0, 0]
             } else {
                 immediate(77)
