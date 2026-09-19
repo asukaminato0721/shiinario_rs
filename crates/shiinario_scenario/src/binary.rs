@@ -784,4 +784,52 @@ mod tests {
         assert!(vm.step().unwrap_err().to_string().contains("branch target"));
         assert_eq!(vm.pc, 0);
     }
+
+    #[test]
+    fn heap_memory_is_zeroed_bounded_and_distinct_from_script_addresses() {
+        let mut args = immediate(8);
+        args.extend([12, 0, 0]);
+        let mut code = instruction(0x2bc, &args);
+        code.extend(instruction(0x49d, &[13, 0, 0]));
+        let mut args = vec![12, 0, 0];
+        args.extend(immediate(8));
+        args.extend(immediate(0x12));
+        code.extend(instruction(0x2c7, &args));
+        code.extend(instruction(0x49d, &[13, 0, 0]));
+        let mut vm = BinaryVm::new("heap.scn", code).unwrap();
+        vm.step().unwrap();
+        let address = vm.banks[&12][0];
+        assert!(address >= 0x2000_0000);
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 0);
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 0x12121212);
+        assert!(vm.memory_read(address + 5, 4).is_err());
+        assert!(vm.memory_read(address - 1, 4).is_err());
+        assert!(vm.memory_read(u32::MAX, 4).is_err());
+        assert!(vm.memory_read(address, usize::MAX).is_err());
+    }
+
+    #[test]
+    fn invalid_fill_and_allocation_leave_memory_unchanged() {
+        let mut args = vec![0x4c, 0, 0];
+        args.extend(immediate(4001));
+        args.extend(immediate(0xff));
+        let mut vm = BinaryVm::new("fill.scn", instruction(0x2c7, &args)).unwrap();
+        assert!(vm.step().is_err());
+        assert!(vm.banks[&12].iter().all(|&value| value == 0));
+        assert_eq!(vm.pc, 0);
+        for size in [0, u32::MAX, 16 * 1024 * 1024 + 1] {
+            let mut args = immediate(size);
+            args.extend([12, 0, 0]);
+            let mut vm = BinaryVm::new("allocate.scn", instruction(0x2bc, &args)).unwrap();
+            assert!(vm.step().is_err());
+            assert!(vm.allocations.is_empty());
+            assert_eq!(vm.pc, 0);
+        }
+        let mut vm = BinaryVm::new("return.scn", instruction(0x26c, &[])).unwrap();
+        assert!(vm.step().unwrap_err().to_string().contains("underflow"));
+        assert_eq!(vm.sp, CELLS);
+    }
 }

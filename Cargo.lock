@@ -408,6 +408,7 @@ dependencies = [
  "anyhow",
  "encoding_rs",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
