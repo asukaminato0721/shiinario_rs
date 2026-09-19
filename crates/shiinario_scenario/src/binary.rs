@@ -2029,6 +2029,22 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::LoadAsset { name });
             }
+            0x00d2 => {
+                ensure!(self.best_effort, "save-file writes are unavailable");
+                // 424793 reads data pointer, length, path; 405ba0 writes the
+                // file. The dispatcher discards its result (no destination).
+                let address = self.read(&mut cursor)?;
+                let length = self.read(&mut cursor)?;
+                let name = self.string(self.read(&mut cursor)?)?;
+                self.memory_range(address, length as usize)?;
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: format!(
+                        "file write {name:?} ({length} bytes) omitted; no save was created"
+                    ),
+                };
+            }
             0x00dd => {
                 ensure!(
                     self.archive_paths.len() < 256,
@@ -2229,7 +2245,7 @@ impl BinaryVm {
                 if opcode == 0x00b4 {
                     ensure!(
                         values[0] == u32::MAX || self.best_effort,
-                        "original image text rasterization is unresolved; use best-effort playback for native alpha blending"
+                        "original text rasterization into image frames is unresolved; use best-effort playback for native alpha blending"
                     );
                     self.text_image = values;
                     if values[0] != u32::MAX {
@@ -3166,6 +3182,37 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn omitted_file_write_validates_buffer_and_preserves_following_instruction() {
+        let mut operands = vec![0x84];
+        operands.extend(128u32.to_le_bytes());
+        operands.extend(immediate(4));
+        operands.extend(b"\x10fixture.dat\0");
+        let mut code = instruction(0xd2, &operands);
+        code.extend(instruction(0x49d, &immediate(11)));
+        code.resize(132, 7);
+        assert!(
+            BinaryVm::new("strict.scn", code.clone())
+                .unwrap()
+                .step()
+                .is_err()
+        );
+        let mut vm = BinaryVm::new("write.scn", code.clone()).unwrap();
+        vm.set_best_effort(true);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::CompatibilitySkip { opcode: 0xd2, .. }
+        ));
+        assert_eq!(vm.data, code);
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 11);
+        code.truncate(131);
+        let mut vm = BinaryVm::new("short.scn", code).unwrap();
+        vm.set_best_effort(true);
+        assert!(vm.step().is_err());
+        assert_eq!(vm.pc, 0);
     }
 
     #[test]
