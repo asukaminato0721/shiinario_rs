@@ -443,6 +443,9 @@ pub struct BinaryVm {
     background_mode: u32,
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
+    best_effort: bool,
+    text_image: [u32; 2],
+    text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the default text context.
     text_cursor: [u32; 3],
     text_layout: crate::text_layout::TextLayout,
@@ -500,6 +503,9 @@ impl BinaryVm {
             pending_timer: None,
             task_timers: Default::default(),
             text_style: Default::default(),
+            best_effort: false,
+            text_image: [u32::MAX, 0],
+            text_image_offset: [0; 2],
             text_cursor: [0; 3],
             text_layout: crate::text_layout::TextLayout::new([0; 3]),
             async_text: None,
@@ -512,6 +518,11 @@ impl BinaryVm {
     }
     pub fn current_task(&self) -> u32 {
         self.current_task
+    }
+    /// Permit only explicitly identified presentation omissions. Unknown operand
+    /// boundaries and control-flow operations still fail.
+    pub fn set_best_effort(&mut self, enabled: bool) {
+        self.best_effort = enabled;
     }
     /// Number of instructions per native dispatcher invocation (INI Turbo).
     pub fn set_dispatch_quantum(&mut self, value: u32) -> Result<()> {
@@ -1913,6 +1924,28 @@ impl BinaryVm {
                 let duration = self.read(&mut cursor)?;
                 let epoch = *self.task_timers.get(&self.current_task).unwrap_or(&0);
                 request = Some(PlatformRequest::WaitTaskTimer { epoch, duration });
+            }
+            0x00b4 | 0x00b6 => {
+                let values = [self.read(&mut cursor)?, self.read(&mut cursor)?];
+                if opcode == 0x00b4 {
+                    ensure!(values[0] == u32::MAX || self.best_effort,
+                        "text drawing into image frames is unresolved; use best-effort playback to omit it");
+                    self.text_image = values;
+                    if values[0] != u32::MAX {
+                        event = Event::CompatibilitySkip {
+                            location: location.clone(), opcode,
+                            detail: format!("text pixels in image {} frame {} omitted; text layout still executes", values[0], values[1]),
+                        };
+                    }
+                } else {
+                    self.text_image_offset = values;
+                }
+            }
+            0x00b5 | 0x00b7 => {
+                let values = if opcode == 0x00b5 { self.text_image } else { self.text_image_offset };
+                for value in values {
+                    writes.push((self.destination(&mut cursor)?, value));
+                }
             }
             0x0078 | 0x007a => {
                 let x = self.read(&mut cursor)?;

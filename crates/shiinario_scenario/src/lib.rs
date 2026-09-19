@@ -1,5 +1,5 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
-//! are distinct formats; unknown instructions are never treated as no-ops.
+//! are distinct formats. Compatibility omissions are explicit events.
 mod binary;
 mod expression;
 mod format;
@@ -160,6 +160,11 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
+    CompatibilitySkip {
+        location: Location,
+        opcode: u16,
+        detail: String,
+    },
     /// Host poll between scheduler passes or priority-task dispatches.
     SchedulerPoll,
     /// One asynchronous text scheduler pass, after its input/drawing replies.

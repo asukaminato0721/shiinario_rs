@@ -199,11 +199,14 @@ impl BinaryVm {
                     let position = layout.place(glyph, next,
                         [self.text_style.half_advance,self.text_style.full_advance],
                         self.text_style.line_advance,self.text_style.line_limit,&self.text_style.punctuation)?;
-                    if surface == u32::MAX {
+                    if surface == u32::MAX || self.text_image[0] != u32::MAX {
+                        let timed = text.timed;
                         self.text_cursor = layout.cursor;
                         self.text_layout = layout;
                         self.async_text.as_mut().unwrap().offset += consumed;
-                        self.async_text.as_mut().unwrap().phase = TextPhase::Process;
+                        self.async_text.as_mut().unwrap().phase = if timed && self.text_style.character_delay != 0 {
+                            TextPhase::Finish(false)
+                        } else { TextPhase::Process };
                         continue;
                     }
                     let text = self.async_text.as_mut().unwrap();

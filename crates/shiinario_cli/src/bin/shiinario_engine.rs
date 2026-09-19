@@ -6,6 +6,9 @@ use std::path::PathBuf;
 struct Args {
     #[arg(long)]
     project_dir: PathBuf,
+    /// Stop at known presentation omissions instead of printing SKIP and continuing.
+    #[arg(long)]
+    strict: bool,
     /// Close after this many milliseconds (native startup smoke test).
     #[arg(long)]
     run_for_ms: Option<u64>,
@@ -20,6 +23,7 @@ fn main() -> Result<()> {
     shiinario_runtime::native::run(
         &project,
         shiinario_runtime::native::Options {
+            strict: args.strict,
             run_for: args.run_for_ms.map(std::time::Duration::from_millis),
             scenario_dump: args.scenario_dump,
         },

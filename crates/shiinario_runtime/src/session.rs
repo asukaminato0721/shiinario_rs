@@ -26,6 +26,9 @@ pub struct Session {
     resources: Resources,
 }
 impl Session {
+    pub fn set_best_effort(&mut self, enabled: bool) {
+        self.vm.set_best_effort(enabled);
+    }
     pub fn new(project: &Project, name: &str) -> Result<Self> {
         let mut vm = BinaryVm::new(name, project.read(name)?)?;
         vm.set_viewport(project.config.width, project.config.height)?;
