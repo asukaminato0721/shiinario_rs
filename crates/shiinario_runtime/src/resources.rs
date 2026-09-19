@@ -987,14 +987,22 @@ mod tests {
         use shiinario_scenario::SurfacePoint;
         let mut resources = Resources::default();
         resources.create_surface(2, 2, 2, 0).unwrap();
-        resources.surfaces[&2].pixels.write(0, &[1, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12, 99, 99]).unwrap();
+        resources.surfaces[&2]
+            .pixels
+            .write(0, &[1, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12, 99, 99])
+            .unwrap();
         resources.create_image(30, 2, 2, 4, 1).unwrap();
         let operation = SurfaceCapture {
-            image: 30, frame: 0, destination: [-1, 0], size: [3, 3],
+            image: 30,
+            frame: 0,
+            destination: [-1, 0],
+            size: [3, 3],
             source: SurfacePoint { id: 2, x: 0, y: -1 },
         };
         resources.capture_surface(&operation).unwrap();
-        let Image::Mutable { frames, .. } = &resources.images[&30] else { panic!() };
+        let Image::Mutable { frames, .. } = &resources.images[&30] else {
+            panic!()
+        };
         assert_eq!(&frames[0].rgba[8..12], &[6, 5, 4, 255]);
         assert_eq!(&frames[0].rgba[..8], &[0; 8]);
         assert_eq!(&frames[0].rgba[12..], &[0; 4]);

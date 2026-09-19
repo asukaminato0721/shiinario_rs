@@ -1,21 +1,19 @@
 # shiinario_rs
 
 An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
-**This is not yet a playable port.** The Linux winit/wgpu host now displays the
-800×600 title screen and starts its music through CPAL. The captured native title
-pixels exactly match the original x86 renderer's BGR hash. Title-menu hover now
-runs with static sound-buffer playback. Clicking the first item advances through
-cleanup and scene replacement into `t\_MAI.SCN`, loads its story file and enters
-the transition library. Mask transitions, cleanup and text-style initialization
-now execute. Further canvas clicks reach asynchronous text output `0x0083`,
-`start.SCN:0x61ec6`, which remains unresolved. Menu completion, dialogue, choices,
-movies and saves remain unfinished.
+**Full-route gameplay is not complete yet.** The Linux winit/wgpu host displays
+an 800×600 title screen, plays music and effects through CPAL, and enters the story
+with Japanese text and transitions. The title pixels match the original x86 renderer.
+Native and headless hosts share the same interpreter and resources. Native text uses
+Fontconfig and an installed Japanese font; the fallback glyphs differ from Windows.
+Movies, complete menu/choice coverage and compatible saves remain unfinished.
 
-The simulated startup/title trace passes 20,000 instructions against captured x86:
-instruction/poll order, all final SCN hashes, input replies, frame bounds and title
-buffer hashes match. Native and headless hosts share the same interpreter and
-resource handling. Unknown operations always stop execution. Assets are verified
-against GARbro; original game files remain unchanged.
+Native playback defaults to best effort: identified optional presentation operations
+print `SKIP` with their scenario location. Currently this omits text drawn into image
+frames and affine image transforms, and applies audio fades immediately. Use `--strict` to reject these approximations.
+Other unknown commands still stop with context because their operands and control-flow
+effects are not known. Headless traces require explicit `--best-effort` for these omissions.
+Assets are verified against GARbro and original game files remain unchanged.
 
 The workspace builds independently of the reference checkouts. On Linux, CPAL
 requires ALSA development headers and pkg-config:
@@ -56,12 +54,20 @@ target/release/shiinario_tool dump --project-dir /path/to/game A001.TXT
 target/release/shiinario_tool dump --project-dir /path/to/game START.SCN
 target/release/shiinario_tool inventory --project-dir /path/to/game
 
-# Research traces for the verified SCN/TXT subsets. Unknown operations stop execution.
+# Research traces for the recovered SCN/TXT subsets.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-steps 10000
 # Explicit simulated Windows replies, logged in the output; this does not display a game window.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 16 --max-steps 40000
 target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
+# Deterministic input replay with compact counts and explicit compatibility omissions.
+target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --best-effort --summary
 ```
+
+Replay input is a JSON array of frames with strictly increasing `at_ms`, logical
+`cursor: [x, y]`, optional `mouse_buttons` (left/right/middle bits), `keys` (Windows
+virtual-key numbers), and `control_mask` (`256` holds the engine's skip control).
+State persists until the next frame. Exhausting the instruction budget is a failure,
+not evidence that a story route ended.
 
 Extraction writes only to the explicitly provided output path. Reading, inspecting,
 verifying, and tracing do not write to the installation. Keep extracted assets and

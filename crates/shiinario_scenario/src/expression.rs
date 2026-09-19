@@ -71,13 +71,21 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
         loop {
             self.spaces();
             let op = self.bytes.get(self.at).copied();
-            if !matches!(op, Some(b'*' | b'/' | b'|')) {
+            if !matches!(op, Some(b'*' | b'/' | b'|' | b'%')) {
                 return Ok(value);
             }
             self.at += 1;
             let rhs = self.atom(depth)?;
             value = Self::checked(if op == Some(b'|') {
                 f64::from((value as i64 as i32) | (rhs as i64 as i32))
+            } else if op == Some(b'%') {
+                let divisor = rhs as i64 as i32;
+                ensure!(divisor != 0, "expression remainder by zero");
+                f64::from(
+                    (value as i64 as i32)
+                        .checked_rem(divisor)
+                        .context("expression remainder overflow")?,
+                )
             } else if op == Some(b'*') {
                 value * rhs
             } else {
@@ -224,7 +232,9 @@ mod tests {
         for bytes in [
             b"".as_slice(),
             b"1/0",
-            b"1%2",
+            b"1%0",
+            b"1%0.5",
+            b"(-2147483648)%-1",
             b"{array[1]}",
             b"{missing}",
             b"1=2",

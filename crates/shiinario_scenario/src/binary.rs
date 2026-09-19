@@ -1582,6 +1582,23 @@ impl BinaryVm {
                     flags,
                 }));
             }
+            0x0574 => {
+                // Original 4193e0 reads 19 numeric operands before performing
+                // an affine transform between mutable image frames.
+                ensure!(
+                    self.best_effort,
+                    "image affine transform is unresolved; use best-effort playback to omit it"
+                );
+                let mut arguments = [0u32; 19];
+                for value in &mut arguments {
+                    *value = self.read(&mut cursor)?;
+                }
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: format!("image affine transform omitted; arguments={arguments:?}"),
+                };
+            }
             0x055e => {
                 let image = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
