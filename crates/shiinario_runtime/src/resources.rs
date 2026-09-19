@@ -1,7 +1,7 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
 use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
-use shiinario_scenario::{PlatformRequest, SharedMemory};
+use shiinario_scenario::{ImageDraw, PlatformRequest, SharedMemory, SurfaceBlend};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -130,7 +130,7 @@ impl Resources {
         let bytes = surface.pixels.read(0, surface.pixels.len()).ok()?;
         let mut rgba = Vec::with_capacity(surface.width as usize * surface.height as usize * 4);
         for row in bytes.chunks_exact(surface.stride) {
-            for bgr in row[..surface.width as usize * 3].chunks_exact(3) {
+            for bgr in row[..surface.width as usize * 3].as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[bgr[2], bgr[1], bgr[0], 255]);
             }
         }
@@ -244,6 +244,211 @@ impl Resources {
     }
     pub fn resident_bytes(&self) -> usize {
         self.resident
+    }
+    pub fn image_bounds(&self, id: u32, index: u32) -> Result<[i32; 4]> {
+        let (x, y, width, height) =
+            match self.images.get(&id).context("image slot is not loaded")? {
+                Image::Encoded(bytes) => {
+                    let frames = image::frames(bytes)?;
+                    let info = frames
+                        .iter()
+                        .find(|f| f.index == index as usize)
+                        .context("image frame not present")?;
+                    (info.x, info.y, info.width, info.height)
+                }
+                Image::Mutable { frames, .. } => {
+                    let surface = frames
+                        .get(index as usize)
+                        .context("image frame not present")?;
+                    (0, 0, surface.width, surface.height)
+                }
+            };
+        Ok([
+            x,
+            y,
+            x.wrapping_add(width as i32),
+            y.wrapping_add(height as i32),
+        ])
+    }
+    fn hit_test_images(&self, x: i32, y: i32, items: &[ImageDraw]) -> Result<u32> {
+        // Highest layer and latest entry win. Unlike painting, the native hit
+        // tester includes disabled items and the maximum layer sentinel.
+        let mut ordered: Vec<_> = items.iter().rev().collect();
+        ordered.sort_by_key(|item| std::cmp::Reverse(item.layer));
+        for item in ordered {
+            let present = match self.images.get(&item.image) {
+                None => false,
+                Some(Image::Encoded(bytes)) => image::frames(bytes)?
+                    .iter()
+                    .any(|f| f.index == item.frame as usize),
+                Some(Image::Mutable { frames, .. }) => (item.frame as usize) < frames.len(),
+            };
+            if !present {
+                // The original aborts this search at a missing image/frame.
+                return Ok(u32::MAX);
+            }
+            let [left, top, right, bottom] = self.image_bounds(item.image, item.frame)?;
+            let left = left.wrapping_add(item.x);
+            let top = top.wrapping_add(item.y);
+            let right = right.wrapping_add(item.x);
+            let bottom = bottom.wrapping_add(item.y);
+            if x < left || x >= right || y < top || y >= bottom {
+                continue;
+            }
+            let hit = match &self.images[&item.image] {
+                Image::Encoded(bytes) => image::hit_test(
+                    bytes,
+                    item.frame as usize,
+                    x.wrapping_sub(left) as u32,
+                    y.wrapping_sub(top) as u32,
+                )?,
+                Image::Mutable { .. } => true,
+            };
+            if hit {
+                return Ok(item.extra[0]);
+            }
+        }
+        Ok(u32::MAX)
+    }
+    fn draw_images(&mut self, id: u32, items: &[ImageDraw]) -> Result<()> {
+        let destination = self
+            .surfaces
+            .get(&id)
+            .context("drawing surface is not allocated")?;
+        let mut ordered: Vec<_> = items
+            .iter()
+            .filter(|item| item.flags & 0x8000_0000 != 0 && item.layer != u32::MAX)
+            .collect();
+        ordered.sort_by_key(|item| item.layer);
+        // Work in a private copy so a malformed later item cannot partially draw.
+        let mut pixels = destination.pixels.read(0, destination.pixels.len())?;
+        for item in ordered {
+            ensure!(
+                item.flags == 0x8000_0000 && item.extra[1] == 0,
+                "unsupported image drawing flags or extra operands"
+            );
+            let exists = match self
+                .images
+                .get(&item.image)
+                .context("draw image slot is not loaded")?
+            {
+                Image::Encoded(bytes) => image::frames(bytes)?
+                    .iter()
+                    .any(|f| f.index == item.frame as usize),
+                Image::Mutable { frames, .. } => (item.frame as usize) < frames.len(),
+            };
+            if !exists {
+                continue;
+            }
+            let frame = self.frame(item.image, item.frame as usize)?;
+            let left = i64::from(item.x) + i64::from(frame.x);
+            let top = i64::from(item.y) + i64::from(frame.y);
+            let right = (left + i64::from(frame.surface.width)).min(i64::from(destination.width));
+            let bottom = (top + i64::from(frame.surface.height)).min(i64::from(destination.height));
+            for y in top.max(0)..bottom {
+                for x in left.max(0)..right {
+                    let src = ((y - top) as usize * frame.surface.width as usize
+                        + (x - left) as usize)
+                        * 4;
+                    let rgba = &frame.surface.rgba[src..src + 4];
+                    let dst = y as usize * destination.stride + x as usize * 3;
+                    let alpha = i32::from(rgba[3]);
+                    for channel in 0..3 {
+                        let source = rgba[2 - channel];
+                        let old = pixels[dst + channel];
+                        pixels[dst + channel] = if alpha == 255 {
+                            source
+                        } else {
+                            (i32::from(old) + (((i32::from(source) - i32::from(old)) * alpha) >> 8))
+                                as u8
+                        };
+                    }
+                }
+            }
+        }
+        destination.pixels.write(0, &pixels)
+    }
+    fn blend_surfaces(&mut self, blend: &SurfaceBlend) -> Result<()> {
+        let destination = self
+            .surfaces
+            .get(&blend.destination.id)
+            .context("blend destination is not allocated")?;
+        let [width, height] = blend.size;
+        ensure!(width >= 0 && height >= 0, "negative blend dimensions");
+        let [a, b] = blend.weights;
+        ensure!(a <= 65535 && b <= 65535, "unsupported blend weights");
+        let right = blend
+            .destination
+            .x
+            .checked_add(width)
+            .context("blend rectangle overflow")?;
+        let bottom = blend
+            .destination
+            .y
+            .checked_add(height)
+            .context("blend rectangle overflow")?;
+        let left = blend.destination.x.max(0).min(destination.width as i32);
+        let top = blend.destination.y.max(0).min(destination.height as i32);
+        let right = right.max(0).min(destination.width as i32);
+        let bottom = bottom.max(0).min(destination.height as i32);
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let width = (right - left) as usize;
+        let height = (bottom - top) as usize;
+        let mut sources = Vec::with_capacity(2);
+        for point in &blend.sources {
+            let source = self
+                .surfaces
+                .get(&point.id)
+                .context("blend source is not allocated")?;
+            // The native helper uses the destination's row stride for all inputs.
+            ensure!(
+                source.stride == destination.stride,
+                "unsupported differing blend strides"
+            );
+            let x = i64::from(point.x) + i64::from(left) - i64::from(blend.destination.x);
+            let y = i64::from(point.y) + i64::from(top) - i64::from(blend.destination.y);
+            ensure!(
+                x >= 0
+                    && y >= 0
+                    && x + width as i64 <= i64::from(source.width)
+                    && y + height as i64 <= i64::from(source.height),
+                "blend source rectangle outside surface"
+            );
+            ensure!(
+                point.id != blend.destination.id || (x == i64::from(left) && y == i64::from(top)),
+                "unsupported overlapping blend rectangles"
+            );
+            sources.push((source, x as usize, y as usize));
+        }
+        let total = a + b;
+        if total == 0 {
+            return Ok(());
+        }
+        let bias = (total - 1) / 2;
+        for row in 0..height {
+            let read = |(surface, x, y): &(&DrawingSurface, usize, usize)| {
+                surface
+                    .pixels
+                    .read((y + row) * surface.stride + x * 3, width * 3)
+            };
+            let first = read(&sources[0])?;
+            let second = read(&sources[1])?;
+            let pixels: Vec<_> = first
+                .iter()
+                .zip(second)
+                .map(|(&x, y)| {
+                    (((u32::from(x) * a + bias) / total) + ((u32::from(y) * b + bias) / total))
+                        as u8
+                })
+                .collect();
+            destination.pixels.write(
+                (top as usize + row) * destination.stride + left as usize * 3,
+                &pixels,
+            )?;
+        }
+        Ok(())
     }
     fn fill_surface(
         &mut self,
@@ -447,6 +652,11 @@ impl Resources {
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         match request {
+            PlatformRequest::HitTestImages { x, y, items } => {
+                return Ok(Some(self.hit_test_images(*x, *y, items)?));
+            }
+            PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
+            PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
             }
@@ -489,6 +699,156 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hit_testing_matches_original_rle_methods_layers_and_disabled_items() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/validation/hit-test-probe.json"))
+                .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut resources = Resources::default();
+            resources.load_image(30, decode(&fixture["s25"])).unwrap();
+            let mut vm = BinaryVm::new("hit.scn", decode(&case["code"])).unwrap();
+            loop {
+                if let Event::Platform {
+                    request: PlatformRequest::HitTestImages { x, y, items },
+                    ..
+                } = vm.step().unwrap()
+                {
+                    let hit = resources.hit_test_images(x, y, &items).unwrap();
+                    assert_eq!(serde_json::json!(hit), case["result"]);
+                    vm.respond(hit).unwrap();
+                    assert_eq!(
+                        vm.location().offset,
+                        case["next_offset"].as_u64().unwrap() as usize
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    #[test]
+    fn image_bounds_match_original_signed_offsets_and_missing_frames() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/image-bounds-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut resources = Resources::default();
+            resources.load_image(30, decode(&case["s25"])).unwrap();
+            let index = case["index"].as_u64().unwrap() as u32;
+            let bounds = resources.image_bounds(30, index);
+            if case["status"] == 2 {
+                assert!(bounds.is_err());
+                continue;
+            }
+            let bounds = bounds.unwrap();
+            assert_eq!(serde_json::json!(bounds), case["bounds"]);
+            let mut code = decode(&case["code"]);
+            for index in 0..4u16 {
+                code.extend([0x9d, 4, 12]);
+                code.extend(index.to_le_bytes());
+            }
+            let mut vm = BinaryVm::new("bounds.scn", code).unwrap();
+            assert!(vm.respond_image_bounds(bounds).is_err());
+            let event = vm.step().unwrap();
+            assert!(matches!(
+                event,
+                Event::Platform {
+                    request: PlatformRequest::ImageBounds { id: 30, frame: 0 },
+                    ..
+                }
+            ));
+            assert!(vm.respond(1).is_err());
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond_image_bounds(bounds).unwrap();
+            assert_eq!(
+                vm.location().offset,
+                case["next_offset"].as_u64().unwrap() as usize
+            );
+            assert!(vm.respond_image_bounds(bounds).is_err());
+            for edge in bounds {
+                assert!(
+                    matches!(vm.step().unwrap(), Event::MouseButtonMapping { value, .. } if value == edge as u32)
+                );
+            }
+        }
+    }
+    #[test]
+    fn draw_list_matches_original_s25_alpha_clipping_and_layer_order() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/draw-list-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut vm = BinaryVm::new("draw.scn", decode(&case["code"])).unwrap();
+            let mut resources = Resources::default();
+            resources.create_surface(3, 8, 4, 0).unwrap();
+            resources.load_image(30, decode(&fixture["s25"])).unwrap();
+            let memory = resources.surface_memory(3).unwrap();
+            memory.write(0, &decode(&case["initial"])).unwrap();
+            for state in case["states"].as_array().unwrap() {
+                if let Event::Platform {
+                    request: PlatformRequest::DrawImages { id, items },
+                    ..
+                } = vm.step().unwrap()
+                {
+                    let native_items: Vec<_> = items
+                        .iter()
+                        .map(|i| {
+                            [
+                                i.image, i.frame, i.flags, i.layer, i.x as u32, i.y as u32,
+                                i.extra[0], i.extra[1],
+                            ]
+                        })
+                        .collect();
+                    assert_eq!(serde_json::json!(native_items), state["items"]);
+                    resources.draw_images(id, &items).unwrap();
+                    vm.respond(1).unwrap();
+                    // A later invalid item must not leave an earlier item drawn.
+                    let before = memory.read(0, memory.len()).unwrap();
+                    let mut bad = items.clone();
+                    let mut last = items[0].clone();
+                    last.flags = 0x8000_0001;
+                    last.layer = u32::MAX - 1;
+                    bad.push(last);
+                    assert!(resources.draw_images(id, &bad).is_err());
+                    assert_eq!(memory.read(0, memory.len()).unwrap(), before);
+                }
+                assert_eq!(
+                    vm.location().offset,
+                    state["offset"].as_u64().unwrap() as usize
+                );
+                assert_eq!(
+                    memory.read(0, memory.len()).unwrap(),
+                    decode(&state["pixels"])
+                );
+            }
+        }
+    }
     #[test]
     fn audio_stream_creation_matches_original_and_preserves_budget_on_failure() {
         use shiinario_scenario::{BinaryVm, Event};
@@ -820,6 +1180,76 @@ mod tests {
             resources.surface(2).unwrap().rgba,
             [0, 0, 0, 255, 0, 0, 0, 255]
         );
+    }
+    #[test]
+    fn weighted_blend_matches_original_pixels_clipping_and_operand_order() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/surface-blend-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut resources = Resources::default();
+            for (index, id) in [0, 3, 11].into_iter().enumerate() {
+                resources.create_surface(id, 8, 4, 0).unwrap();
+                resources
+                    .surface_memory(id)
+                    .unwrap()
+                    .write(0, &decode(&fixture["initial"][index]))
+                    .unwrap();
+            }
+            let mut vm = BinaryVm::new("blend.scn", decode(&case["code"])).unwrap();
+            let Event::Platform {
+                request: PlatformRequest::BlendSurfaces(blend),
+                ..
+            } = vm.step().unwrap()
+            else {
+                panic!("expected blend");
+            };
+            resources.blend_surfaces(&blend).unwrap();
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+            assert_eq!(
+                resources.surface_memory(0).unwrap().read(0, 96).unwrap(),
+                decode(&case["pixels"]),
+                "{:?}",
+                case["args"]
+            );
+        }
+        let mut resources = Resources::default();
+        resources.create_surface(0, 8, 4, 0).unwrap();
+        resources.create_surface(3, 8, 4, 0).unwrap();
+        let point = shiinario_scenario::SurfacePoint { id: 0, x: 0, y: 0 };
+        let mut blend = SurfaceBlend {
+            destination: point.clone(),
+            sources: [point.clone(), point],
+            size: [8, 4],
+            weights: [1, 1],
+        };
+        resources
+            .fill_surface(0, [0, 0, 8, 4], [255, 127, 3])
+            .unwrap();
+        // Same-coordinate in-place blends are defined; shifted aliasing is not.
+        resources.blend_surfaces(&blend).unwrap();
+        let previous = resources.surface(0).unwrap();
+        blend.size = [7, 4];
+        blend.sources[0].x = 1;
+        assert!(resources.blend_surfaces(&blend).is_err());
+        assert_eq!(resources.surface(0).unwrap(), previous);
+        blend.sources[0].id = 3;
+        blend.sources[0].x = 8;
+        assert!(resources.blend_surfaces(&blend).is_err());
+        assert_eq!(resources.surface(0).unwrap(), previous);
     }
     #[test]
     fn invalid_image_does_not_replace_an_existing_slot() {

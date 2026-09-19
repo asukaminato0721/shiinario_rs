@@ -19,9 +19,52 @@ impl MouseButtonMapping {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfacePoint {
+    pub id: u32,
+    pub x: i32,
+    pub y: i32,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceBlend {
+    pub destination: SurfacePoint,
+    pub sources: [SurfacePoint; 2],
+    pub size: [i32; 2],
+    pub weights: [u32; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageDraw {
+    pub image: u32,
+    pub frame: u32,
+    pub flags: u32,
+    pub layer: u32,
+    pub x: i32,
+    pub y: i32,
+    pub extra: [u32; 2],
+}
+
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    HitTestImages {
+        x: i32,
+        y: i32,
+        items: Vec<ImageDraw>,
+    },
+    ImageBounds {
+        id: u32,
+        frame: u32,
+    },
+    DrawImages {
+        id: u32,
+        items: Vec<ImageDraw>,
+    },
+    /// Logical left/top/right/bottom; request repaint without clearing.
+    InvalidateRect {
+        rect: [i32; 4],
+    },
+    BlendSurfaces(SurfaceBlend),
     SurfacePixels {
         id: u32,
     },
@@ -176,6 +219,7 @@ struct TaskState {
     stack: Vec<u32>,
     locals: Vec<u32>,
     scopes: Vec<NamedScope>,
+    parameters: Vec<u32>,
 }
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
@@ -187,6 +231,7 @@ impl TaskState {
             stack: vec![0; CELLS],
             locals: vec![0; CELLS],
             scopes: Vec::new(),
+            parameters: Vec::new(),
         }
     }
     fn bank(&self, tag: u8) -> &[u32] {
@@ -287,6 +332,7 @@ pub struct BinaryVm {
     sp: usize,
     thread_limit: u32,
     thread_limit_override: u32,
+    draw_list: Vec<ImageDraw>,
     file_read_marker: u32,
     file_write_marker: u32,
     input_latches: [u32; 2],
@@ -308,10 +354,12 @@ pub struct BinaryVm {
     callback_tasks: std::collections::BTreeMap<u16, u32>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
+    parameters: Vec<u32>,
     registry_root: u32,
     registry_path: String,
     ini_path: String,
     pending_bytes: Option<u32>,
+    pending_bounds: Option<[Destination; 4]>,
     context_flags: u32,
     message_mode: u32,
     background_mode: u32,
@@ -337,6 +385,7 @@ impl BinaryVm {
             sp: CELLS,
             thread_limit: 1,
             thread_limit_override: 0,
+            draw_list: Vec::new(),
             file_read_marker: 0,
             file_write_marker: 0,
             input_latches: [0; 2],
@@ -357,10 +406,12 @@ impl BinaryVm {
             callback_tasks: Default::default(),
             ended: false,
             named_scopes: Vec::new(),
+            parameters: Vec::new(),
             registry_root: 0,
             registry_path: String::new(),
             ini_path: String::new(),
             pending_bytes: None,
+            pending_bounds: None,
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -416,6 +467,7 @@ impl BinaryVm {
             stack: std::mem::replace(self.banks.get_mut(&8).unwrap(), task.stack),
             locals: std::mem::replace(self.banks.get_mut(&12).unwrap(), task.locals),
             scopes: std::mem::replace(&mut self.named_scopes, task.scopes),
+            parameters: std::mem::replace(&mut self.parameters, task.parameters),
         };
         self.tasks.insert(self.current_task, old);
         self.switch_scenario(task.base);
@@ -508,6 +560,10 @@ impl BinaryVm {
     /// response return the same request, without executing the next instruction.
     pub fn respond(&mut self, value: u32) -> Result<()> {
         ensure!(
+            self.pending_bounds.is_none(),
+            "platform request requires image bounds"
+        );
+        ensure!(
             self.pending_bytes.is_none(),
             "platform request requires a byte-string reply"
         );
@@ -583,10 +639,9 @@ impl BinaryVm {
             request: PlatformRequest::CreateSurface { id, .. },
             ..
         } = event
+            && let Some(base) = self.surface_regions.remove(&id)
         {
-            if let Some(base) = self.surface_regions.remove(&id) {
-                self.shared_regions.remove(&base);
-            }
+            self.shared_regions.remove(&base);
         }
         Ok(())
     }
@@ -766,6 +821,18 @@ impl BinaryVm {
         self.pending = None;
         Ok(())
     }
+    /// Complete a frame metadata query with signed left/top/right/bottom edges.
+    pub fn respond_image_bounds(&mut self, bounds: [i32; 4]) -> Result<()> {
+        let destinations = self
+            .pending_bounds
+            .take()
+            .context("no pending image bounds query")?;
+        for (destination, value) in destinations.into_iter().zip(bounds) {
+            self.write(destination, value as u32);
+        }
+        self.pending = None;
+        Ok(())
+    }
     fn destination(&self, cursor: &mut Cursor<'_>) -> Result<Destination> {
         let tag = cursor.byte()?;
         match tag & 0x7f {
@@ -810,20 +877,26 @@ impl BinaryVm {
         let start = cursor.pc;
         let tag = cursor.byte()?;
         if tag & 0x40 != 0 {
-            return match tag & 0x3f {
-                4 => Ok(self.script_base.wrapping_add(cursor.dword()?)),
-                bank @ (2 | 6 | 8 | 10 | 12 | 14) => {
-                    let index = usize::from(cursor.word()?) + if bank == 8 { self.sp } else { 0 };
-                    // Taking the address of the empty stack's end is valid;
-                    // dereferencing it still requires an in-bounds memory range.
-                    ensure!(index <= CELLS, "bank address index {index} out of bounds");
-                    Ok(task_bank_base(self.current_task, bank)
-                        + (index * if bank == 6 { 1 } else { 4 }) as u32)
-                }
-                0x12 => self.named_address(&cursor.variable_name()?),
-                _ => bail!("unsupported address operand tag {tag:#04x} at {start:#x}"),
-            };
+            return self.operand_address(tag, cursor);
         }
+        self.read_value(tag, start, cursor)
+    }
+    fn operand_address(&self, tag: u8, cursor: &mut Cursor<'_>) -> Result<u32> {
+        match tag & 0x3f {
+            4 => Ok(self.script_base.wrapping_add(cursor.dword()?)),
+            bank @ (2 | 6 | 8 | 10 | 12 | 14) => {
+                let index = usize::from(cursor.word()?) + if bank == 8 { self.sp } else { 0 };
+                // Taking the address of the empty stack's end is valid;
+                // dereferencing it still requires an in-bounds memory range.
+                ensure!(index <= CELLS, "bank address index {index} out of bounds");
+                Ok(task_bank_base(self.current_task, bank)
+                    + (index * if bank == 6 { 1 } else { 4 }) as u32)
+            }
+            0x12 => self.named_address(&cursor.variable_name()?),
+            _ => bail!("unsupported address operand tag {tag:#04x}"),
+        }
+    }
+    fn read_value(&self, tag: u8, start: usize, cursor: &mut Cursor<'_>) -> Result<u32> {
         let value = match tag & 0x7f {
             4 => cursor.dword()?,
             bank @ (2 | 6 | 8 | 10 | 12 | 14) => {
@@ -836,6 +909,21 @@ impl BinaryVm {
                 *self.banks[&bank].get(index).with_context(|| {
                     format!("operand bank {bank:#x} index {index} out of bounds")
                 })?
+            }
+            0x11 if tag == 0x11 => {
+                let length = cursor.data[cursor.pc..]
+                    .iter()
+                    .position(|&b| b == 0)
+                    .context("unterminated inline expression")?;
+                let bytes = &cursor.data[cursor.pc..cursor.pc + length];
+                let value = crate::expression::evaluate(bytes, |name| {
+                    let address = self.named_address(name)?;
+                    Ok(u32::from_le_bytes(
+                        self.memory_read(address, 4)?.as_slice().try_into()?,
+                    ))
+                })?;
+                cursor.pc += length + 1;
+                return Ok(value);
             }
             0x10 if tag == 0x10 => {
                 let address = self.script_base + cursor.pc as u32;
@@ -1092,6 +1180,7 @@ impl BinaryVm {
         let mut response_destination = None;
         let mut memory_write = None;
         let mut byte_destination = None;
+        let mut bounds_destinations = None;
         let mut next_base = self.script_base;
         let mut definition = None;
         let mut rescan = false;
@@ -1123,6 +1212,39 @@ impl BinaryVm {
                     name,
                     activate: opcode == 1,
                 });
+            }
+            0x07d0 => {
+                let rect = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                request = Some(PlatformRequest::InvalidateRect { rect });
+            }
+            0x04f6 => {
+                let mut point = || -> Result<SurfacePoint> {
+                    let id = self.read(&mut cursor)?;
+                    ensure!(id < 256, "unsupported blend surface index/flags {id:#x}");
+                    Ok(SurfacePoint {
+                        id,
+                        x: self.read(&mut cursor)? as i32,
+                        y: self.read(&mut cursor)? as i32,
+                    })
+                };
+                let destination = point()?;
+                let sources = [point()?, point()?];
+                let size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let weights = [self.read(&mut cursor)?, self.read(&mut cursor)?];
+                request = Some(PlatformRequest::BlendSurfaces(SurfaceBlend {
+                    destination,
+                    sources,
+                    size,
+                    weights,
+                }));
             }
             0x0528 => {
                 let id = self.read(&mut cursor)?;
@@ -1202,6 +1324,53 @@ impl BinaryVm {
                     width: self.read(&mut cursor)?,
                     height: self.read(&mut cursor)?,
                     color: self.read(&mut cursor)?,
+                });
+            }
+            0x04c7 => {
+                let x = self.read(&mut cursor)? as i32;
+                let y = self.read(&mut cursor)? as i32;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::HitTestImages {
+                    x,
+                    y,
+                    items: self.draw_list.clone(),
+                });
+            }
+            0x04c8 => {
+                let id = self.read(&mut cursor)?;
+                let frame = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot {id} out of bounds");
+                bounds_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+                request = Some(PlatformRequest::ImageBounds { id, frame });
+            }
+            0x04ba => self.draw_list.clear(),
+            0x04bd => {
+                ensure!(
+                    self.draw_list.len() < 1024,
+                    "draw list exceeds 1024 entries"
+                );
+                let item = ImageDraw {
+                    image: self.read(&mut cursor)?,
+                    frame: self.read(&mut cursor)?,
+                    flags: self.read(&mut cursor)?,
+                    layer: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                    extra: [self.read(&mut cursor)?, self.read(&mut cursor)?],
+                };
+                self.draw_list.push(item);
+            }
+            0x04c4 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "draw surface index out of bounds");
+                request = Some(PlatformRequest::DrawImages {
+                    id,
+                    items: self.draw_list.clone(),
                 });
             }
             0x04b0 => {
@@ -1424,6 +1593,33 @@ impl BinaryVm {
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
             }
+            0x0208 => {
+                // The marker evaluates its operand but does not retain it.
+                self.read(&mut cursor)?;
+            }
+            0x0209 => {
+                let source = cursor.dword()? as usize;
+                let mut selector = Cursor {
+                    data: cursor.data,
+                    pc: source,
+                };
+                let value = self.read(&mut selector)?;
+                let matched_target = cursor.dword()? as usize;
+                let mut entries = 0;
+                let target = loop {
+                    if cursor.data.get(cursor.pc) == Some(&0xff) {
+                        cursor.byte()?;
+                        break cursor.dword()? as usize;
+                    }
+                    ensure!(entries < 4096, "case list exceeds 4096 operands");
+                    entries += 1;
+                    if self.read(&mut cursor)? == value {
+                        break matched_target;
+                    }
+                };
+                ensure!(target < self.data.len(), "case target outside scenario");
+                cursor.pc = target;
+            }
             0x0259 => {
                 let table_end = cursor.dword()? as usize;
                 let selector = self.read(&mut cursor)?;
@@ -1530,6 +1726,90 @@ impl BinaryVm {
                 self.sp -= 1;
                 writes.push((destination?, value));
                 self.sp += 1;
+            }
+            0x0280 => {
+                let count = cursor.word()? as usize;
+                let argc = *self
+                    .parameters
+                    .last()
+                    .context("parameter binding outside function")?
+                    as usize;
+                ensure!(count <= argc, "parameter binding exceeds argument count");
+                for i in 0..count {
+                    let value = self.parameters[self.parameters.len() - i - 2];
+                    writes.push((self.destination(&mut cursor)?, value));
+                }
+            }
+            0x0281 => {
+                let tag = cursor.byte()?;
+                let destination = self.operand_address(tag, &mut cursor)?;
+                self.memory_range(destination, 4)?;
+                let address = self.read(&mut cursor)?;
+                let target = address
+                    .checked_sub(self.script_base)
+                    .context("function address outside scenario")?
+                    as usize;
+                ensure!(target < self.data.len(), "function target outside scenario");
+                let count = cursor.word()? as usize;
+                ensure!(
+                    self.parameters.len() + count + 2 <= CELLS,
+                    "function parameter stack overflow"
+                );
+                ensure!(self.sp >= 2, "call stack overflow");
+                let mut arguments = Vec::with_capacity(count);
+                for _ in 0..count {
+                    arguments.push(self.read(&mut cursor)?);
+                }
+                self.parameters.push(destination);
+                self.parameters.extend(arguments.into_iter().rev());
+                self.parameters.push(count as u32);
+                writes.push((Destination::Bank(8, self.sp - 1), self.script_base));
+                writes.push((
+                    Destination::Bank(8, self.sp - 2),
+                    self.script_base + cursor.pc as u32,
+                ));
+                self.sp -= 2;
+                cursor.pc = target;
+            }
+            0x0285 => {
+                let count = *self
+                    .parameters
+                    .last()
+                    .context("function return without frame")? as usize;
+                let start = self
+                    .parameters
+                    .len()
+                    .checked_sub(count + 2)
+                    .context("invalid function parameter frame")?;
+                let destination = self.parameters[start];
+                let range = self.memory_range(destination, 4)?;
+                let value = self.read(&mut cursor)?;
+                ensure!(self.sp <= CELLS - 2, "return stack underflow");
+                // Native writes the return value before popping the saved PC.
+                // Apply an overlapping result to this temporary stack snapshot.
+                let stack_address = task_bank_base(self.current_task, 8) + self.sp as u32 * 4;
+                let mut saved = self.memory_read(stack_address, 8)?;
+                for (i, byte) in value.to_le_bytes().into_iter().enumerate() {
+                    let at = u64::from(destination) + i as u64;
+                    if at >= u64::from(stack_address) && at < u64::from(stack_address) + 8 {
+                        saved[(at - u64::from(stack_address)) as usize] = byte;
+                    }
+                }
+                let address = u32::from_le_bytes(saved[..4].try_into()?);
+                let base = u32::from_le_bytes(saved[4..].try_into()?);
+                let target = address
+                    .checked_sub(base)
+                    .context("return address outside scenario")?
+                    as usize;
+                ensure!(
+                    target < self.scenario_size(base)?,
+                    "return target outside scenario"
+                );
+                memory_write = Some((range, value.to_le_bytes().to_vec()));
+                self.parameters.truncate(start);
+                self.sp += 2;
+                cursor.pc = target;
+                next_base = base;
             }
             0x0262 | 0x0267 => {
                 let operand = self.read(&mut cursor)?;
@@ -1839,6 +2119,7 @@ impl BinaryVm {
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
         self.pc = cursor.pc;
+        self.pending_bounds = bounds_destinations;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
         }
@@ -1892,6 +2173,72 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn redraw_preserves_native_signed_edges_and_operand_boundary() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/validation/redraw-probe.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let bytes = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("redraw.scn", bytes).unwrap();
+            let Event::Platform {
+                request: PlatformRequest::InvalidateRect { rect },
+                ..
+            } = vm.step().unwrap()
+            else {
+                panic!("expected redraw request")
+            };
+            assert_eq!(serde_json::json!(rect), case["rect"]);
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset,
+                case["next_offset"].as_u64().unwrap() as usize
+            );
+        }
+    }
+
+    #[test]
+    fn draw_list_is_bounded_and_reset_reuses_capacity() {
+        let item = instruction(0x04bd, &immediate(0).repeat(8));
+        let mut code = item.repeat(1024);
+        code.extend(instruction(0x04ba, &[]));
+        code.extend(item.repeat(1025));
+        let mut vm = BinaryVm::new("queue.scn", code).unwrap();
+        for _ in 0..1024 {
+            vm.step().unwrap();
+        }
+        assert_eq!(vm.draw_list.len(), 1024);
+        vm.step().unwrap();
+        assert!(vm.draw_list.is_empty());
+        for _ in 0..1024 {
+            vm.step().unwrap();
+        }
+        assert!(vm.step().unwrap_err().to_string().contains("draw list"));
+        assert_eq!(vm.draw_list.len(), 1024);
+    }
+
+    #[test]
+    fn malformed_function_calls_and_returns_preserve_frames_and_stack() {
+        for code in [
+            instruction(0x281, &[4, 0, 0, 0, 0]),
+            instruction(0x281, &[4, 0, 0, 0, 0, 0x84, 0, 0, 0, 0, 0xff, 0xff]),
+            instruction(0x280, &[1, 0, 12, 0, 0]),
+            instruction(0x285, &immediate(17)),
+        ] {
+            let mut vm = BinaryVm::new("bad-function.scn", code).unwrap();
+            let before = vm.data.clone();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+            assert_eq!(vm.sp, CELLS);
+            assert!(vm.parameters.is_empty());
+            assert_eq!(vm.data, before);
+        }
     }
 
     #[test]
@@ -2242,7 +2589,7 @@ mod tests {
                     "thread_limit": vm.thread_limit, "override": vm.thread_limit_override,
                     "read_marker": vm.file_read_marker, "write_marker": vm.file_write_marker,
                     "media_flags": vm.media_flags, "save_encoding": vm.save_encoding,
-                    "context_flags": vm.context_flags, "message_mode": vm.message_mode,
+                    "context_flags": vm.context_flags, "message_mode": vm.message_mode, "parameter_depth": vm.parameters.len(),
                 });
                 assert_eq!(&actual, expected, "{} step {}", vm.name, vm.steps);
             }

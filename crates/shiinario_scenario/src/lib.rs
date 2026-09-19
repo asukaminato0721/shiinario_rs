@@ -1,9 +1,13 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
 //! are distinct formats; unknown instructions are never treated as no-ops.
 mod binary;
+mod expression;
 mod format;
 mod memory;
-pub use binary::{BinaryVm, MouseButtonMapping, PlatformRequest, boot_binary};
+pub use binary::{
+    BinaryVm, ImageDraw, MouseButtonMapping, PlatformRequest, SurfaceBlend, SurfacePoint,
+    boot_binary,
+};
 pub use memory::SharedMemory;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -170,6 +174,13 @@ pub enum Event {
     PlatformReply {
         value: u32,
         simulated: bool,
+    },
+    SurfaceDigest {
+        id: u32,
+        bgr_sha256: String,
+    },
+    ImageBoundsReply {
+        bounds: [i32; 4],
     },
     PlatformBytesReply {
         bytes: Vec<u8>,

@@ -31,6 +31,9 @@ enum Command {
         /// Use logged, synthetic window replies for interpreter research.
         #[arg(long)]
         simulate_platform: bool,
+        /// Advance synthetic milliseconds per host poll (zero freezes time).
+        #[arg(long, default_value_t = 0, requires = "simulate_platform")]
+        tick_ms: u32,
     },
     Extract {
         archive: PathBuf,
@@ -116,13 +119,15 @@ fn main() -> Result<()> {
             name,
             max_steps,
             simulate_platform,
+            tick_ms,
         } => {
             let p = shiinario_runtime::open(project_dir)?;
-            shiinario_runtime::trace_with_platform(
+            shiinario_runtime::trace_with_clock(
                 &p,
                 &name,
                 max_steps,
                 simulate_platform,
+                tick_ms,
                 |event| {
                     println!("{}", serde_json::to_string(event)?);
                     Ok(())

@@ -2,6 +2,7 @@
 pub mod audio;
 pub mod resources;
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
 use shiinario_scenario::{BinaryVm, Event, Input, PlatformRequest, TextScript, TextVm};
 use std::path::Path;
@@ -27,8 +28,24 @@ pub fn trace_with_platform(
     name: &str,
     max_steps: usize,
     simulate_platform: bool,
+    emit: impl FnMut(&Event) -> Result<()>,
+) -> Result<()> {
+    trace_with_clock(project, name, max_steps, simulate_platform, 0, emit)
+}
+
+/// Each host poll advances the explicit synthetic clock by tick_ms.
+pub fn trace_with_clock(
+    project: &Project,
+    name: &str,
+    max_steps: usize,
+    simulate_platform: bool,
+    tick_ms: u32,
     mut emit: impl FnMut(&Event) -> Result<()>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        simulate_platform || tick_ms == 0,
+        "trace clock requires a simulated platform"
+    );
     let data = project.read(name)?;
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut vm = BinaryVm::new(name, data)?;
@@ -45,7 +62,10 @@ pub fn trace_with_platform(
                 vm.set_dispatch_quantum((value as u32).max(1))?;
             }
         }
-        let mut platform = TracePlatform::default();
+        let mut platform = TracePlatform {
+            tick_ms,
+            ..TracePlatform::default()
+        };
         let mut resources = resources::Resources::for_project(project)?;
         let mut audio = audio::Mixer::default();
         for _ in 0..max_steps {
@@ -57,6 +77,7 @@ pub fn trace_with_platform(
                         "scheduler requires a platform host; use --simulate-platform for a synthetic host"
                     );
                 }
+                platform.poll();
                 vm.respond(1)?;
                 emit(&Event::PlatformReply {
                     value: 1,
@@ -77,6 +98,14 @@ pub fn trace_with_platform(
                         location.scenario,
                         location.offset
                     );
+                }
+                if let PlatformRequest::ImageBounds { id, frame } = &request {
+                    let bounds = resources.image_bounds(*id, *frame).with_context(|| {
+                        format!("{}:{:#x}: image bounds", location.scenario, location.offset)
+                    })?;
+                    vm.respond_image_bounds(bounds)?;
+                    emit(&Event::ImageBoundsReply { bounds })?;
+                    continue;
                 }
                 if let PlatformRequest::SurfacePixels { id } = &request {
                     let address = vm.respond_surface_pixels(resources.surface_memory(*id))?;
@@ -188,6 +217,16 @@ pub fn trace_with_platform(
                         location.scenario, location.offset
                     )
                 })?;
+                if let PlatformRequest::DrawImages { id, .. } = &request {
+                    let memory = resources
+                        .surface_memory(*id)
+                        .context("draw surface missing")?;
+                    let bgr_sha256 = format!("{:x}", Sha256::digest(memory.read(0, memory.len())?));
+                    emit(&Event::SurfaceDigest {
+                        id: *id,
+                        bgr_sha256,
+                    })?;
+                }
                 let value = if let Some(value) = resource_reply {
                     value
                 } else if let PlatformRequest::FileExists { path } = &request {
@@ -230,13 +269,22 @@ pub fn trace_with_platform(
 
 struct TracePlatform {
     class_style: u32,
+    clock_ms: u32,
+    tick_ms: u32,
 }
 impl Default for TracePlatform {
     fn default() -> Self {
-        Self { class_style: 0xb }
+        Self {
+            class_style: 0xb,
+            clock_ms: 0,
+            tick_ms: 0,
+        }
     }
 }
 impl TracePlatform {
+    fn poll(&mut self) {
+        self.clock_ms = self.clock_ms.wrapping_add(self.tick_ms);
+    }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
             // The portable trace reports no x86 rendering acceleration.
@@ -244,14 +292,17 @@ impl TracePlatform {
             PlatformRequest::ReleaseGraphics | PlatformRequest::SetFullscreen { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
-            // Frozen until a trace supplies elapsed time explicitly.
-            PlatformRequest::ClockMilliseconds => Ok(0),
+            PlatformRequest::ClockMilliseconds => Ok(self.clock_ms),
+            PlatformRequest::InvalidateRect { .. } => Ok(1),
             PlatformRequest::ReadRegistryValue {
                 root: 0x80000001,
                 path,
                 name,
             } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "InstMode" => Ok(0),
-            PlatformRequest::PumpMessages => Ok(1),
+            PlatformRequest::PumpMessages => {
+                self.poll();
+                Ok(1)
+            }
             PlatformRequest::DisableIme => Ok(0),
             PlatformRequest::DeviceCaps {
                 device: 0,
@@ -278,4 +329,40 @@ impl TracePlatform {
 }
 pub fn open(path: impl AsRef<Path>) -> Result<Project> {
     Project::open(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn simulated_clock_advances_only_at_polls_and_wraps() {
+        let mut clock = TracePlatform {
+            clock_ms: u32::MAX - 7,
+            tick_ms: 16,
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            assert_eq!(
+                clock.respond(&PlatformRequest::ClockMilliseconds).unwrap(),
+                u32::MAX - 7
+            );
+        }
+        clock.poll();
+        assert_eq!(
+            clock.respond(&PlatformRequest::ClockMilliseconds).unwrap(),
+            8
+        );
+        clock.respond(&PlatformRequest::PumpMessages).unwrap();
+        assert_eq!(
+            clock.respond(&PlatformRequest::ClockMilliseconds).unwrap(),
+            24
+        );
+        let mut frozen = TracePlatform::default();
+        frozen.poll();
+        frozen.respond(&PlatformRequest::PumpMessages).unwrap();
+        assert_eq!(
+            frozen.respond(&PlatformRequest::ClockMilliseconds).unwrap(),
+            0
+        );
+    }
 }

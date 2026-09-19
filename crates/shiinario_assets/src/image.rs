@@ -101,6 +101,51 @@ pub fn decode(data: &[u8], index: usize) -> Result<Frame> {
     }
     Ok(Frame { info, rgba })
 }
+/// Original button hit testing uses the RLE method, not the decoded alpha.
+/// In particular, an alpha-zero literal and a method-1 run are both hits.
+pub fn hit_test(data: &[u8], index: usize, x: u32, y: u32) -> Result<bool> {
+    let all = frames(data)?;
+    let frame = all
+        .iter()
+        .find(|f| f.index == index)
+        .context("S25 frame not present")?;
+    if x >= frame.width || y >= frame.height {
+        return Ok(false);
+    }
+    let pos = word(data, frame.offset + 20 + y as usize * 4)? as usize;
+    let len = u16::from_le_bytes(bytes(data, pos, 2)?.try_into()?) as usize;
+    let skip = pos & 1;
+    ensure!(len >= skip, "S25 invalid row length");
+    let row = bytes(data, pos + 2 + skip, len - skip)?;
+    let (mut p, mut end) = (0usize, 0u32);
+    loop {
+        p += p & 1;
+        let control = u16::from_le_bytes(bytes(row, p, 2)?.try_into()?);
+        p += 2 + ((control >> 11) & 3) as usize;
+        let mut count = u32::from(control & 0x7ff);
+        if count == 0 {
+            count = word(row, p)?;
+            p += 4;
+        }
+        ensure!(count > 0, "S25 zero-length run");
+        let method = control >> 13;
+        let size = match method {
+            2 => u64::from(count) * 3,
+            3 => 3,
+            4 => u64::from(count) * 4,
+            5 => 4,
+            _ => 0,
+        };
+        bytes(row, p, usize::try_from(size)?)?;
+        end = end
+            .checked_add(count)
+            .context("S25 hit-test run overflow")?;
+        if x < end {
+            return Ok(method != 0);
+        }
+        p += usize::try_from(size)?;
+    }
+}
 fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize) -> Result<()> {
     let (mut p, mut x) = (0usize, 0usize);
     while x < out.len() / 4 {
