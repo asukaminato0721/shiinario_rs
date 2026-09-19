@@ -32,6 +32,12 @@ pub struct SurfaceBlend {
     pub size: [i32; 2],
     pub weights: [u32; 2],
 }
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceCopy {
+    pub destination: SurfacePoint,
+    pub source: SurfacePoint,
+    pub size: [i32; 2],
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ImageDraw {
@@ -87,6 +93,7 @@ pub enum PlatformRequest {
         rect: [i32; 4],
     },
     BlendSurfaces(SurfaceBlend),
+    CopySurface(SurfaceCopy),
     SurfacePixels {
         id: u32,
     },
@@ -1409,6 +1416,31 @@ impl BinaryVm {
                 ];
                 request = Some(PlatformRequest::InvalidateRect { rect });
             }
+            0x04e2 => {
+                let destination = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                let size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let source = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                ensure!(
+                    destination.id < 256 && source.id < 256,
+                    "copy surface slot out of bounds"
+                );
+                request = Some(PlatformRequest::CopySurface(SurfaceCopy {
+                    destination,
+                    source,
+                    size,
+                }));
+            }
             0x04f6 => {
                 let mut point = || -> Result<SurfacePoint> {
                     let id = self.read(&mut cursor)?;
@@ -1810,9 +1842,9 @@ impl BinaryVm {
                 })?;
                 let mode = cursor.byte()?;
                 let value = if mode == 0 {
-                    (value as f32).to_bits()
-                } else {
                     value as i64 as u32
+                } else {
+                    (value as f32).to_bits()
                 };
                 writes.push((self.destination(&mut cursor)?, value));
             }

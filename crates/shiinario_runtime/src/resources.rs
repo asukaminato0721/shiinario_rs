@@ -1,7 +1,7 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
 use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
-use shiinario_scenario::{ImageDraw, PlatformRequest, SharedMemory, SurfaceBlend};
+use shiinario_scenario::{ImageDraw, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCopy};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -417,6 +417,59 @@ impl Resources {
         }
         destination.pixels.write(0, &pixels)
     }
+    fn copy_surface(&mut self, copy: &SurfaceCopy) -> Result<()> {
+        let destination = self
+            .surfaces
+            .get(&copy.destination.id)
+            .context("copy destination is not allocated")?;
+        let [width, height] = copy.size;
+        ensure!(width >= 0 && height >= 0, "negative copy dimensions");
+        let right = copy
+            .destination
+            .x
+            .checked_add(width)
+            .context("copy rectangle overflow")?;
+        let bottom = copy
+            .destination
+            .y
+            .checked_add(height)
+            .context("copy rectangle overflow")?;
+        let left = copy.destination.x.max(0).min(destination.width as i32);
+        let top = copy.destination.y.max(0).min(destination.height as i32);
+        let right = right.max(0).min(destination.width as i32);
+        let bottom = bottom.max(0).min(destination.height as i32);
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let source = self
+            .surfaces
+            .get(&copy.source.id)
+            .context("copy source is not allocated")?;
+        let width = (right - left) as usize;
+        let height = (bottom - top) as usize;
+        let sx = i64::from(copy.source.x) + i64::from(left) - i64::from(copy.destination.x);
+        let sy = i64::from(copy.source.y) + i64::from(top) - i64::from(copy.destination.y);
+        ensure!(
+            sx >= 0
+                && sy >= 0
+                && sx + width as i64 <= i64::from(source.width)
+                && sy + height as i64 <= i64::from(source.height),
+            "copy source rectangle outside surface"
+        );
+        // Native 417900 calls memmove separately for each row, top to bottom.
+        // A downward overlapping copy therefore reads rows written earlier.
+        for row in 0..height {
+            let bytes = source.pixels.read(
+                (sy as usize + row) * source.stride + sx as usize * 3,
+                width * 3,
+            )?;
+            destination.pixels.write(
+                (top as usize + row) * destination.stride + left as usize * 3,
+                &bytes,
+            )?;
+        }
+        Ok(())
+    }
     fn blend_surfaces(&mut self, blend: &SurfaceBlend) -> Result<()> {
         let destination = self
             .surfaces
@@ -713,6 +766,7 @@ impl Resources {
             }
             PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
+            PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
             }
@@ -1334,6 +1388,75 @@ mod tests {
             resources.surface(2).unwrap().rgba,
             [0, 0, 0, 255, 0, 0, 0, 255]
         );
+    }
+    #[test]
+    fn surface_copy_matches_original_clipping_overlap_and_operand_order() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/surface-copy-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut resources = Resources::default();
+            for (index, id) in [0, 3, 11].into_iter().enumerate() {
+                resources.create_surface(id, 8, 4, 0).unwrap();
+                resources
+                    .surface_memory(id)
+                    .unwrap()
+                    .write(0, &decode(&fixture["initial"][index]))
+                    .unwrap();
+            }
+            let mut vm = BinaryVm::new("copy.scn", decode(&case["code"])).unwrap();
+            let Event::Platform {
+                request: PlatformRequest::CopySurface(copy),
+                ..
+            } = vm.step().unwrap()
+            else {
+                panic!("expected copy");
+            };
+            resources.copy_surface(&copy).unwrap();
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+            assert_eq!(
+                resources.surface_memory(0).unwrap().read(0, 96).unwrap(),
+                decode(&case["pixels"]),
+                "{:?}",
+                case["args"]
+            );
+        }
+        let mut resources = Resources::default();
+        resources.create_surface(0, 8, 4, 0).unwrap();
+        let point = shiinario_scenario::SurfacePoint { id: 0, x: 0, y: 0 };
+        let valid = SurfaceCopy {
+            destination: point.clone(),
+            source: point,
+            size: [8, 4],
+        };
+        for kind in 0..4 {
+            let mut copy = valid.clone();
+            match kind {
+                0 => copy.source.x = 1,
+                1 => copy.size[0] = -1,
+                2 => copy.destination.x = i32::MAX,
+                _ => copy.source.id = 99,
+            }
+            let before = resources.surface_memory(0).unwrap().read(0, 96).unwrap();
+            assert!(resources.copy_surface(&copy).is_err());
+            assert_eq!(
+                resources.surface_memory(0).unwrap().read(0, 96).unwrap(),
+                before
+            );
+        }
     }
     #[test]
     fn weighted_blend_matches_original_pixels_clipping_and_operand_order() {

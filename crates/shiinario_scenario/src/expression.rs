@@ -184,6 +184,13 @@ mod tests {
             assert!(evaluate(bytes, |_| bail!("undefined variable")).is_err());
         }
         assert!(evaluate(&vec![b'-'; 4097], |_| Ok(0)).is_err());
+        for bits in [
+            f32::NAN.to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::MAX.to_bits(),
+        ] {
+            assert!(evaluate_real(b"{value}f", |_| Ok(bits)).is_err());
+        }
         assert!(
             evaluate(
                 format!("{}1{}", "(".repeat(64), ")".repeat(64)).as_bytes(),

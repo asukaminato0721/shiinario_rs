@@ -18,6 +18,8 @@ pub struct FrameInfo {
 pub struct Frame {
     pub info: FrameInfo,
     pub rgba: Vec<u8>,
+    /// Original RLE method for each pixel; compositing rounding depends on it.
+    pub methods: Vec<u8>,
 }
 fn bytes(data: &[u8], p: usize, n: usize) -> Result<&[u8]> {
     data.get(p..p.checked_add(n).context("S25 offset overflow")?)
@@ -85,6 +87,7 @@ pub fn decode(data: &[u8], index: usize) -> Result<Frame> {
         }
     }
     let mut rgba = vec![0; info.width as usize * info.height as usize * 4];
+    let mut methods = vec![0; rgba.len() / 4];
     for y in 0..info.height as usize {
         let pos = word(data, info.offset + 20 + y * 4)? as usize;
         let len = u16::from_le_bytes(bytes(data, pos, 2)?.try_into()?) as usize;
@@ -96,10 +99,15 @@ pub fn decode(data: &[u8], index: usize) -> Result<Frame> {
             &mut row,
             &mut rgba[y * info.width as usize * 4..(y + 1) * info.width as usize * 4],
             repeats,
+            &mut methods[y * info.width as usize..(y + 1) * info.width as usize],
         )
         .with_context(|| format!("S25 frame {index} row {y}"))?;
     }
-    Ok(Frame { info, rgba })
+    Ok(Frame {
+        info,
+        rgba,
+        methods,
+    })
 }
 /// Original button hit testing uses the RLE method, not the decoded alpha.
 /// In particular, an alpha-zero literal and a method-1 run are both hits.
@@ -149,7 +157,7 @@ pub fn hit_test(data: &[u8], index: usize, x: u32, y: u32) -> Result<bool> {
         p += usize::try_from(size)?;
     }
 }
-fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize) -> Result<()> {
+fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize, methods: &mut [u8]) -> Result<()> {
     let (mut p, mut x) = (0usize, 0usize);
     while x < out.len() / 4 {
         p += p & 1;
@@ -164,6 +172,7 @@ fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize) -> Result<()> {
         }
         ensure!(count > 0, "S25 zero-length run");
         count = count.min(out.len() / 4 - x);
+        methods[x..x + count].fill(method as u8);
         let stride = match method {
             2 | 3 => 3,
             4 | 5 => 4,
@@ -226,20 +235,20 @@ mod tests {
     fn colors_transparency_and_repeats() {
         let mut row = vec![2, 0x60, 1, 2, 3, 0, 1, 0xa0, 128, 4, 5, 6, 1, 0x20];
         let mut out = [0; 16];
-        decode_row(&mut row, &mut out, 0).unwrap();
+        decode_row(&mut row, &mut out, 0, &mut [0; 4]).unwrap();
         assert_eq!(out, [3, 2, 1, 255, 3, 2, 1, 255, 6, 5, 4, 128, 0, 0, 0, 0]);
     }
     #[test]
     fn incremental_literal() {
         let mut row = vec![2, 0x40, 1, 2, 3, 4, 5, 6];
         let mut out = [0; 8];
-        decode_row(&mut row, &mut out, 1).unwrap();
+        decode_row(&mut row, &mut out, 1, &mut [0; 2]).unwrap();
         assert_eq!(out, [3, 2, 1, 255, 9, 7, 5, 255]);
     }
     #[test]
     fn malformed_rows() {
-        assert!(decode_row(&mut [0, 0], &mut [0; 4], 0).is_err());
+        assert!(decode_row(&mut [0, 0], &mut [0; 4], 0, &mut [0; 1]).is_err());
         assert!(frames(b"S25\0\xff\xff\xff\xff").is_err());
-        assert!(decode_row(&mut [1, 0x80], &mut [0; 4], 0).is_err());
+        assert!(decode_row(&mut [1, 0x80], &mut [0; 4], 0, &mut [0; 1]).is_err());
     }
 }
