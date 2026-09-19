@@ -467,6 +467,7 @@ pub struct BinaryVm {
     pending_sizes: Option<[Destination; 2]>,
     // Some(true) resets this task's epoch; Some(false) reads elapsed time.
     pending_timer: Option<bool>,
+    pending_delay: Option<u32>,
     task_timers: std::collections::BTreeMap<u32, u32>,
     context_flags: u32,
     message_mode: u32,
@@ -531,6 +532,7 @@ impl BinaryVm {
             pending_point: None,
             pending_sizes: None,
             pending_timer: None,
+            pending_delay: None,
             task_timers: Default::default(),
             text_style: Default::default(),
             best_effort: false,
@@ -777,6 +779,26 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        if let Some(duration) = self.pending_delay.take() {
+            let Event::Platform {
+                location,
+                request: PlatformRequest::ClockMilliseconds,
+            } = event
+            else {
+                bail!("delay requires a clock reply");
+            };
+            self.pending = Some((
+                Event::Platform {
+                    location,
+                    request: PlatformRequest::WaitTaskTimer {
+                        epoch: value,
+                        duration,
+                    },
+                },
+                None,
+            ));
+            return Ok(());
+        }
         self.text_response(&event, value)?;
         if let Some((mut style, clock)) = self.pending_text_style.take() {
             match clock {
@@ -1473,6 +1495,7 @@ impl BinaryVm {
         let mut point_destinations = None;
         let mut size_destinations = None;
         let mut timer_reply = None;
+        let mut delay = None;
         let mut next_base = self.script_base;
         let mut definition = None;
         let mut rescan = false;
@@ -1481,6 +1504,10 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x0028 => {
+                delay = Some(self.read(&mut cursor)?);
+                request = Some(PlatformRequest::ClockMilliseconds);
+            }
             0x06a7..=0x06ab | 0x06af => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "unsupported sound slot/handle {id:#x}");
@@ -2943,6 +2970,7 @@ impl BinaryVm {
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
         self.pending_timer = timer_reply;
+        self.pending_delay = delay;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
         }
@@ -3037,6 +3065,25 @@ mod tests {
             assert_eq!(vm.sp, 1000);
             assert!(vm.parameters.is_empty());
         }
+    }
+
+    #[test]
+    fn relative_delay_preserves_task_timer_and_blocks_following_instruction() {
+        let mut code = instruction(0x28, &immediate(10));
+        code.extend(instruction(0x49d, &immediate(42)));
+        let mut vm = BinaryVm::new("delay.scn", code).unwrap();
+        vm.task_timers.insert(0, 17);
+        assert!(matches!(vm.step().unwrap(), Event::Platform { request: PlatformRequest::ClockMilliseconds, .. }));
+        vm.respond(u32::MAX - 4).unwrap();
+        for _ in 0..3 {
+            assert!(matches!(vm.scheduled_step().unwrap(), Event::Platform { request: PlatformRequest::WaitTaskTimer { epoch, duration: 10 }, .. } if epoch == u32::MAX - 4));
+            assert_eq!(vm.steps, 1);
+            vm.respond(0).unwrap();
+        }
+        vm.respond(1).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 42);
+        assert_eq!(vm.task_timers[&0], 17);
     }
 
     #[test]
