@@ -11,6 +11,9 @@ pub struct InputFrame {
     pub cursor: [i32; 2],
     #[serde(default)]
     pub mouse_buttons: u8,
+    /// Additional engine control bits, e.g. 0x100 for the reading skip key.
+    #[serde(default)]
+    pub control_mask: u32,
     /// Windows virtual-key codes. Keyboard control masks are not synthesized.
     #[serde(default)]
     pub keys: Vec<u8>,
@@ -21,6 +24,7 @@ pub(crate) struct Replay {
     next: usize,
     pub cursor: [i32; 2],
     mouse: u8,
+    control_mask: u32,
     pub keys: AsyncKeys,
     mapping: MouseButtonMapping,
 }
@@ -43,6 +47,7 @@ impl Replay {
         while let Some(frame) = self.frames.get(self.next).filter(|f| f.at_ms <= now) {
             self.cursor = frame.cursor;
             self.mouse = frame.mouse_buttons;
+            self.control_mask = frame.control_mask;
             for key in 0..256 {
                 self.keys.set(key, frame.keys.contains(&(key as u8)));
             }
@@ -60,7 +65,7 @@ impl Replay {
             mouse_buttons: self.mapping.map_buttons(self.mouse),
             ..Default::default()
         }
-        .mask()
+        .mask() | self.control_mask
     }
 }
 
@@ -74,12 +79,14 @@ mod tests {
                 at_ms: 10,
                 cursor: [690, 65],
                 mouse_buttons: 1,
+                control_mask: 0x100,
                 keys: vec![],
             },
             InputFrame {
                 at_ms: 20,
                 cursor: [400, 500],
                 mouse_buttons: 0,
+                control_mask: 0,
                 keys: vec![],
             },
         ])
@@ -87,12 +94,12 @@ mod tests {
         replay.advance(9);
         assert_eq!(replay.controls(), 0);
         replay.advance(10);
-        assert_eq!(replay.controls(), 0x20);
+        assert_eq!(replay.controls(), 0x120);
         assert_eq!(replay.cursor, [690, 65]);
         assert_eq!(replay.keys.query(1, true), 0xffff8001);
         assert_eq!(replay.keys.query(1, true), 0xffff8000);
         replay.mapping(1);
-        assert_eq!(replay.controls(), 0x10);
+        assert_eq!(replay.controls(), 0x110);
         replay.advance(20);
         assert_eq!(replay.controls(), 0);
         assert_eq!(replay.keys.query(1, true), 0);

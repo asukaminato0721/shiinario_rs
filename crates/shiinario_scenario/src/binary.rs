@@ -2342,16 +2342,17 @@ impl BinaryVm {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
             }
-            0x0281 => {
+            0x0281 | 0x0283 => {
                 let tag = cursor.byte()?;
                 let destination = self.operand_address(tag, &mut cursor)?;
-                self.memory_range(destination, 4)?;
-                let address = self.read(&mut cursor)?;
-                let target = address
-                    .checked_sub(self.script_base)
-                    .context("function address outside scenario")?
-                    as usize;
-                ensure!(target < self.data.len(), "function target outside scenario");
+                if destination != 0 { self.memory_range(destination, 4)?; }
+                let operand = self.read(&mut cursor)?;
+                let (base,target) = if opcode==0x0283 {
+                    *self.task_entries.get(&operand).with_context(||format!("parameterized call to undefined task {operand}"))?
+                } else {
+                    (self.script_base,operand.checked_sub(self.script_base).context("function address outside scenario")? as usize)
+                };
+                ensure!(target < self.scenario_size(base)?, "function target outside scenario");
                 let count = cursor.word()? as usize;
                 ensure!(
                     self.parameters.len() + count + 2 <= CELLS,
@@ -2372,6 +2373,7 @@ impl BinaryVm {
                 ));
                 self.sp -= 2;
                 cursor.pc = target;
+                next_base = base;
             }
             0x0285 => {
                 let count = *self
@@ -2384,7 +2386,7 @@ impl BinaryVm {
                     .checked_sub(count + 2)
                     .context("invalid function parameter frame")?;
                 let destination = self.parameters[start];
-                let range = self.memory_range(destination, 4)?;
+                let range = if destination == 0 { None } else { Some(self.memory_range(destination, 4)?) };
                 let value = self.read(&mut cursor)?;
                 ensure!(self.sp <= CELLS - 2, "return stack underflow");
                 // Native writes the return value before popping the saved PC.
@@ -2407,7 +2409,7 @@ impl BinaryVm {
                     target < self.scenario_size(base)?,
                     "return target outside scenario"
                 );
-                memory_write = Some((range, value.to_le_bytes().to_vec()));
+                memory_write = range.map(|range|(range, value.to_le_bytes().to_vec()));
                 self.parameters.truncate(start);
                 self.sp += 2;
                 cursor.pc = target;
@@ -2849,6 +2851,27 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn parameterized_library_call_preserves_caller_and_optional_result() {
+        for discard in [false,true] {
+            let mut args=if discard { immediate(0) } else { vec![12,1,0] };
+            args.extend(immediate(77));args.extend(2u16.to_le_bytes());
+            args.extend(immediate(11));args.extend(immediate(22));
+            let mut code=instruction(0x283,&args);let return_pc=code.len();
+            code.extend(instruction(0,&immediate(0)));
+            let mut vm=BinaryVm::new("caller.scn",code).unwrap();
+            let mut callee=instruction(0x280,&[2,0,12,3,0,12,4,0]);
+            callee.extend(instruction(0x285,&[12,4,0]));
+            vm.scenarios.insert(0x40000000,Scenario {name:"library.scn".into(),data:callee});
+            vm.define_task(77,0x40000000,0,false);vm.banks.get_mut(&12).unwrap()[1]=99;
+            vm.step().unwrap();assert_eq!(vm.name,"library.scn");assert_eq!(vm.sp,998);
+            vm.step().unwrap();assert_eq!(vm.banks[&12][3..5],[11,22]);
+            vm.step().unwrap();assert_eq!(vm.name,"caller.scn");assert_eq!(vm.pc,return_pc);
+            assert_eq!(vm.banks[&12][1],if discard {99} else {22});
+            assert_eq!(vm.sp,1000);assert!(vm.parameters.is_empty());
+        }
     }
 
     #[test]
