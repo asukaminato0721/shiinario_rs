@@ -3,8 +3,9 @@
 An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
 **This is not yet a playable port.** Asset decoding is verified against GARbro;
 binary scenario execution, native presentation, menus, choices, movies, and saves
-remain unfinished. The engine currently reports the first unsupported startup
-opcode and exits with an error. It does not skip startup or pretend to run it.
+remain unfinished. Startup execution stops at an unresolved instruction or a platform request that
+has no host. The optional simulated-platform trace executes 88 startup instructions
+with offsets matching captured x86 execution, then stops at the message pump.
 
 The workspace builds independently of the reference checkouts:
 
@@ -20,7 +21,7 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 ## Commands
 
 ```sh
-# Read original configuration and attempt the real startup (executes 0x049d; stops at 0x000a, byte 7).
+# Read original configuration and execute until a native platform host is required.
 target/release/shiinario_engine --project-dir /path/to/game
 
 # Inspect CP932 configuration and list the original archive entries.
@@ -42,6 +43,8 @@ target/release/shiinario_tool inventory --project-dir /path/to/game
 
 # Research traces for the verified SCN/TXT subsets. Unknown operations stop execution.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-steps 10000
+# Explicit simulated Windows replies, logged in the output; this does not display a game window.
+target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --max-steps 10000
 target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
 ```
 
@@ -55,8 +58,9 @@ research artifacts outside this repository. No alternative save format is create
   OGV/Vorbis, project configuration, Windows-style path lookup, bounded byte cache.
 - `shiinario_scenario`: CP932 story parser, command inventory, bytecode research
   dumps, typed presentation events and deterministic input/timing for a limited
-  text interpreter and the verified binary mouse-button mapping opcode. Unsupported
-  commands produce sticky errors with source context.
+  text interpreter and the recovered binary startup subset: operand banks, bounded
+  memory, branches, calls, inactive task definitions, and platform requests.
+  Unsupported commands produce sticky errors with source context.
 - `shiinario_runtime`: host-independent startup and trace orchestration.
 - `shiinario_cli`: the engine and inspection tools. No native window backend yet.
 

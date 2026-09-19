@@ -35,6 +35,9 @@ pub fn trace_with_platform(
         for _ in 0..max_steps {
             let event = vm.step()?;
             emit(&event)?;
+            if matches!(event, Event::End) {
+                return Ok(());
+            }
             if let Event::Platform { location, request } = event {
                 if !simulate_platform {
                     bail!(
@@ -42,6 +45,19 @@ pub fn trace_with_platform(
                         location.scenario,
                         location.offset
                     );
+                }
+                if matches!(&request, PlatformRequest::ProjectDirectory)
+                    || matches!(&request, PlatformRequest::ReadRegistryString { root: 0x80000001, path, name } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "DataPath")
+                {
+                    // An empty registry DataPath makes the SCN ask for the
+                    // installation directory. Empty project-relative paths
+                    // refer to Project.root; no host absolute path enters SCN.
+                    emit(&Event::PlatformBytesReply {
+                        bytes: Vec::new(),
+                        simulated: true,
+                    })?;
+                    vm.respond_bytes(&[])?;
+                    continue;
                 }
                 let value = platform.respond(&request)?;
                 emit(&Event::PlatformReply {
@@ -88,6 +104,7 @@ impl Default for TracePlatform {
 impl TracePlatform {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::PumpMessages => Ok(1),
             PlatformRequest::DisableIme => Ok(0),
             PlatformRequest::DeviceCaps {
                 device: 0,

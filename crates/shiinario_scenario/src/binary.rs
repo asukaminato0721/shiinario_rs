@@ -22,12 +22,35 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    ReadRegistryString {
+        root: u32,
+        path: String,
+        name: String,
+    },
+    ProjectDirectory,
+    PumpMessages,
     DisableIme,
-    DeviceCaps { device: u32, index: i32 },
-    GetClassLong { window: u32, index: i32 },
-    SetClassLong { window: u32, index: i32, value: u32 },
-    FindWindow { class: String, title: String },
-    SetWindowTitle { window: u32, title: String },
+    DeviceCaps {
+        device: u32,
+        index: i32,
+    },
+    GetClassLong {
+        window: u32,
+        index: i32,
+    },
+    SetClassLong {
+        window: u32,
+        index: i32,
+        value: u32,
+    },
+    FindWindow {
+        class: String,
+        title: String,
+    },
+    SetWindowTitle {
+        window: u32,
+        title: String,
+    },
 }
 
 const CELLS: usize = 1000;
@@ -48,6 +71,11 @@ enum MemoryRange {
 
 fn bank_base(tag: u8) -> u32 {
     0x1100_0000 + u32::from(tag) * 0x10000
+}
+
+struct NamedScope {
+    allocation: u32,
+    names: Vec<Vec<u8>>,
 }
 
 struct Cursor<'a> {
@@ -72,6 +100,20 @@ impl Cursor<'_> {
     }
     fn dword(&mut self) -> Result<u32> {
         Ok(u32::from_le_bytes(self.bytes()?))
+    }
+    fn variable_name(&mut self) -> Result<Vec<u8>> {
+        let mut name = Vec::new();
+        loop {
+            match self.byte()? {
+                0 | b'}' => break,
+                b' ' | b'\t' => continue,
+                b'[' => bail!("array expression in named variable is unresolved"),
+                b => name.push(b),
+            }
+            ensure!(name.len() <= 31, "named variable exceeds 31 bytes");
+        }
+        ensure!(!name.is_empty(), "empty named variable");
+        Ok(name)
     }
 }
 
@@ -101,6 +143,11 @@ pub struct BinaryVm {
     // separate operation; unsupported activation instructions still stop.
     task_entries: std::collections::BTreeMap<u32, usize>,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
+    ended: bool,
+    named_scopes: Vec<NamedScope>,
+    registry_root: u32,
+    registry_path: String,
+    pending_bytes: Option<u32>,
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -130,6 +177,11 @@ impl BinaryVm {
             next_allocation: 0x2000_0000,
             task_entries: Default::default(),
             callback_tasks: Default::default(),
+            ended: false,
+            named_scopes: Vec::new(),
+            registry_root: 0,
+            registry_path: String::new(),
+            pending_bytes: None,
         })
     }
     pub fn location(&self) -> Location {
@@ -150,10 +202,40 @@ impl BinaryVm {
     /// Complete the outstanding platform request. Repeated step calls before a
     /// response return the same request, without executing the next instruction.
     pub fn respond(&mut self, value: u32) -> Result<()> {
-        let (_, destination) = self.pending.take().context("no pending platform request")?;
+        ensure!(
+            self.pending_bytes.is_none(),
+            "platform request requires a byte-string reply"
+        );
+        let (event, destination) = self.pending.take().context("no pending platform request")?;
+        if matches!(
+            event,
+            Event::Platform {
+                request: PlatformRequest::PumpMessages,
+                ..
+            }
+        ) && value == 0
+        {
+            self.ended = true;
+        }
         if let Some(destination) = destination {
             self.write(destination, value);
         }
+        Ok(())
+    }
+    pub fn respond_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        let address = self
+            .pending_bytes
+            .context("no pending byte-string request")?;
+        ensure!(
+            bytes.len() < 256 && !bytes.contains(&0),
+            "platform string exceeds 255 bytes or contains NUL"
+        );
+        let range = self.memory_range(address, bytes.len() + 1)?;
+        let mut terminated = bytes.to_vec();
+        terminated.push(0);
+        self.memory_write(range, &terminated);
+        self.pending_bytes = None;
+        self.pending = None;
         Ok(())
     }
     fn destination(&self, cursor: &mut Cursor<'_>) -> Result<Destination> {
@@ -181,6 +263,18 @@ impl BinaryVm {
                 self.memory_range(address, width)?;
                 Ok(Destination::Memory(address, width))
             }
+            0x12 | 0x13 => {
+                let name = cursor.variable_name()?;
+                let mut address = self.named_address(&name)?;
+                if tag & 0x7f == 0x13 {
+                    address = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
+                    if tag & 0x80 != 0 {
+                        address = address.wrapping_add(SCRIPT_BASE);
+                    }
+                }
+                self.memory_range(address, 4)?;
+                Ok(Destination::Memory(address, 4))
+            }
             _ => bail!("unsupported destination tag {tag:#04x}"),
         }
     }
@@ -194,6 +288,7 @@ impl BinaryVm {
                     let index = self.bank_index(bank, cursor.word()?)?;
                     Ok(bank_base(bank) + (index * if bank == 6 { 1 } else { 4 }) as u32)
                 }
+                0x12 => self.named_address(&cursor.variable_name()?),
                 _ => bail!("unsupported address operand tag {tag:#04x} at {start:#x}"),
             };
         }
@@ -228,6 +323,17 @@ impl BinaryVm {
                     u32::from_le_bytes(bytes.try_into().unwrap())
                 });
             }
+            0x12 | 0x13 => {
+                let address = self.named_address(&cursor.variable_name()?)?;
+                let value = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
+                if tag & 0x7f == 0x13 {
+                    let address = value.wrapping_add(if tag & 0x80 != 0 { SCRIPT_BASE } else { 0 });
+                    return Ok(u32::from_le_bytes(
+                        self.memory_read(address, 4)?.try_into().unwrap(),
+                    ));
+                }
+                value
+            }
             _ => bail!("unsupported operand tag {tag:#04x} at {start:#x}"),
         };
         Ok(if tag & 0x80 != 0 {
@@ -237,20 +343,35 @@ impl BinaryVm {
         })
     }
     fn string(&self, value: u32) -> Result<String> {
-        let offset = value
-            .checked_sub(SCRIPT_BASE)
-            .context("string address outside scenario")? as usize;
-        let bytes = self
-            .data
-            .get(offset..)
-            .context("string address outside scenario")?;
-        let end = bytes
-            .iter()
-            .position(|&b| b == 0)
-            .context("unterminated string")?;
-        let (text, _, bad) = encoding_rs::SHIFT_JIS.decode(&bytes[..end]);
-        ensure!(!bad, "invalid CP932 string at {offset:#x}");
+        let bytes = self.string_bytes(value)?;
+        let (text, _, bad) = encoding_rs::SHIFT_JIS.decode(&bytes);
+        ensure!(!bad, "invalid CP932 string at {value:#x}");
         Ok(text.into_owned())
+    }
+    fn string_bytes(&self, address: u32) -> Result<Vec<u8>> {
+        let mut bytes = Vec::new();
+        for index in 0..65536u32 {
+            let address = address
+                .checked_add(index)
+                .context("string address overflow")?;
+            let byte = self.memory_read(address, 1)?[0];
+            if byte == 0 {
+                return Ok(bytes);
+            }
+            bytes.push(byte);
+        }
+        bail!("unterminated string within 64 KiB cap")
+    }
+    fn named_address(&self, name: &[u8]) -> Result<u32> {
+        for scope in self.named_scopes.iter().rev() {
+            if let Some(index) = scope.names.iter().position(|n| n == name) {
+                return Ok(scope.allocation + (index as u32 * 40) + 32);
+            }
+        }
+        bail!(
+            "undefined named variable {:?}",
+            String::from_utf8_lossy(name)
+        )
     }
     fn write(&mut self, destination: Destination, value: u32) {
         match destination {
@@ -354,6 +475,9 @@ impl BinaryVm {
         if let Some(error) = &self.failure {
             bail!("{error}");
         }
+        if self.ended {
+            return Ok(Event::End);
+        }
         if let Some((event, _)) = &self.pending {
             return Ok(event.clone());
         }
@@ -391,11 +515,102 @@ impl BinaryVm {
         let mut request = None;
         let mut response_destination = None;
         let mut memory_write = None;
+        let mut byte_destination = None;
         let mut event = Event::BinaryInstruction {
             location: location.clone(),
             opcode,
         };
         match opcode {
+            0x00fe => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                let address = self.read(&mut cursor)?;
+                self.memory_range(address, 256)?;
+                byte_destination = Some(address);
+                request = Some(PlatformRequest::ReadRegistryString {
+                    root: self.registry_root,
+                    path: self.registry_path.clone(),
+                    name,
+                });
+            }
+            0x0a28 => {
+                let address = self.read(&mut cursor)?;
+                self.memory_range(address, 256)?;
+                byte_destination = Some(address);
+                request = Some(PlatformRequest::ProjectDirectory);
+            }
+            0x0304 => {
+                let address = self.read(&mut cursor)?;
+                let value = u32::from(self.memory_read(address, 1)?[0]);
+                writes.push((self.destination(&mut cursor)?, value));
+            }
+            0x02d1 | 0x02d3 => {
+                let mut destination = self.read(&mut cursor)?;
+                let source = self.read(&mut cursor)?;
+                let mut bytes = self.string_bytes(source)?;
+                bytes.push(0);
+                if opcode == 0x02d3 {
+                    destination = destination
+                        .checked_add(self.string_bytes(destination)?.len() as u32)
+                        .context("string destination overflow")?;
+                }
+                memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
+            }
+            0x0258 => {
+                let address = self.read(&mut cursor)?;
+                let target = address
+                    .checked_sub(SCRIPT_BASE)
+                    .context("jump address outside scenario")?
+                    as usize;
+                ensure!(
+                    target < self.data.len(),
+                    "jump target {target:#x} outside scenario"
+                );
+                cursor.pc = target;
+            }
+            0x03cf => {
+                let count = cursor.word()? as usize;
+                ensure!(count <= 256, "named declaration exceeds 256 variables");
+                if count == 0 {
+                    if let Some(scope) = self.named_scopes.pop() {
+                        self.allocations.remove(&scope.allocation);
+                    }
+                } else {
+                    ensure!(
+                        self.named_scopes.len() < 256,
+                        "named scope depth exceeds 256"
+                    );
+                    let mut names = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        ensure!(cursor.byte()? == 0x12, "unsupported declaration operand");
+                        names.push(cursor.variable_name()?);
+                    }
+                    let address = self.next_allocation;
+                    let size = count * 40;
+                    let next = address
+                        .checked_add(((size as u32 + 4095) & !4095) + 4096)
+                        .context("allocation overflow")?;
+                    ensure!(next < 0x3000_0000, "VM allocation address space exhausted");
+                    let mut bytes = vec![0; size];
+                    for (i, name) in names.iter().enumerate() {
+                        bytes[i * 40..i * 40 + name.len()].copy_from_slice(name);
+                        bytes[i * 40 + 36] = 1;
+                    }
+                    self.allocations.insert(address, bytes);
+                    self.next_allocation = next;
+                    self.named_scopes.push(NamedScope {
+                        allocation: address,
+                        names,
+                    });
+                }
+            }
+            0x00fa => {
+                let root = self.read(&mut cursor)?;
+                let path = self.string(self.read(&mut cursor)?)?;
+                ensure!(path.len() < 256, "registry path exceeds engine buffer");
+                self.registry_root = root;
+                self.registry_path = path;
+            }
+            0x0034 => request = Some(PlatformRequest::PumpMessages),
             0x0a8d => request = Some(PlatformRequest::DisableIme),
             0x0262 => {
                 let address = self.read(&mut cursor)?;
@@ -624,6 +839,7 @@ impl BinaryVm {
         if let Some(request) = request {
             event = Event::Platform { location, request };
             self.pending = Some((event.clone(), response_destination));
+            self.pending_bytes = byte_destination;
         }
         Ok(event)
     }

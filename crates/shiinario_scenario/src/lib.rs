@@ -162,6 +162,10 @@ pub enum Event {
         value: u32,
         simulated: bool,
     },
+    PlatformBytesReply {
+        bytes: Vec<u8>,
+        simulated: bool,
+    },
     MouseButtonMapping {
         location: Location,
         value: u32,
