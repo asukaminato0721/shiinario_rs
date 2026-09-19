@@ -1,0 +1,15 @@
+[package]
+name = "shiinario_cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+shiinario_assets.workspace = true
+shiinario_scenario.workspace = true
+shiinario_runtime.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+png = "0.17"
