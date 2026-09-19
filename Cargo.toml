@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/shiinario_assets", "crates/shiinario_scenario", "crates/shiinario_runtime", "crates/shiinario_cli"]
+members = ["crates/na_mpeg2_decoder", "crates/shiinario_assets", "crates/shiinario_scenario", "crates/shiinario_runtime", "crates/shiinario_cli"]
 resolver = "2"
 
 [workspace.package]

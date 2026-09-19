@@ -98,6 +98,49 @@ pub struct Resources {
     archives: Vec<String>,
 }
 impl Resources {
+    /// Write into the existing allocation so SCN pointers retain their identity.
+    pub(crate) fn write_movie_frame(
+        &mut self,
+        id: u32,
+        rect: [i32; 4],
+        frame: &Surface,
+    ) -> Result<()> {
+        let dst = self.surfaces.get(&id).context("missing movie surface")?;
+        let [x, y, width, height] = rect.map(i64::from);
+        if width == 0 || height == 0 {
+            return Ok(());
+        }
+        ensure!(
+            width > 0 && height > 0 && frame.width > 0 && frame.height > 0,
+            "invalid movie frame dimensions"
+        );
+        ensure!(
+            frame.rgba.len() == frame.width as usize * frame.height as usize * 4,
+            "invalid movie frame buffer"
+        );
+        let mut pixels = dst.pixels.read(0, dst.pixels.len())?;
+        for dy in y.max(0)..(y + height).min(i64::from(dst.height)) {
+            let sy = ((dy - y) * i64::from(frame.height) / height) as usize;
+            for dx in x.max(0)..(x + width).min(i64::from(dst.width)) {
+                let sx = ((dx - x) * i64::from(frame.width) / width) as usize;
+                let src = (sy * frame.width as usize + sx) * 4;
+                let dest = dy as usize * dst.stride + dx as usize * 3;
+                pixels[dest..dest + 3].copy_from_slice(&[
+                    frame.rgba[src + 2],
+                    frame.rgba[src + 1],
+                    frame.rgba[src],
+                ]);
+            }
+        }
+        dst.pixels.write(0, &pixels)
+    }
+    pub(crate) fn present_movie(&mut self, stretch: &SurfaceStretch) -> Result<()> {
+        self.stretch_surface(stretch)
+    }
+    pub(crate) fn surface_dimensions(&self, id: u32) -> Result<[i32; 2]> {
+        let surface = self.surfaces.get(&id).context("missing movie surface")?;
+        Ok([surface.width as i32, surface.height as i32])
+    }
     /// The native pre-SCN initializer allocates Vram buffers (default two).
     pub fn for_project(project: &Project) -> Result<Self> {
         let count: i32 = project
@@ -725,7 +768,7 @@ impl Resources {
         dst.pixels.write(0, &pixels)
     }
 
-    fn create_surface(&mut self, id: u32, width: u32, height: u32, flags: u32) -> Result<()> {
+    pub fn create_surface(&mut self, id: u32, width: u32, height: u32, flags: u32) -> Result<()> {
         ensure!(
             id < 256 && width > 0 && height > 0 && width <= 16384 && height <= 16384,
             "invalid drawing surface dimensions or slot"

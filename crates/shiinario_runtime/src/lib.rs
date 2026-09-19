@@ -2,6 +2,7 @@
 pub mod audio;
 mod buffer_audio;
 pub mod input;
+pub mod movie;
 pub mod native;
 mod presentation;
 pub mod replay;

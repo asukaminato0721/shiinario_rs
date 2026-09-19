@@ -193,6 +193,10 @@ impl Host for NativeHost {
             .stop(handle)
     }
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
+        // Movies can be opened before SCN initializes the ordinary sound slots.
+        if self.audio.is_none() {
+            self.audio = Some(AudioOutput::open()?);
+        }
         self.audio
             .as_ref()
             .context("audio has not been initialized")?
@@ -346,6 +350,11 @@ impl App<'_> {
     }
 }
 impl ApplicationHandler for App<'_> {
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // EGL surface destruction still needs the Wayland display connection.
+        // Release GPU presentation before run_app tears down the event loop.
+        self.presentation = None;
+    }
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.host.is_none()
             && let Err(error) = self.initialize(event_loop)

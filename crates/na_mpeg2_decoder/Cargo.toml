@@ -1,0 +1,21 @@
+[package]
+name = "na_mpeg2_decoder"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Rust MPEG-1/2 decoder vendored from siglus_rs"
+
+[dependencies]
+thiserror = "1"
+log = "0.4"
+byteorder = "1"
+symphonia = { version = "0.5.5", default-features = false, features = ["mpa"] }
+oxideav-ac3 = "0.0.10"
+oxideav-core = "=0.1.29"
+
+[lints.rust]
+unused = "allow"
+non_upper_case_globals = "allow"
+
+[lints.clippy]
+all = "allow"

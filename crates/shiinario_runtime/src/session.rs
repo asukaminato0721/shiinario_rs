@@ -3,7 +3,7 @@ use crate::resources::{AudioStream, Resources, Sound, Surface};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
-use shiinario_scenario::{BinaryVm, Event, PlatformRequest, SoundCommand};
+use shiinario_scenario::{BinaryVm, Event, MovieCommand, PlatformRequest, SoundCommand};
 use std::sync::Arc;
 
 pub trait Host {
@@ -27,6 +27,7 @@ pub trait Host {
 pub struct Session {
     vm: BinaryVm,
     resources: Resources,
+    movies: crate::movie::Movies,
 }
 impl Session {
     pub fn set_best_effort(&mut self, enabled: bool) {
@@ -50,6 +51,7 @@ impl Session {
         Ok(Self {
             vm,
             resources: Resources::for_project(project)?,
+            movies: Default::default(),
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -105,6 +107,7 @@ impl Session {
                 );
             }
             host.poll()?;
+            self.movies.update(host, resources)?;
             vm.respond(1)?;
             emit(&Event::PlatformReply {
                 value: 1,
@@ -116,6 +119,7 @@ impl Session {
             resources.register_archive(name);
         }
         if matches!(event, Event::End) {
+            self.movies.stop_all(host)?;
             return Ok(false);
         }
         if let Event::Platform { location, request } = event {
@@ -135,6 +139,57 @@ impl Session {
                 emit(&Event::PointReply {
                     point,
                     simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::Movie { id, command } = &request {
+                if matches!(command, MovieCommand::Dimensions) {
+                    let point = self.movies.dimensions(*id)?;
+                    vm.respond_point(point)?;
+                    emit(&Event::PointReply {
+                        point,
+                        simulated: false,
+                    })?;
+                } else {
+                    let value = if let MovieCommand::Open { name, .. } = command {
+                        self.movies
+                            .open(*id, command, project.read(name)?, resources, host)
+                    } else {
+                        self.movies.command(*id, command, resources, host)
+                    }
+                    .with_context(|| {
+                        format!(
+                            "{}:{:#x}: movie slot {id}: {command:?}",
+                            location.scenario, location.offset
+                        )
+                    })?;
+                    vm.respond(value)?;
+                    emit(&Event::PlatformReply {
+                        value,
+                        simulated: host.simulated(),
+                    })?;
+                }
+                return Ok(true);
+            }
+            if let PlatformRequest::PlayMovies { ids } = &request {
+                for id in ids {
+                    self.movies
+                        .command(*id, &MovieCommand::Play, resources, host)?;
+                }
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if matches!(request, PlatformRequest::DirectShowAvailable) {
+                // This probes COM support, not the legacy 05b5 movie backend.
+                // Keep the script on the portable MPEG path on all hosts.
+                vm.respond(0)?;
+                emit(&Event::PlatformReply {
+                    value: 0,
+                    simulated: false,
                 })?;
                 return Ok(true);
             }
@@ -432,6 +487,14 @@ impl Session {
             } else {
                 host.respond(&request)?
             };
+            // A task can remain in a timer retry without reaching another
+            // scheduler poll. Movie playback must keep advancing during it.
+            if matches!(
+                request,
+                PlatformRequest::WaitTaskTimer { .. } | PlatformRequest::PumpMessages
+            ) {
+                self.movies.update(host, resources)?;
+            }
             emit(&Event::PlatformReply {
                 value,
                 simulated: resource_reply.is_none() && host.simulated(),

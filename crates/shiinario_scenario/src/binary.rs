@@ -88,9 +88,48 @@ pub enum SoundCommand {
     Status,
 }
 
+/// Legacy movie controls (05b4..05c3). Times are in milliseconds.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum MovieCommand {
+    Open {
+        name: String,
+        flags: u32,
+        surface: u32,
+        play: bool,
+    },
+    Stop,
+    Pause,
+    Play,
+    Status,
+    Position,
+    Seek {
+        milliseconds: u32,
+    },
+    LoopCount,
+    Dimensions,
+    Update {
+        present: bool,
+    },
+    Rect {
+        rect: [i32; 4],
+    },
+    Volume,
+    SetVolume {
+        percent: u32,
+    },
+}
+
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    Movie {
+        id: u32,
+        command: MovieCommand,
+    },
+    PlayMovies {
+        ids: Vec<u32>,
+    },
+    DirectShowAvailable,
     /// Controls plus bit 16 for the WM_CHAR-style latch. A clear only resets
     /// that latch; it does not consume physical button/key state.
     TextInput {
@@ -489,7 +528,6 @@ pub struct BinaryVm {
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
     best_effort: bool,
-    skipped_movies: std::collections::BTreeSet<u32>,
     text_image: [u32; 2],
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the default text context.
@@ -553,7 +591,6 @@ impl BinaryVm {
             task_timers: Default::default(),
             text_style: Default::default(),
             best_effort: false,
-            skipped_movies: Default::default(),
             text_image: [u32::MAX, 0],
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
@@ -1583,70 +1620,81 @@ impl BinaryVm {
                 )?;
                 memory_write = Some((destination, bytes));
             }
-            0x05b5 => {
-                ensure!(
-                    self.best_effort,
-                    "movie playback is unavailable; use best-effort playback to skip movies"
-                );
-                let id = self.read(&mut cursor)?;
-                let name = self.string(self.read(&mut cursor)?)?;
-                let flags = self.read(&mut cursor)?;
-                let surface = self.read(&mut cursor)?;
-                ensure!(
-                    id < 16 && (surface < 256 || surface == u32::MAX),
-                    "movie slot or surface out of bounds"
-                );
-                self.skipped_movies.insert(id);
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: format!(
-                        "movie {name:?} omitted; slot {id}, flags {flags:#x}, surface {surface}; report completed with viewport dimensions"
-                    ),
-                };
-            }
-            0x05b6 | 0x05b9 | 0x05bf | 0x05c1 => {
-                let id = self.read(&mut cursor)?;
-                ensure!(
-                    self.best_effort && self.skipped_movies.contains(&id),
-                    "movie operation requires a known skipped movie slot"
-                );
-                match opcode {
-                    0x05b9 => {
-                        let destination = self.destination(&mut cursor)?;
-                        // 40b7f0 maps stopped/completed movie states to 0x20d.
-                        writes.push((destination, 0x20d));
+            0x05b4..=0x05c3 => {
+                if opcode == 0x05be {
+                    let mut ids = Vec::new();
+                    loop {
+                        let id = self.read(&mut cursor)?;
+                        if id == u32::MAX {
+                            break;
+                        }
+                        ensure!(id < 16 && ids.len() < 16, "invalid movie play list");
+                        ids.push(id);
                     }
-                    0x05bf => {
-                        let width = self.destination(&mut cursor)?;
-                        let height = self.destination(&mut cursor)?;
-                        writes.push((width, self.viewport[0]));
-                        writes.push((height, self.viewport[1]));
-                    }
-                    _ => {}
+                    request = Some(PlatformRequest::PlayMovies { ids });
+                } else {
+                    let id = self.read(&mut cursor)?;
+                    ensure!(id < 16, "movie slot out of bounds");
+                    let command = match opcode {
+                        0x05b4 => MovieCommand::Rect {
+                            rect: [
+                                self.read(&mut cursor)? as i32,
+                                self.read(&mut cursor)? as i32,
+                                self.read(&mut cursor)? as i32,
+                                self.read(&mut cursor)? as i32,
+                            ],
+                        },
+                        0x05b5 | 0x05bd => {
+                            let name = self.string(self.read(&mut cursor)?)?;
+                            let flags = self.read(&mut cursor)?;
+                            let surface = self.read(&mut cursor)?;
+                            ensure!(
+                                surface < 256 || surface == u32::MAX,
+                                "movie surface out of bounds"
+                            );
+                            MovieCommand::Open {
+                                name,
+                                flags,
+                                surface,
+                                play: opcode == 0x05b5,
+                            }
+                        }
+                        0x05b6 => MovieCommand::Stop,
+                        0x05b7 => MovieCommand::Pause,
+                        0x05b8 => MovieCommand::Play,
+                        0x05bb => MovieCommand::Seek {
+                            milliseconds: self.read(&mut cursor)?,
+                        },
+                        0x05bf => {
+                            point_destinations = Some([
+                                self.destination(&mut cursor)?,
+                                self.destination(&mut cursor)?,
+                            ]);
+                            MovieCommand::Dimensions
+                        }
+                        0x05c0 | 0x05c1 => MovieCommand::Update {
+                            present: opcode == 0x05c1,
+                        },
+                        0x05c3 => MovieCommand::SetVolume {
+                            percent: self.read(&mut cursor)?,
+                        },
+                        _ => {
+                            response_destination = Some(self.destination(&mut cursor)?);
+                            match opcode {
+                                0x05b9 => MovieCommand::Status,
+                                0x05ba => MovieCommand::Position,
+                                0x05bc => MovieCommand::LoopCount,
+                                0x05c2 => MovieCommand::Volume,
+                                _ => unreachable!(),
+                            }
+                        }
+                    };
+                    request = Some(PlatformRequest::Movie { id, command });
                 }
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: format!(
-                        "operation on omitted movie slot {id}; playback remains complete"
-                    ),
-                };
             }
             0x073f => {
-                // Original 40c5b0 probes DirectShow COM components. No native
-                // movie backend is connected yet; report that capability.
-                let destination = self.destination(&mut cursor)?;
-                ensure!(
-                    self.best_effort,
-                    "movie playback is unavailable; use best-effort playback to report no DirectShow support"
-                );
-                writes.push((destination, 0));
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: "DirectShow movie capability unavailable; script receives false".into(),
-                };
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::DirectShowAvailable);
             }
             0x0028 => {
                 delay = Some(self.read(&mut cursor)?);
@@ -3346,7 +3394,7 @@ mod tests {
     }
 
     #[test]
-    fn skipped_movie_reports_completion_and_consumes_query_destinations() {
+    fn movie_requests_preserve_destinations_and_instruction_boundaries() {
         let mut args = immediate(0);
         args.extend(b"\x10fixture.mpg\0");
         args.extend(immediate(0));
@@ -3359,21 +3407,46 @@ mod tests {
         args.extend([12, 2, 0]);
         code.extend(instruction(0x5b9, &args));
         code.extend(instruction(0x5b6, &immediate(0)));
+        code.extend(instruction(0x73f, &[12, 3, 0]));
         code.extend(instruction(0x49d, &immediate(7)));
-        assert!(
-            BinaryVm::new("strict.scn", code.clone())
-                .unwrap()
-                .step()
-                .is_err()
-        );
-        let mut vm = BinaryVm::new("skip-movie.scn", code).unwrap();
-        vm.set_best_effort(true);
-        for opcode in [0x5b5, 0x5bf, 0x5b9, 0x5b6] {
+        // These requests work in strict mode, without compatibility skips.
+        let mut vm = BinaryVm::new("movie.scn", code).unwrap();
+        for command in [
+            MovieCommand::Open {
+                name: "fixture.mpg".into(),
+                flags: 0,
+                surface: 13,
+                play: true,
+            },
+            MovieCommand::Dimensions,
+            MovieCommand::Status,
+            MovieCommand::Stop,
+        ] {
+            let event = vm.step().unwrap();
             assert!(
-                matches!(vm.step().unwrap(), Event::CompatibilitySkip { opcode: actual, .. } if actual == opcode)
+                matches!(&event, Event::Platform { request: PlatformRequest::Movie { id: 0, command: actual }, .. } if *actual == command)
             );
+            assert_eq!(vm.step().unwrap(), event);
+            if command == MovieCommand::Dimensions {
+                vm.respond_point([320, 240]).unwrap();
+            } else {
+                vm.respond(if command == MovieCommand::Status {
+                    0x20e
+                } else {
+                    1
+                })
+                .unwrap();
+            }
         }
-        assert_eq!(vm.banks[&12][..3], [800, 600, 0x20d]);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::DirectShowAvailable,
+                ..
+            }
+        ));
+        vm.respond(0).unwrap();
+        assert_eq!(vm.banks[&12][..4], [320, 240, 0x20e, 0]);
         vm.step().unwrap();
         assert_eq!(vm.mouse_mapping.value, 7);
     }

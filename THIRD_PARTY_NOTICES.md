@@ -1,5 +1,11 @@
 # Third-party notices
 
+The bundled `crates/na_mpeg2_decoder` library comes from `siglus_rs` revision
+`91b0882ea938638c9eebe5e10e93c7f1be4fab61` under MPL-2.0. The decoder library
+sources are unchanged; desktop examples and their dependencies are excluded.
+See its [provenance](crates/na_mpeg2_decoder/README.md) and
+[license](crates/na_mpeg2_decoder/LICENSE-MPL-2.0).
+
 The WARC encryption/decompression and S25 decoder are Rust ports of GARbro
 by morkt. The unchanged upstream format catalog is bundled as
 [`crates/shiinario_assets/data/garbro/Formats.dat`](crates/shiinario_assets/data/garbro/Formats.dat).

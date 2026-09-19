@@ -6,13 +6,15 @@ an 800×600 title screen, plays music and effects through CPAL, and enters the s
 with Japanese text and transitions. The title pixels match the original x86 renderer.
 Native and headless hosts share the same interpreter and resources. Native text uses
 Fontconfig and an installed Japanese font; the fallback glyphs differ from Windows.
-Movies, complete menu/choice coverage and compatible saves remain unfinished.
+MPEG-1/2 movies play with audio, including pause, resume, seek and loop controls.
+Complete menu/choice coverage and compatible saves remain unfinished.
 
 Native playback defaults to best effort: identified optional presentation operations
 print `SKIP` with their scenario location. Currently this approximates image-frame text, omits affine/pixelation filters,
 applies audio fades immediately and uses software buffers for DirectDraw surfaces.
-The movie capability probe reports unavailable; the reached movie path is skipped
-and reports completion. Actual movie playback is not implemented. Calendar metadata is a fixed placeholder;
+The DirectShow COM probe reports unavailable; scripts use the implemented legacy
+MPEG movie path. Movie playback also works in strict mode. Other movie formats
+are rejected with an error. Calendar metadata is a fixed placeholder;
 automatic and manual file writes are logged and omitted, so no save is created. Use `--strict` to reject these approximations.
 Other unknown commands still stop with context because their operands and control-flow
 effects are not known. Headless traces require explicit `--best-effort` for these omissions.
@@ -29,6 +31,12 @@ cargo test --workspace --locked
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
+
+Movie decoding uses the bundled MPEG decoder from `siglus_rs`; neither that
+checkout nor FFmpeg is needed at runtime. Video frames are decoded incrementally,
+while compressed input and decoded audio are retained under a memory budget.
+The independent movie regression suite runs with
+`cargo test -p shiinario_runtime --test movie --locked` and uses a synthetic clip.
 
 Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not been verified.
 
