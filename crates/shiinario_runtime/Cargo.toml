@@ -11,6 +11,9 @@ shiinario_scenario.workspace = true
 serde.workspace = true
 sha2.workspace = true
 cpal = "0.15.3"
+wgpu = "0.20"
+winit = "0.30.13"
+pollster = "0.3"
 
 [dev-dependencies]
 serde_json.workspace = true

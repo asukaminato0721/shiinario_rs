@@ -50,7 +50,6 @@ pub fn trace_with_clock(
         simulate_platform || tick_ms == 0,
         "trace clock requires a simulated platform"
     );
-    let data = project.read(name)?;
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut session = session::Session::new(project, name)?;
         let mut platform = TracePlatform {
@@ -70,7 +69,7 @@ pub fn trace_with_clock(
             session.location().offset
         );
     }
-    let script = TextScript::parse(name, &data)?;
+    let script = TextScript::parse(name, &project.read(name)?)?;
     let mut vm = TextVm::new(script);
     for _ in 0..max_steps {
         let event = vm.step()?;
