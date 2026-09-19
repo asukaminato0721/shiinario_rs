@@ -191,6 +191,9 @@ impl Project {
             .with_context(|| format!("asset not found: {name}"))
     }
     pub fn read(&self, name: &str) -> Result<Vec<u8>> {
+        if let Some(data) = self.read_loose(name)? {
+            return Ok(data);
+        }
         match self.resolve(name)? {
             Source::Loose(p) => {
                 ensure!(
@@ -213,6 +216,11 @@ impl Project {
     }
     /// Original WARC index fields, in decoded-size / stored-size order.
     pub fn sizes_with_archives(&self, name: &str, paths: &[String]) -> Result<[u32; 2]> {
+        if let Some(path) = self.loose_path(name, false)? {
+            let size = std::fs::metadata(path)?.len();
+            ensure!(size <= MAX_OUTPUT as u64, "file exceeds cap");
+            return Ok([0, size as u32]);
+        }
         let (_, entry) = self.registered_entry(name, paths)?;
         Ok([entry.unpacked_size, entry.size])
     }
@@ -238,28 +246,89 @@ impl Project {
     /// Filesystem-only lookup used by SCN GetFileAttributes checks. Archive
     /// entries and the archive basename fallback do not participate.
     pub fn loose_path_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.loose_path(name, false)?.is_some())
+    }
+    /// Resolve on each access: scripts can create files after Project::open.
+    /// Reject links and ambiguous case aliases, including at the write target.
+    fn loose_path(&self, name: &str, create: bool) -> Result<Option<PathBuf>> {
         let normalized = normalize(name)?;
         let mut current = self.root.clone();
-        for component in normalized.split('/') {
+        let mut components = normalized.split('/').peekable();
+        while let Some(component) = components.next() {
             if !current.is_dir() {
-                return Ok(false);
+                return Ok(None);
             }
             let mut matched = None;
             for entry in std::fs::read_dir(&current)? {
                 let entry = entry?;
-                if entry.file_name().to_string_lossy().to_lowercase() == component
-                    && !entry.file_type()?.is_symlink()
-                {
+                if entry.file_name().to_string_lossy().to_lowercase() == component {
+                    ensure!(
+                        !entry.file_type()?.is_symlink(),
+                        "symbolic link in file path {name}"
+                    );
                     ensure!(matched.is_none(), "ambiguous Windows filename {name}");
                     matched = Some(entry.path());
                 }
             }
-            let Some(path) = matched else {
-                return Ok(false);
-            };
-            current = path;
+            match matched {
+                Some(path) => current = path,
+                None if create && components.peek().is_none() => current.push(component),
+                None => return Ok(None),
+            }
         }
-        Ok(current.exists())
+        Ok(Some(current))
+    }
+    pub fn read_loose(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        let Some(path) = self.loose_path(name, false)? else {
+            return Ok(None);
+        };
+        let mut file = std::fs::File::open(path)?;
+        ensure!(
+            file.metadata()?.len() <= MAX_OUTPUT as u64,
+            "file exceeds cap"
+        );
+        let mut bytes = Vec::new();
+        use std::io::Read;
+        (&mut file)
+            .take(MAX_OUTPUT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= MAX_OUTPUT, "file exceeds cap");
+        Ok(Some(bytes))
+    }
+    /// Preserve the previous slot if a write fails. Persist only original bytes.
+    pub fn write_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+        ensure!(bytes.len() <= 16 * 1024 * 1024, "file write exceeds 16 MiB");
+        let target = self
+            .loose_path(name, true)?
+            .context("file parent directory does not exist")?;
+        ensure!(!target.is_dir(), "file destination is a directory");
+        let parent = target.parent().context("missing file parent")?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let (temp, mut file) = loop {
+            let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = parent.join(format!(".shiinario-{}-{id}.tmp", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        };
+        let result = (|| -> Result<()> {
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &target)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(temp);
+        }
+        result.with_context(|| format!("write file {name}"))
     }
 }
 /// LRU cache counts decoded bytes and never retains a single oversized asset.

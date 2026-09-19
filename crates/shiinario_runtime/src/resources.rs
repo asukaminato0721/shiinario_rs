@@ -1,5 +1,5 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::{
     ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCapture,
@@ -87,6 +87,12 @@ impl Image {
         }
     }
 }
+struct OpenFile {
+    name: String,
+    bytes: Vec<u8>,
+    position: usize,
+    access: u32,
+}
 #[derive(Default)]
 pub struct Resources {
     text_renderer: crate::text_render::TextRenderer,
@@ -96,6 +102,8 @@ pub struct Resources {
     streams: BTreeMap<u32, Arc<AudioStream>>,
     resident: usize,
     archives: Vec<String>,
+    transient_files: BTreeMap<String, Vec<u8>>,
+    files: BTreeMap<u32, OpenFile>,
 }
 impl Resources {
     /// Write into the existing allocation so SCN pointers retain their identity.
@@ -161,10 +169,161 @@ impl Resources {
         Ok(resources)
     }
     pub fn asset_sizes(&self, project: &Project, name: &str) -> Result<[u32; 2]> {
+        if let Some(bytes) = self
+            .transient_files
+            .get(&shiinario_assets::project::normalize(name)?)
+        {
+            return Ok([0, bytes.len() as u32]);
+        }
         project.sizes_with_archives(name, &self.archives)
     }
     pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
         project.read_with_archives(name, &self.archives)
+    }
+    pub fn read_file_contents(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
+        if let Some(bytes) = self
+            .transient_files
+            .get(&shiinario_assets::project::normalize(name)?)
+        {
+            return Ok(bytes.clone());
+        }
+        project.read_loose(name)?.context("file not found")
+    }
+    pub fn open_file(&mut self, project: &Project, name: &str, access: u32) -> Result<[u32; 4]> {
+        ensure!(
+            access & !0xc0000000 == 0 && access != 0,
+            "unsupported file access {access:#x}"
+        );
+        ensure!(self.files.len() < 256, "too many open files");
+        let key = shiinario_assets::project::normalize(name)?;
+        let bytes = match self.transient_files.get(&key) {
+            Some(bytes) => bytes.clone(),
+            None => project.read_loose(name)?.context("file not found")?,
+        };
+        let total: usize = self.files.values().map(|file| file.bytes.len()).sum();
+        ensure!(
+            bytes.len() <= 16 * 1024 * 1024 && total + bytes.len() <= 64 * 1024 * 1024,
+            "open files exceed memory cap"
+        );
+        let handle = (1..=256).find(|id| !self.files.contains_key(id)).unwrap();
+        let length = bytes.len() as u32;
+        self.files.insert(
+            handle,
+            OpenFile {
+                name: key,
+                bytes,
+                position: 0,
+                access,
+            },
+        );
+        Ok([0, length, 0, handle])
+    }
+    pub fn close_file(&mut self, handle: u32) -> Result<()> {
+        self.files.remove(&handle).context("invalid file handle")?;
+        Ok(())
+    }
+    pub fn read_file(&mut self, handle: u32, length: u32) -> Result<Vec<u8>> {
+        ensure!(length <= 16 * 1024 * 1024, "file read exceeds cap");
+        let file = self.files.get_mut(&handle).context("invalid file handle")?;
+        ensure!(
+            file.access & 0x80000000 != 0,
+            "file is not open for reading"
+        );
+        let start = file.position.min(file.bytes.len());
+        let end = file
+            .position
+            .saturating_add(length as usize)
+            .min(file.bytes.len());
+        let bytes = file.bytes[start..end].to_vec();
+        file.position += bytes.len();
+        Ok(bytes)
+    }
+    pub fn seek_file(&mut self, handle: u32, distance: i32, origin: u32) -> Result<u32> {
+        let file = self.files.get_mut(&handle).context("invalid file handle")?;
+        let base = match origin {
+            0 => 0,
+            1 => file.position,
+            2 => file.bytes.len(),
+            _ => bail!("invalid file seek origin"),
+        };
+        let position = base as i64 + i64::from(distance);
+        ensure!(
+            (0..=u32::MAX as i64 - 1).contains(&position),
+            "invalid file seek position"
+        );
+        file.position = position as usize;
+        Ok(position as u32)
+    }
+    pub fn write_file_handle(
+        &mut self,
+        project: &Project,
+        handle: u32,
+        bytes: Vec<u8>,
+        simulated: bool,
+    ) -> Result<u32> {
+        let file = self.files.get(&handle).context("invalid file handle")?;
+        ensure!(
+            file.access & 0x40000000 != 0,
+            "file is not open for writing"
+        );
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let end = file
+            .position
+            .checked_add(bytes.len())
+            .context("file size overflow")?;
+        ensure!(end <= 16 * 1024 * 1024, "file write exceeds cap");
+        let total: usize = self
+            .files
+            .iter()
+            .filter(|(id, _)| **id != handle)
+            .map(|(_, file)| file.bytes.len())
+            .sum();
+        ensure!(
+            total + end.max(file.bytes.len()) <= 64 * 1024 * 1024,
+            "open files exceed memory cap"
+        );
+        let mut contents = file.bytes.clone();
+        contents.resize(end.max(contents.len()), 0);
+        contents[file.position..end].copy_from_slice(&bytes);
+        let name = file.name.clone();
+        self.write_file(project, &name, contents.clone(), simulated)?;
+        let file = self.files.get_mut(&handle).unwrap();
+        file.bytes = contents;
+        file.position = end;
+        Ok(bytes.len() as u32)
+    }
+    pub fn file_exists(&self, project: &Project, name: &str) -> Result<bool> {
+        Ok(self
+            .transient_files
+            .contains_key(&shiinario_assets::project::normalize(name)?)
+            || project.loose_path_exists(name)?)
+    }
+    pub fn write_file(
+        &mut self,
+        project: &Project,
+        name: &str,
+        bytes: Vec<u8>,
+        simulated: bool,
+    ) -> Result<()> {
+        if simulated {
+            let key = shiinario_assets::project::normalize(name)?;
+            let total: usize = self
+                .transient_files
+                .iter()
+                .filter(|(name, _)| **name != key)
+                .map(|(_, bytes)| bytes.len())
+                .sum();
+            ensure!(
+                total + bytes.len() <= 64 * 1024 * 1024,
+                "transient files exceed 64 MiB"
+            );
+            self.transient_files.insert(key, bytes);
+            Ok(())
+        } else {
+            project.write_file(name, &bytes)
+        }
     }
     pub fn register_archive(&mut self, name: &str) {
         if !self

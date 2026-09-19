@@ -2216,6 +2216,7 @@ dependencies = [
  "cpal",
  "encoding_rs",
  "flate2",
+ "libc",
  "na_mpeg2_decoder",
  "pollster",
  "serde",

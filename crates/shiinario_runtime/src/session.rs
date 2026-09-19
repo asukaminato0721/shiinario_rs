@@ -11,6 +11,9 @@ pub trait Host {
         true
     }
     fn simulated(&self) -> bool;
+    fn calendar(&mut self, time: bool) -> Result<[u32; 4]> {
+        crate::calendar::local(time)
+    }
     fn poll(&mut self) -> Result<()>;
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32>;
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]>;
@@ -338,6 +341,72 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::LocalCalendar { time } = &request {
+                vm.respond_calendar(host.calendar(*time)?)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::OpenFile { name, access } = &request {
+                vm.respond_file_open(resources.open_file(project, name, *access)?)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ReadFile { handle, length, .. } = &request {
+                vm.respond_file_read(&resources.read_file(*handle, *length)?)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::WriteFileHandle { handle, .. } = &request {
+                let count = resources.write_file_handle(
+                    project,
+                    *handle,
+                    vm.file_write_bytes()?,
+                    host.simulated(),
+                )?;
+                vm.respond(count)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::CloseFile { handle } = &request {
+                resources.close_file(*handle)?;
+                vm.respond(1)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::SeekFile {
+                handle,
+                distance,
+                origin,
+            } = &request
+            {
+                vm.respond(resources.seek_file(*handle, *distance, *origin)?)?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ReadFlags { name, .. } = &request {
+                vm.respond_flags(&resources.read_file_contents(project, name)?)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::WriteFlags { name, .. } = &request {
+                resources.write_file(project, name, vm.flag_write_bytes()?, host.simulated())?;
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::WriteFile { name, .. } = &request {
+                resources
+                    .write_file(project, name, vm.file_write_bytes()?, host.simulated())
+                    .with_context(|| {
+                        format!("{}:{:#x}: write {name}", location.scenario, location.offset)
+                    })?;
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::AssetSizes { name } = &request {
                 let sizes = resources.asset_sizes(project, name).with_context(|| {
                     format!(
@@ -483,7 +552,7 @@ impl Session {
             let value = if let Some(value) = resource_reply {
                 value
             } else if let PlatformRequest::FileExists { path } = &request {
-                u32::from(project.loose_path_exists(path)?)
+                u32::from(resources.file_exists(project, path)?)
             } else {
                 host.respond(&request)?
             };

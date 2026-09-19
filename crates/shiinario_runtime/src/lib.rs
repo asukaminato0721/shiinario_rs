@@ -1,6 +1,7 @@
 //! Host-independent project startup and deterministic research traces.
 pub mod audio;
 mod buffer_audio;
+mod calendar;
 pub mod input;
 pub mod movie;
 pub mod native;
@@ -180,6 +181,9 @@ impl Default for TracePlatform {
     }
 }
 impl Host for TracePlatform {
+    fn calendar(&mut self, time: bool) -> Result<[u32; 4]> {
+        Ok(if time { [0; 4] } else { [2000, 1, 1, 6] })
+    }
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
         std::mem::take(&mut self.replay.window_messages)
     }

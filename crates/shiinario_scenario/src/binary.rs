@@ -228,6 +228,44 @@ pub enum PlatformRequest {
         name: String,
         address: u32,
     },
+    OpenFile {
+        name: String,
+        access: u32,
+    },
+    CloseFile {
+        handle: u32,
+    },
+    ReadFile {
+        handle: u32,
+        address: u32,
+        length: u32,
+    },
+    WriteFileHandle {
+        handle: u32,
+        address: u32,
+        length: u32,
+    },
+    SeekFile {
+        handle: u32,
+        distance: i32,
+        origin: u32,
+    },
+    ReadFlags {
+        name: String,
+        system: bool,
+    },
+    WriteFlags {
+        name: String,
+        system: bool,
+    },
+    WriteFile {
+        name: String,
+        address: u32,
+        length: u32,
+    },
+    LocalCalendar {
+        time: bool,
+    },
     LoadAsset {
         name: String,
     },
@@ -510,6 +548,7 @@ pub struct BinaryVm {
     window_callback: Option<(u32, usize)>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
+    retired_scopes: std::collections::BTreeSet<u32>,
     parameters: Vec<u32>,
     registry_root: u32,
     registry_path: String,
@@ -518,6 +557,8 @@ pub struct BinaryVm {
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
     pending_sizes: Option<[Destination; 2]>,
+    pending_calendar: Option<[Destination; 4]>,
+    pending_file: Option<[Destination; 4]>,
     // Some(true) resets this task's epoch; Some(false) reads elapsed time.
     pending_timer: Option<bool>,
     pending_delay: Option<u32>,
@@ -578,6 +619,7 @@ impl BinaryVm {
             window_callback: None,
             ended: false,
             named_scopes: Vec::new(),
+            retired_scopes: Default::default(),
             parameters: Vec::new(),
             registry_root: 0,
             registry_path: String::new(),
@@ -586,6 +628,8 @@ impl BinaryVm {
             pending_bounds: None,
             pending_point: None,
             pending_sizes: None,
+            pending_calendar: None,
+            pending_file: None,
             pending_timer: None,
             pending_delay: None,
             task_timers: Default::default(),
@@ -644,6 +688,7 @@ impl BinaryVm {
         task.flags = u32::from(activate);
         task.parameters.clear();
         self.task_entries.insert(id, (base, pc));
+        self.collect_retired_scopes();
     }
     fn select_task(&mut self, id: u32) {
         if id == self.current_task {
@@ -815,6 +860,14 @@ impl BinaryVm {
     /// response return the same request, without executing the next instruction.
     pub fn respond(&mut self, value: u32) -> Result<()> {
         ensure!(
+            self.pending_file.is_none(),
+            "platform request requires file metadata"
+        );
+        ensure!(
+            self.pending_calendar.is_none(),
+            "platform request requires calendar values"
+        );
+        ensure!(
             self.pending_sizes.is_none(),
             "platform request requires asset sizes"
         );
@@ -840,7 +893,9 @@ impl BinaryVm {
             ensure!(
                 !matches!(
                     request,
-                    PlatformRequest::LoadScenario { .. }
+                    PlatformRequest::ReadFile { .. }
+                        | PlatformRequest::ReadFlags { .. }
+                        | PlatformRequest::LoadScenario { .. }
                         | PlatformRequest::LoadAsset { .. }
                         | PlatformRequest::ReadAssetInto { .. }
                         | PlatformRequest::SurfacePixels { .. }
@@ -849,7 +904,9 @@ impl BinaryVm {
             );
             if matches!(
                 request,
-                PlatformRequest::CreateAudioStream { .. }
+                PlatformRequest::WriteFile { .. }
+                    | PlatformRequest::WriteFlags { .. }
+                    | PlatformRequest::CreateAudioStream { .. }
                     | PlatformRequest::DrawGlyph { .. }
                     | PlatformRequest::DrawImageGlyph { .. }
                     | PlatformRequest::CreateSurface { .. }
@@ -1130,6 +1187,7 @@ impl BinaryVm {
         }
         self.next_scenario_base = next;
         self.pending = None;
+        self.collect_retired_scopes();
         Ok(())
     }
     fn scenario_size(&self, base: u32) -> Result<usize> {
@@ -1186,6 +1244,138 @@ impl BinaryVm {
         }
         self.pending = None;
         Ok(())
+    }
+    pub fn respond_file_open(&mut self, values: [u32; 4]) -> Result<()> {
+        let destinations = self.pending_file.take().context("no pending file open")?;
+        for (destination, value) in destinations.into_iter().zip(values) {
+            self.write(destination, value);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn respond_file_read(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some((
+            Event::Platform {
+                request:
+                    PlatformRequest::ReadFile {
+                        address, length, ..
+                    },
+                ..
+            },
+            destination,
+        )) = &self.pending
+        else {
+            bail!("no pending file read");
+        };
+        ensure!(
+            bytes.len() <= *length as usize,
+            "file reply exceeds requested length"
+        );
+        let destination = *destination;
+        let range = self.memory_range(*address, bytes.len())?;
+        self.memory_write(range, bytes);
+        if let Some(destination) = destination {
+            self.write(destination, bytes.len() as u32);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn flag_write_bytes(&self) -> Result<Vec<u8>> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::WriteFlags { system, .. },
+                ..
+            },
+            _,
+        )) = &self.pending
+        else {
+            bail!("no pending flag write");
+        };
+        let mut bytes = if *system {
+            self.memory_read(bank_base(14), 4000)?
+        } else {
+            let mut bytes = self.memory_read(bank_base(6), 1000)?;
+            bytes.extend(self.memory_read(bank_base(10), 4000)?);
+            bytes
+        };
+        let length = bytes.len();
+        bytes.resize(length + 8, 0);
+        if self.save_encoding != 0 {
+            // The native rand() byte is stored in the trailer. Any byte is a
+            // valid seed; use the instruction counter for repeatable traces.
+            let seed = self.steps as u8;
+            let checksum: u32 = bytes[..length]
+                .iter()
+                .map(|byte| u32::from(byte ^ 0xd3))
+                .sum();
+            for byte in &mut bytes[..length] {
+                *byte ^= seed ^ 0xf4;
+            }
+            bytes[length] = seed ^ 0xb1;
+            bytes[length + 4..].copy_from_slice(&(checksum ^ 0x4bc57d21).to_le_bytes());
+        }
+        Ok(bytes)
+    }
+    pub fn respond_flags(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::ReadFlags { system, .. },
+                ..
+            },
+            _,
+        )) = &self.pending
+        else {
+            bail!("no pending flag read");
+        };
+        let system = *system;
+        let length = if system { 4000 } else { 5000 };
+        ensure!(bytes.len() == length + 8, "invalid flag file length");
+        let mut data = bytes[..length].to_vec();
+        if self.save_encoding != 0 {
+            for byte in &mut data {
+                *byte ^= bytes[length] ^ 0xb1 ^ 0xf4;
+            }
+        }
+        // Native loaders validate length but do not verify the checksum.
+        if system {
+            self.memory_write(self.memory_range(bank_base(14), 4000)?, &data);
+        } else {
+            self.memory_write(self.memory_range(bank_base(6), 1000)?, &data[..1000]);
+            self.memory_write(self.memory_range(bank_base(10), 4000)?, &data[1000..]);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn respond_calendar(&mut self, values: [u32; 4]) -> Result<()> {
+        let destinations = self
+            .pending_calendar
+            .take()
+            .context("no pending calendar query")?;
+        for (destination, value) in destinations.into_iter().zip(values) {
+            self.write(destination, value);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    /// Snapshot a validated pending write without exposing host pointers.
+    pub fn file_write_bytes(&self) -> Result<Vec<u8>> {
+        let Some((
+            Event::Platform {
+                request:
+                    PlatformRequest::WriteFile {
+                        address, length, ..
+                    }
+                    | PlatformRequest::WriteFileHandle {
+                        address, length, ..
+                    },
+                ..
+            },
+            _,
+        )) = &self.pending
+        else {
+            bail!("no pending file write");
+        };
+        self.memory_read(*address, *length as usize)
     }
     pub fn respond_asset_sizes(&mut self, sizes: [u32; 2]) -> Result<()> {
         let destinations = self
@@ -1384,6 +1574,55 @@ impl BinaryVm {
                 Ok(self.banks[&bank][self.bank_index(bank, index)?])
             }
         }
+    }
+    fn return_destinations(&self) -> Vec<u32> {
+        let mut result = Vec::new();
+        for parameters in std::iter::once(&self.parameters)
+            .chain(self.tasks.values().map(|task| &task.parameters))
+        {
+            let mut end = parameters.len();
+            while end > 0 {
+                let count = parameters[end - 1] as usize;
+                let Some(start) = end.checked_sub(count + 2) else {
+                    break;
+                };
+                result.push(parameters[start]);
+                end = start;
+            }
+        }
+        result
+    }
+    fn release_scope(&mut self, address: u32) {
+        let length = self.allocations[&address].len() as u32;
+        if self
+            .return_destinations()
+            .iter()
+            .any(|&destination| destination >= address && destination < address + length)
+        {
+            // The original scripts mix 0281 calls with 026c returns. This can
+            // leave a result pointer into a scope that 03cf has already freed.
+            // Keep only that VM backing allocation until the pending return;
+            // remove the names immediately and never dereference a host pointer.
+            self.retired_scopes.insert(address);
+        } else {
+            self.allocations.remove(&address);
+        }
+    }
+    fn collect_retired_scopes(&mut self) {
+        let destinations = self.return_destinations();
+        self.retired_scopes.retain(|address| {
+            let Some(bytes) = self.allocations.get(address) else {
+                return false;
+            };
+            if destinations.iter().any(|destination| {
+                *destination >= *address && *destination < *address + bytes.len() as u32
+            }) {
+                true
+            } else {
+                self.allocations.remove(address);
+                false
+            }
+        });
     }
     fn named_address(&self, name: &[u8]) -> Result<u32> {
         for scope in self.named_scopes.iter().rev() {
@@ -1589,6 +1828,10 @@ impl BinaryVm {
         let mut bounds_destinations = None;
         let mut point_destinations = None;
         let mut size_destinations = None;
+        let mut calendar_destinations = None;
+        let mut collect_scopes = false;
+        let mut released_scopes = Vec::new();
+        let mut file_destinations = None;
         let mut timer_reply = None;
         let mut delay = None;
         let mut next_base = self.script_base;
@@ -2103,6 +2346,53 @@ impl BinaryVm {
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadImage { id, name });
             }
+            0x0154 => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                let access = self.read(&mut cursor)?;
+                file_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+                request = Some(PlatformRequest::OpenFile { name, access });
+            }
+            0x0155 => {
+                request = Some(PlatformRequest::CloseFile {
+                    handle: self.read(&mut cursor)?,
+                })
+            }
+            0x0156 | 0x0157 => {
+                let handle = self.read(&mut cursor)?;
+                let address = self.read(&mut cursor)?;
+                let length = self.read(&mut cursor)?;
+                self.memory_range(address, length as usize)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(if opcode == 0x0156 {
+                    PlatformRequest::ReadFile {
+                        handle,
+                        address,
+                        length,
+                    }
+                } else {
+                    PlatformRequest::WriteFileHandle {
+                        handle,
+                        address,
+                        length,
+                    }
+                });
+            }
+            0x0159 => {
+                let handle = self.read(&mut cursor)?;
+                let distance = self.read(&mut cursor)? as i32;
+                let origin = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::SeekFile {
+                    handle,
+                    distance,
+                    origin,
+                });
+            }
             0x0158 => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 size_destinations = Some([
@@ -2123,21 +2413,18 @@ impl BinaryVm {
                 request = Some(PlatformRequest::LoadAsset { name });
             }
             0x00d2 => {
-                ensure!(self.best_effort, "save-file writes are unavailable");
-                // 424793 reads data pointer, length, path; 405ba0 writes the
-                // file. There is no result destination; native failure stops
-                // dispatch. Best-effort logs the omitted write and continues.
+                // 424793 -> 405ba0 writes these bytes verbatim. The scenario
+                // owns the slot format; 0136 does not transform raw file writes.
                 let address = self.read(&mut cursor)?;
                 let length = self.read(&mut cursor)?;
                 let name = self.string(self.read(&mut cursor)?)?;
+                ensure!(length <= 16 * 1024 * 1024, "file write exceeds 16 MiB");
                 self.memory_range(address, length as usize)?;
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: format!(
-                        "file write {name:?} ({length} bytes) omitted; no save was created"
-                    ),
-                };
+                request = Some(PlatformRequest::WriteFile {
+                    name,
+                    address,
+                    length,
+                });
             }
             0x00dd => {
                 ensure!(
@@ -2296,27 +2583,15 @@ impl BinaryVm {
                 });
             }
             0x03b7 | 0x03b8 => {
-                ensure!(
-                    self.best_effort,
-                    "local calendar queries require best-effort placeholder metadata"
-                );
-                // 41ce70/41ced0 call GetLocalTime, then write four WORDs:
-                // year/month/day/weekday or hour/minute/second/millisecond.
-                let values = if opcode == 0x03b7 {
-                    [2000, 1, 1, 6]
-                } else {
-                    [0; 4]
-                };
-                for value in values {
-                    writes.push((self.destination(&mut cursor)?, value));
-                }
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: format!(
-                        "local calendar metadata replaced by deterministic placeholder {values:?}; save compatibility is unavailable"
-                    ),
-                };
+                calendar_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+                request = Some(PlatformRequest::LocalCalendar {
+                    time: opcode == 0x03b8,
+                });
             }
             0x03bb..=0x03bd => {
                 if opcode != 0x03bb {
@@ -2646,7 +2921,7 @@ impl BinaryVm {
                     }
                     .min(scopes.len());
                     for scope in scopes.drain(scopes.len() - count..) {
-                        self.allocations.remove(&scope.allocation);
+                        released_scopes.push(scope.allocation);
                     }
                 }
             }
@@ -2655,7 +2930,7 @@ impl BinaryVm {
                 ensure!(count <= 256, "named declaration exceeds 256 variables");
                 if count == 0 {
                     if let Some(scope) = self.named_scopes.pop() {
-                        self.allocations.remove(&scope.allocation);
+                        released_scopes.push(scope.allocation);
                     }
                 } else {
                     ensure!(
@@ -2835,6 +3110,7 @@ impl BinaryVm {
                 );
                 memory_write = range.map(|range| (range, value.to_le_bytes().to_vec()));
                 self.parameters.truncate(start);
+                collect_scopes = true;
                 self.sp += 2;
                 cursor.pc = target;
                 next_base = base;
@@ -2994,6 +3270,15 @@ impl BinaryVm {
                 self.sp = sp
                     .filter(|&v| v <= CELLS)
                     .context("stack allocation outside 0..1000")?;
+            }
+            0x0138..=0x013b => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                let system = opcode >= 0x013a;
+                request = Some(if opcode & 1 == 0 {
+                    PlatformRequest::ReadFlags { name, system }
+                } else {
+                    PlatformRequest::WriteFlags { name, system }
+                });
             }
             0x0136 => self.save_encoding = self.read(&mut cursor)?,
             0x06ba => self.media_flags = self.read(&mut cursor)?,
@@ -3226,10 +3511,18 @@ impl BinaryVm {
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
+        self.pending_calendar = calendar_destinations;
+        self.pending_file = file_destinations;
         self.pending_timer = timer_reply;
         self.pending_delay = delay;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
+        }
+        for address in released_scopes {
+            self.release_scope(address);
+        }
+        if collect_scopes {
+            self.collect_retired_scopes();
         }
         for (destination, value) in writes {
             self.write(destination, value);
@@ -3339,7 +3632,7 @@ mod tests {
     }
 
     #[test]
-    fn omitted_file_write_validates_buffer_and_preserves_following_instruction() {
+    fn file_write_validates_buffer_and_waits_for_success() {
         let mut operands = vec![0x84];
         operands.extend(128u32.to_le_bytes());
         operands.extend(immediate(4));
@@ -3347,18 +3640,16 @@ mod tests {
         let mut code = instruction(0xd2, &operands);
         code.extend(instruction(0x49d, &immediate(11)));
         code.resize(132, 7);
-        assert!(
-            BinaryVm::new("strict.scn", code.clone())
-                .unwrap()
-                .step()
-                .is_err()
-        );
         let mut vm = BinaryVm::new("write.scn", code.clone()).unwrap();
-        vm.set_best_effort(true);
-        assert!(matches!(
-            vm.step().unwrap(),
-            Event::CompatibilitySkip { opcode: 0xd2, .. }
-        ));
+        let event = vm.step().unwrap();
+        assert!(
+            matches!(&event, Event::Platform { request: PlatformRequest::WriteFile { name, length: 4, .. }, .. } if name == "fixture.dat")
+        );
+        assert_eq!(vm.file_write_bytes().unwrap(), [7; 4]);
+        assert_eq!(vm.step().unwrap(), event);
+        assert!(vm.respond(0).is_err());
+        assert_eq!(vm.step().unwrap(), event);
+        vm.respond(1).unwrap();
         assert_eq!(vm.data, code);
         vm.step().unwrap();
         assert_eq!(vm.mouse_mapping.value, 11);
@@ -3370,25 +3661,26 @@ mod tests {
     }
 
     #[test]
-    fn calendar_placeholder_writes_all_destinations_only_in_best_effort() {
+    fn calendar_requires_complete_reply_and_validates_all_destinations() {
         let mut code = instruction(0x3b7, &[12, 0, 0, 12, 1, 0, 12, 2, 0, 12, 3, 0]);
         code.extend(instruction(
             0x3b8,
             &[12, 4, 0, 12, 5, 0, 12, 6, 0, 12, 7, 0],
         ));
         code.extend(instruction(0x49d, &immediate(9)));
-        let mut strict = BinaryVm::new("strict.scn", code.clone()).unwrap();
-        assert!(strict.step().is_err());
-        assert_eq!(strict.pc, 0);
-        let mut vm = BinaryVm::new("calendar.scn", code).unwrap();
-        vm.set_best_effort(true);
+        let mut vm = BinaryVm::new("calendar.scn", code.clone()).unwrap();
         vm.banks.get_mut(&12).unwrap()[..8].fill(999);
-        for opcode in [0x3b7, 0x3b8] {
-            assert!(
-                matches!(vm.step().unwrap(), Event::CompatibilitySkip { opcode: actual, .. } if actual == opcode)
-            );
+        for values in [[2026, 9, 20, 0], [23, 59, 58, 987]] {
+            let event = vm.step().unwrap();
+            assert_eq!(vm.step().unwrap(), event);
+            assert!(vm.respond(1).is_err());
+            vm.respond_calendar(values).unwrap();
         }
-        assert_eq!(&vm.banks[&12][..8], &[2000, 1, 1, 6, 0, 0, 0, 0]);
+        assert_eq!(&vm.banks[&12][..8], &[2026, 9, 20, 0, 23, 59, 58, 987]);
+        let mut invalid = BinaryVm::new("bad-calendar.scn", code[..13].to_vec()).unwrap();
+        assert!(invalid.step().is_err());
+        assert_eq!(invalid.pc, 0);
+        assert!(invalid.respond_calendar([0; 4]).is_err());
         vm.step().unwrap();
         assert_eq!(vm.mouse_mapping.value, 9);
     }
