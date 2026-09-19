@@ -9,6 +9,8 @@ anyhow.workspace = true
 shiinario_assets.workspace = true
 shiinario_scenario.workspace = true
 serde.workspace = true
+cpal = "0.15.3"
 
 [dev-dependencies]
 serde_json.workspace = true
+flate2.workspace = true

@@ -1,4 +1,5 @@
 //! Host-independent project startup and deterministic research traces.
+pub mod audio;
 pub mod resources;
 use anyhow::{Context, Result, bail};
 use shiinario_assets::project::Project;
@@ -46,6 +47,7 @@ pub fn trace_with_platform(
         }
         let mut platform = TracePlatform::default();
         let mut resources = resources::Resources::default();
+        let mut audio = audio::Mixer::default();
         for _ in 0..max_steps {
             let event = vm.scheduled_step()?;
             emit(&event)?;
@@ -75,6 +77,75 @@ pub fn trace_with_platform(
                         location.scenario,
                         location.offset
                     );
+                }
+                if let PlatformRequest::CreateAudioStream { address, flags } = &request {
+                    let handle = resources
+                        .create_audio_stream(vm.allocation_bytes(*address)?, *flags)
+                        .with_context(|| {
+                            format!(
+                                "{}:{:#x}: create audio stream",
+                                location.scenario, location.offset
+                            )
+                        })?;
+                    vm.respond(handle)?;
+                    emit(&Event::PlatformReply {
+                        value: handle,
+                        simulated: false,
+                    })?;
+                    continue;
+                }
+                if let PlatformRequest::SetAudioStreamVolume { handle, percent } = &request {
+                    if *handle != 0 {
+                        resources
+                            .audio_stream(*handle)
+                            .with_context(|| {
+                                format!(
+                                    "{}:{:#x}: unknown audio stream handle {handle:#x}",
+                                    location.scenario, location.offset
+                                )
+                            })?
+                            .volume
+                            .set_percent(*percent)?;
+                    }
+                    vm.respond(1)?;
+                    emit(&Event::PlatformReply {
+                        value: 1,
+                        simulated: true,
+                    })?;
+                    continue;
+                }
+                if let PlatformRequest::PlayAudioStream { handle, flags } = &request {
+                    let stream = resources
+                        .audio_stream(*handle)
+                        .context("unknown audio stream handle")?;
+                    audio
+                        .play(*handle, stream.clone(), *flags)
+                        .with_context(|| {
+                            format!(
+                                "{}:{:#x}: play audio stream",
+                                location.scenario, location.offset
+                            )
+                        })?;
+                    vm.respond(1)?;
+                    emit(&Event::PlatformReply {
+                        value: 1,
+                        simulated: true,
+                    })?;
+                    continue;
+                }
+                if let PlatformRequest::LoadAsset { name } = &request {
+                    let bytes = resources.read_asset(project, name).with_context(|| {
+                        format!(
+                            "{}:{:#x}: load asset {name}",
+                            location.scenario, location.offset
+                        )
+                    })?;
+                    let address = vm.respond_asset(bytes)?;
+                    emit(&Event::PlatformReply {
+                        value: address,
+                        simulated: false,
+                    })?;
+                    continue;
                 }
                 if let PlatformRequest::LoadScenario { name, .. } = &request {
                     let bytes = resources.read_asset(project, name).with_context(|| {

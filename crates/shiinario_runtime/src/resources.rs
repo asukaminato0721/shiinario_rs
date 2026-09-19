@@ -3,6 +3,8 @@ use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::PlatformRequest;
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const LIMIT: usize = 256 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +22,45 @@ pub struct Sound {
     pub sample_rate: u32,
     pub channels: u8,
     pub samples: Vec<i16>,
+}
+pub struct AudioStream {
+    pub sound: Sound,
+    pub loop_start_frame: u64,
+    /// First ov_read block after seeking to zero (at most 4096 PCM bytes).
+    pub first_block_frames: usize,
+    pub volume: StreamVolume,
+}
+/// Shared with the audio callback so volume changes preserve playback position.
+pub struct StreamVolume(AtomicU32);
+impl Default for StreamVolume {
+    fn default() -> Self {
+        Self(AtomicU32::new(100))
+    }
+}
+impl StreamVolume {
+    pub fn percent(&self) -> u32 {
+        self.0.load(Ordering::Relaxed)
+    }
+    pub fn set_percent(&self, percent: u32) -> Result<()> {
+        ensure!(
+            percent <= 100,
+            "audio volume percentage out of bounds: {percent}"
+        );
+        self.0.store(percent, Ordering::Relaxed);
+        Ok(())
+    }
+    /// Original 101-entry table, verified by executing every valid index.
+    pub fn attenuation(percent: u32) -> Result<i32> {
+        ensure!(
+            percent <= 100,
+            "audio volume percentage out of bounds: {percent}"
+        );
+        Ok(if percent == 0 {
+            -10000
+        } else {
+            (1000.0 * (f64::from(percent) / 100.0).log2()) as i32
+        })
+    }
 }
 enum Image {
     Encoded(Vec<u8>),
@@ -41,6 +82,7 @@ pub struct Resources {
     surfaces: BTreeMap<u32, Surface>,
     images: BTreeMap<u32, Image>,
     sounds: BTreeMap<u32, Sound>,
+    streams: BTreeMap<u32, Arc<AudioStream>>,
     resident: usize,
     archives: Vec<String>,
 }
@@ -62,6 +104,77 @@ impl Resources {
     }
     pub fn sound(&self, id: u32) -> Option<&Sound> {
         self.sounds.get(&id)
+    }
+    pub fn audio_stream(&self, handle: u32) -> Option<&Arc<AudioStream>> {
+        self.streams.get(&handle)
+    }
+    /// Open a memory-backed OGV stream. PCM is decoded under the shared budget;
+    /// the eventual audio host can consume it without access to VM memory.
+    pub fn create_audio_stream(&mut self, data: &[u8], flags: u32) -> Result<u32> {
+        ensure!(
+            matches!(flags, 0x21 | 0x29),
+            "unsupported audio stream flags {flags:#x}"
+        );
+        ensure!(data.starts_with(b"OGV\0"), "audio stream requires OGV");
+        ensure!(self.streams.len() < 256, "audio stream slots exhausted");
+        let length = u32::from_le_bytes(
+            data.get(8..12)
+                .context("truncated OGV length")?
+                .try_into()?,
+        ) as usize;
+        let ogg = audio::ogg_stream(data)?;
+        let loop_bytes = ogg
+            .get(length..length + 4)
+            .context("missing OGV loop metadata")?;
+        let loop_start_ms = u32::from_le_bytes(loop_bytes.try_into()?);
+        // The supplied installation has zero loop metadata. Nonzero trailers
+        // require decoder support and independent seek-point validation.
+        ensure!(
+            loop_start_ms == 0,
+            "nonzero OGV loop metadata is unresolved"
+        );
+        let retained = self.resident;
+        let mut samples = Vec::new();
+        let mut first_block_samples = 0;
+        let info = audio::decode(data, |packet| {
+            if samples.is_empty() {
+                first_block_samples = packet.len().min(2048);
+            }
+            let bytes = samples
+                .len()
+                .checked_add(packet.len())
+                .and_then(|n| n.checked_mul(2))
+                .context("audio stream size overflow")?;
+            ensure!(
+                bytes <= LIMIT - retained,
+                "drawing and audio resources exceed 256 MiB"
+            );
+            samples.extend_from_slice(packet);
+            Ok(())
+        })?;
+        ensure!(
+            matches!(info.channels, 1 | 2),
+            "unsupported audio stream channels"
+        );
+        let handle = (1..=256)
+            .map(|id| 0x7000_0000 + id)
+            .find(|id| !self.streams.contains_key(id))
+            .context("audio stream slots exhausted")?;
+        self.resident += samples.len() * 2;
+        self.streams.insert(
+            handle,
+            Arc::new(AudioStream {
+                sound: Sound {
+                    sample_rate: info.sample_rate,
+                    channels: info.channels,
+                    samples,
+                },
+                loop_start_frame: 0,
+                first_block_frames: first_block_samples / usize::from(info.channels),
+                volume: StreamVolume::default(),
+            }),
+        );
+        Ok(handle)
     }
     /// Decode only the requested frame. The caller owns the decoded pixels.
     pub fn frame(&self, id: u32, index: usize) -> Result<Frame> {
@@ -90,6 +203,36 @@ impl Resources {
     }
     pub fn resident_bytes(&self) -> usize {
         self.resident
+    }
+    fn fill_surface(
+        &mut self,
+        id: u32,
+        [x, y, width, height]: [i32; 4],
+        color: [u8; 3],
+    ) -> Result<()> {
+        let surface = self
+            .surfaces
+            .get_mut(&id)
+            .context("drawing surface is not allocated")?;
+        // The x86 handler computes signed right/bottom with wrapping addition,
+        // clips to the DIB, then GDI fills with exclusive right/bottom edges.
+        let left = x.max(0).min(surface.width as i32) as usize;
+        let top = y.max(0).min(surface.height as i32) as usize;
+        let right = x.wrapping_add(width).max(0).min(surface.width as i32) as usize;
+        let bottom = y.wrapping_add(height).max(0).min(surface.height as i32) as usize;
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        for row in top..bottom {
+            let start = (row * surface.width as usize + left) * 4;
+            for pixel in surface.rgba[start..start + (right - left) * 4]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                *pixel = [color[0], color[1], color[2], 255];
+            }
+        }
+        Ok(())
     }
     fn create_surface(&mut self, id: u32, width: u32, height: u32, flags: u32) -> Result<()> {
         ensure!(
@@ -268,6 +411,9 @@ impl Resources {
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         match request {
+            PlatformRequest::FillSurface { id, rect, color } => {
+                self.fill_surface(*id, *rect, *color)?
+            }
             PlatformRequest::LoadSound { id, name, flags } => {
                 let bytes = project.read_with_archives(name, &self.archives)?;
                 self.load_sound(*id, &bytes, *flags)?;
@@ -307,6 +453,116 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_stream_creation_matches_original_and_preserves_budget_on_failure() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/stream-synthetic-probe.json"
+        ))
+        .unwrap();
+        let ogg = include_bytes!("../../shiinario_assets/tests/fixtures/sine.ogg");
+        let mut data = b"OGV\0".to_vec();
+        data.extend(836u32.to_le_bytes());
+        data.extend((ogg.len() as u32).to_le_bytes());
+        data.extend(b"fmt ");
+        data.extend(16u32.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend(8000u32.to_le_bytes());
+        data.extend(16000u32.to_le_bytes());
+        data.extend(2u16.to_le_bytes());
+        data.extend(16u16.to_le_bytes());
+        data.extend(b"data");
+        data.extend(800u32.to_le_bytes());
+        data.extend(ogg);
+        data.extend([0; 8]);
+        let mut code = vec![0xc9, 0, 0x10];
+        code.extend(b"fixture.ogv\0");
+        code.extend([12, 0, 0]);
+        let stream_offset = code.len();
+        // The native probe uses immediate addresses (5 bytes); this program
+        // uses a bank operand (3 bytes), so its stream instruction is 13 bytes.
+        code.extend([0xd6, 6, 12, 0, 0, 4, 1, 0, 0, 0, 12, 1, 0]);
+        code.extend([0x9d, 4, 12, 1, 0]);
+        let mut vm = BinaryVm::new("stream.scn", code).unwrap();
+        let mut resources = Resources::default();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::LoadAsset { .. },
+                ..
+            }
+        ));
+        assert!(vm.respond(1).is_err());
+        assert!(vm.respond_asset(Vec::new()).is_err());
+        let address = vm.respond_asset(data.clone()).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::CreateAudioStream { flags: 0x21, .. },
+                ..
+            }
+        ));
+        assert!(vm.respond(0).is_err());
+        assert_eq!(vm.allocation_bytes(address).unwrap(), data);
+        let handle = resources
+            .create_audio_stream(vm.allocation_bytes(address).unwrap(), 0x21)
+            .unwrap();
+        vm.respond(handle).unwrap();
+        assert_eq!(
+            vm.location().offset - stream_offset,
+            probe["next_offset"].as_u64().unwrap() as usize - 2
+        );
+        let changed: Vec<_> = data
+            .iter()
+            .zip(vm.allocation_bytes(address).unwrap())
+            .enumerate()
+            .filter_map(|(i, (a, b))| (a != b).then_some(i))
+            .collect();
+        assert_eq!(serde_json::json!(changed), probe["changed_offsets"]);
+        assert_eq!(&vm.allocation_bytes(address).unwrap()[8..12], b"WAVE");
+        assert!(matches!(vm.step().unwrap(),Event::MouseButtonMapping {value,..} if value==handle));
+        let stream = resources.audio_stream(handle).unwrap();
+        assert_eq!(
+            stream.sound.samples.len() * 2,
+            probe["pcm_bytes"].as_u64().unwrap() as usize
+        );
+        assert_eq!(
+            stream.sound.sample_rate,
+            probe["buffers"][0]["sample_rate"].as_u64().unwrap() as u32
+        );
+        assert_eq!(
+            stream.sound.channels,
+            probe["buffers"][0]["channels"].as_u64().unwrap() as u8
+        );
+        assert_eq!(stream.loop_start_frame, 0);
+        let samples = stream.sound.samples.clone();
+        let resident = resources.resident_bytes();
+        assert_eq!(resident, samples.len() * 2);
+        for invalid in [
+            b"OGV\0".to_vec(),
+            {
+                let mut bad = data.clone();
+                bad[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+                bad
+            },
+            {
+                let mut bad = data.clone();
+                *bad.last_mut().unwrap() = 1;
+                bad
+            },
+        ] {
+            assert!(resources.create_audio_stream(&invalid, 0x21).is_err());
+            assert_eq!(resources.resident_bytes(), resident);
+            assert_eq!(
+                resources.audio_stream(handle).unwrap().sound.samples,
+                samples
+            );
+        }
+        resources.resident = LIMIT;
+        assert!(resources.create_audio_stream(&data, 0x21).is_err());
+        assert_eq!(resources.streams.len(), 1);
+    }
     #[test]
     fn sound_decode_and_failed_replacement_preserve_resource_budget() {
         let mut resources = Resources::default();

@@ -22,6 +22,26 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    FillSurface {
+        id: u32,
+        rect: [i32; 4],
+        color: [u8; 3],
+    },
+    SetAudioStreamVolume {
+        handle: u32,
+        percent: u32,
+    },
+    PlayAudioStream {
+        handle: u32,
+        flags: u32,
+    },
+    CreateAudioStream {
+        address: u32,
+        flags: u32,
+    },
+    LoadAsset {
+        name: String,
+    },
     LoadScenario {
         id: u32,
         name: String,
@@ -483,12 +503,16 @@ impl BinaryVm {
         );
         if let Some((Event::Platform { location, request }, _)) = &self.pending {
             ensure!(
-                !matches!(request, PlatformRequest::LoadScenario { .. }),
-                "scenario loading requires respond_scenario"
+                !matches!(
+                    request,
+                    PlatformRequest::LoadScenario { .. } | PlatformRequest::LoadAsset { .. }
+                ),
+                "asset/scenario loading requires a byte-buffer reply"
             );
             if matches!(
                 request,
-                PlatformRequest::CreateSurface { .. }
+                PlatformRequest::CreateAudioStream { .. }
+                    | PlatformRequest::CreateSurface { .. }
                     | PlatformRequest::LoadImage { .. }
                     | PlatformRequest::CreateImage { .. }
                     | PlatformRequest::FillImage { .. }
@@ -509,6 +533,16 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        if let Event::Platform {
+            request: PlatformRequest::CreateAudioStream { address, .. },
+            ..
+        } = &event
+        {
+            // 453010 changes OGV's compressed length field after using it to
+            // find loop metadata. The host reads the original bytes first.
+            let range = self.memory_range(address + 8, 4)?;
+            self.memory_write(range, b"WAVE");
+        }
         if matches!(
             &event,
             Event::Platform {
@@ -534,6 +568,41 @@ impl BinaryVm {
             self.write(destination, value);
         }
         Ok(())
+    }
+    /// Read a whole VM allocation for a pending resource operation.
+    pub fn allocation_bytes(&self, address: u32) -> Result<&[u8]> {
+        self.allocations
+            .get(&address)
+            .map(Vec::as_slice)
+            .context("resource address is not an allocation base")
+    }
+    /// Install a decoded archive entry and return its VM address to the script.
+    pub fn respond_asset(&mut self, data: Vec<u8>) -> Result<u32> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::LoadAsset { .. },
+                ..
+            },
+            Some(destination),
+        )) = self.pending.as_ref()
+        else {
+            bail!("no pending asset load");
+        };
+        let destination = *destination;
+        ensure!(
+            !data.is_empty() && data.len() <= 16 * 1024 * 1024,
+            "asset allocation outside 1..16 MiB"
+        );
+        let address = self.next_allocation;
+        let next = address
+            .checked_add(((data.len() as u32 + 4095) & !4095) + 4096)
+            .filter(|&next| next < 0x3000_0000)
+            .context("VM allocation address space exhausted")?;
+        self.allocations.insert(address, data);
+        self.next_allocation = next;
+        self.write(destination, address);
+        self.pending = None;
+        Ok(address)
     }
     /// Install scenario bytes; 0001 also activates the target task, 0002 does not.
     pub fn respond_scenario(&mut self, data: Vec<u8>) -> Result<()> {
@@ -971,6 +1040,50 @@ impl BinaryVm {
                     activate: opcode == 1,
                 });
             }
+            0x04d8 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "drawing surface slot out of bounds: {id}");
+                let mut rect = [0; 4];
+                for value in &mut rect {
+                    *value = self.read(&mut cursor)? as i32;
+                }
+                let mut color = [0; 3];
+                for value in &mut color {
+                    *value = self.read(&mut cursor)? as u8;
+                }
+                request = Some(PlatformRequest::FillSurface { id, rect, color });
+            }
+            0x06df => {
+                let handle = self.read(&mut cursor)?;
+                let percent = self.read(&mut cursor)?;
+                ensure!(
+                    percent <= 100,
+                    "audio volume percentage out of bounds: {percent}"
+                );
+                request = Some(PlatformRequest::SetAudioStreamVolume { handle, percent });
+            }
+            0x06d9 => {
+                let handle = self.read(&mut cursor)?;
+                let flags =
+                    self.read(&mut cursor)? | if self.media_flags & 8 != 0 { 0x10 } else { 0 };
+                request = Some(PlatformRequest::PlayAudioStream { handle, flags });
+            }
+            0x06d6 => {
+                let address = self.read(&mut cursor)?;
+                let flags =
+                    self.read(&mut cursor)? | 0x20 | if self.background_mode != 0 { 8 } else { 0 };
+                ensure!(
+                    flags == 0x21 || flags == 0x29,
+                    "unsupported audio stream flags {flags:#x}"
+                );
+                let data = self.allocation_bytes(address)?;
+                ensure!(
+                    data.len() >= 12 && data.starts_with(b"OGV\0"),
+                    "audio stream requires a loaded OGV allocation"
+                );
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::CreateAudioStream { address, flags });
+            }
             0x06a6 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "sound slot {id} out of bounds");
@@ -1006,6 +1119,11 @@ impl BinaryVm {
                 ensure!(id < 256, "image slot {id} out of bounds");
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadImage { id, name });
+            }
+            0x00c9 => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::LoadAsset { name });
             }
             0x00dd => {
                 ensure!(
@@ -1172,18 +1290,26 @@ impl BinaryVm {
                 byte_destination = Some(address);
                 request = Some(PlatformRequest::ProjectDirectory);
             }
-            0x0309 => {
+            0x0303 | 0x0309 => {
                 let base = self.read(&mut cursor)?;
-                let offset = self.read(&mut cursor)?;
+                let offset = if opcode == 0x0309 {
+                    self.read(&mut cursor)?
+                } else {
+                    0
+                };
                 let value = self.read(&mut cursor)?;
                 memory_write = Some((
                     self.memory_range(base.wrapping_add(offset), 4)?,
                     value.to_le_bytes().to_vec(),
                 ));
             }
-            0x0308 => {
+            0x0302 | 0x0308 => {
                 let base = self.read(&mut cursor)?;
-                let offset = self.read(&mut cursor)?;
+                let offset = if opcode == 0x0308 {
+                    self.read(&mut cursor)?
+                } else {
+                    0
+                };
                 let value = u32::from_le_bytes(
                     self.memory_read(base.wrapping_add(offset), 4)?
                         .as_slice()
@@ -1456,6 +1582,47 @@ impl BinaryVm {
             0x0136 => self.save_encoding = self.read(&mut cursor)?,
             0x06ba => self.media_flags = self.read(&mut cursor)?,
             0x06bb => writes.push((self.destination(&mut cursor)?, self.media_flags)),
+            0x0bd0 => {
+                let destination = self.read(&mut cursor)?;
+                let source = self.read(&mut cursor)?;
+                let count = self.read(&mut cursor)? as usize;
+                if count != 0 {
+                    let range = self.memory_range(destination, count)?;
+                    let mut bytes = vec![0; count];
+                    let mut consumed = 0;
+                    for byte in &mut bytes {
+                        let address = source
+                            .checked_add(consumed)
+                            .context("string source overflow")?;
+                        *byte = self.memory_read(address, 1)?[0];
+                        consumed += 1;
+                        if *byte == 0 {
+                            break;
+                        }
+                    }
+                    ensure!(
+                        destination == source
+                            || u64::from(destination) + count as u64 <= u64::from(source)
+                            || u64::from(source) + u64::from(consumed) <= u64::from(destination),
+                        "overlapping bounded string copy is unresolved"
+                    );
+                    memory_write = Some((range, bytes));
+                }
+            }
+            0x02d6 => {
+                let left = self.string_bytes(self.read(&mut cursor)?)?;
+                let right = self.string_bytes(self.read(&mut cursor)?)?;
+                let comparison = left
+                    .iter()
+                    .map(u8::to_ascii_lowercase)
+                    .cmp(right.iter().map(u8::to_ascii_lowercase));
+                let value = match comparison {
+                    std::cmp::Ordering::Less => u32::MAX,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                };
+                writes.push((self.destination(&mut cursor)?, value));
+            }
             0x02d5 => {
                 let value = self.read(&mut cursor)?;
                 let tag = *cursor
@@ -1473,7 +1640,7 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0393 | 0x0396..=0x0398 => {
+            0x0393 | 0x0396..=0x0398 | 0x039e..=0x039f => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
@@ -1483,7 +1650,8 @@ impl BinaryVm {
                     0x393 => second.wrapping_add(first),
                     0x396 => first & second,
                     0x397 => first | second,
-                    _ => first ^ second,
+                    0x398 => first ^ second,
+                    _ => second.wrapping_mul(first),
                 };
                 writes.push((destination, value));
             }
@@ -1870,7 +2038,18 @@ mod tests {
                 .collect();
             let mut vm = BinaryVm::new(case["name"].as_str().unwrap(), code).unwrap();
             for expected in case["states"].as_array().unwrap() {
-                vm.step().unwrap();
+                if let Event::Platform {
+                    request: PlatformRequest::LoadAsset { .. },
+                    ..
+                } = vm.step().unwrap()
+                {
+                    let hex = case["asset"].as_str().unwrap();
+                    let data = (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect();
+                    vm.respond_asset(data).unwrap();
+                }
                 let actual = serde_json::json!({
                     "pc": vm.pc, "mouse": vm.mouse_mapping.value, "sp": vm.sp,
                     "thread_limit": vm.thread_limit, "override": vm.thread_limit_override,
