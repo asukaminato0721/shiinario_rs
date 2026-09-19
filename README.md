@@ -12,7 +12,8 @@ Native playback defaults to best effort: identified optional presentation operat
 print `SKIP` with their scenario location. Currently this approximates image-frame text, omits affine/pixelation filters,
 applies audio fades immediately and uses software buffers for DirectDraw surfaces.
 The movie capability probe reports unavailable; the reached movie path is skipped
-and reports completion. Actual movie playback is not implemented. Use `--strict` to reject these approximations.
+and reports completion. Actual movie playback is not implemented. Calendar metadata is a fixed placeholder;
+automatic and manual file writes are logged and omitted, so no save is created. Use `--strict` to reject these approximations.
 Other unknown commands still stop with context because their operands and control-flow
 effects are not known. Headless traces require explicit `--best-effort` for these omissions.
 Assets are verified against GARbro and original game files remain unchanged.
@@ -70,7 +71,8 @@ target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simu
 Replay input is a JSON array of frames with strictly increasing `at_ms`, logical
 `cursor: [x, y]`, optional `mouse_buttons` (left/right/middle bits), `keys` (Windows
 virtual-key numbers), and `control_mask` (`256` holds the engine's skip control).
-State persists until the next frame. Exhausting the instruction budget is a failure,
+The optional `--final-frame /tmp/new-frame.png` captures the last SCN display even
+on failure and refuses to overwrite an existing file. State persists until the next frame. Exhausting the instruction budget is a failure,
 not evidence that a story route ended.
 
 Extraction writes only to the explicitly provided output path. Reading, inspecting,

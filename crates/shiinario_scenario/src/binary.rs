@@ -2989,6 +2989,11 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
             }
+            0x038f => {
+                let tag = cursor.byte()?;
+                let address = self.operand_address(tag, &mut cursor)?;
+                writes.push((self.destination(&mut cursor)?, address));
+            }
             0x0391 | 0x0392 => {
                 let saved = cursor.pc;
                 let value = self.read(&mut cursor)?;

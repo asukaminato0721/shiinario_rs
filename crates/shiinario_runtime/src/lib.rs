@@ -68,6 +68,8 @@ pub struct TraceOptions {
     pub tick_ms: u32,
     pub best_effort: bool,
     pub input: Vec<replay::InputFrame>,
+    /// Receive surface zero when binary replay ends, fails or reaches its budget.
+    pub final_frame: Option<Box<dyn FnOnce(resources::Surface) -> Result<()>>>,
 }
 
 pub fn trace_with_options(
@@ -82,6 +84,7 @@ pub fn trace_with_options(
         tick_ms,
         best_effort,
         input,
+        final_frame,
     } = options;
     anyhow::ensure!(
         input.is_empty() || (simulate_platform && tick_ms > 0),
@@ -100,19 +103,41 @@ pub fn trace_with_options(
             enabled: simulate_platform,
             ..Default::default()
         };
-        for _ in 0..max_steps {
-            if !session.step(project, &mut platform, &mut emit)? {
-                return Ok(());
+        let result = (|| {
+            for _ in 0..max_steps {
+                if !session.step(project, &mut platform, &mut emit)? {
+                    return Ok(());
+                }
+            }
+            session.digests(&mut emit)?;
+            bail!(
+                "{}:{:#x}: trace step budget {max_steps} exhausted at simulated clock {} ms",
+                session.location().scenario,
+                session.location().offset,
+                platform.clock_ms,
+            );
+        })();
+        if let Some(capture) = final_frame {
+            let captured = session
+                .surface(0)
+                .ok_or_else(|| anyhow::anyhow!("trace has no display surface"))
+                .and_then(capture);
+            if let Err(capture_error) = captured {
+                return match result {
+                    Err(error) => {
+                        Err(error
+                            .context(format!("final frame capture also failed: {capture_error}")))
+                    }
+                    Ok(()) => Err(capture_error),
+                };
             }
         }
-        session.digests(&mut emit)?;
-        bail!(
-            "{}:{:#x}: trace step budget {max_steps} exhausted at simulated clock {} ms",
-            session.location().scenario,
-            session.location().offset,
-            platform.clock_ms,
-        );
+        return result;
     }
+    anyhow::ensure!(
+        final_frame.is_none(),
+        "frame capture requires binary SCN execution"
+    );
     let script = TextScript::parse(name, &project.read(name)?)?;
     let mut vm = TextVm::new(script);
     for _ in 0..max_steps {

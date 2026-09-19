@@ -43,6 +43,9 @@ enum Command {
         /// Print coverage totals instead of every interpreter event.
         #[arg(long)]
         summary: bool,
+        /// Write the last binary-replay display to a new PNG file, even on failure.
+        #[arg(long)]
+        final_frame: Option<PathBuf>,
     },
     Extract {
         archive: PathBuf,
@@ -132,6 +135,7 @@ fn main() -> Result<()> {
             input,
             best_effort,
             summary,
+            final_frame,
         } => {
             let p = shiinario_runtime::open(project_dir)?;
             let input = input
@@ -154,6 +158,24 @@ fn main() -> Result<()> {
                     tick_ms,
                     best_effort,
                     input,
+                    final_frame: final_frame.map(
+                        |path| -> Box<
+                            dyn FnOnce(shiinario_runtime::resources::Surface) -> Result<()>,
+                        > {
+                            Box::new(move |frame| {
+                                let file = std::fs::OpenOptions::new()
+                                    .write(true)
+                                    .create_new(true)
+                                    .open(path)?;
+                                let mut encoder =
+                                    png::Encoder::new(file, frame.width, frame.height);
+                                encoder.set_color(png::ColorType::Rgba);
+                                encoder.set_depth(png::BitDepth::Eight);
+                                encoder.write_header()?.write_image_data(&frame.rgba)?;
+                                Ok(())
+                            })
+                        },
+                    ),
                 },
                 |event| {
                     use shiinario_scenario::{Event, PlatformRequest};
