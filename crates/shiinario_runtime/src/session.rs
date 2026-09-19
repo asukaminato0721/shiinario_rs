@@ -17,6 +17,7 @@ pub trait Host {
     fn mouse_mapping(&mut self, _value: u32) {}
     fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()>;
     fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32>;
+    fn stop_stream(&mut self, handle: u32) -> Result<()>;
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()>;
 }
 
@@ -187,6 +188,33 @@ impl Session {
                 vm.respond(value)?;
                 emit(&Event::PlatformReply {
                     value,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::StopAudioStream { handle }
+            | PlatformRequest::ReleaseAudioStream { handle } = &request
+            {
+                if *handle != 0 {
+                    resources.audio_stream(*handle).with_context(|| {
+                        format!(
+                            "{}:{:#x}: unknown audio stream handle {handle:#x}",
+                            location.scenario, location.offset
+                        )
+                    })?;
+                    host.stop_stream(*handle).with_context(|| {
+                        format!(
+                            "{}:{:#x}: stop audio stream",
+                            location.scenario, location.offset
+                        )
+                    })?;
+                }
+                if matches!(request, PlatformRequest::ReleaseAudioStream { .. }) {
+                    resources.release_audio_stream(*handle)?;
+                }
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
                     simulated: host.simulated(),
                 })?;
                 return Ok(true);

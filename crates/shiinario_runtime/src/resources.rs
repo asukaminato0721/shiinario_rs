@@ -152,6 +152,16 @@ impl Resources {
     pub fn audio_stream(&self, handle: u32) -> Option<&Arc<AudioStream>> {
         self.streams.get(&handle)
     }
+    pub fn release_audio_stream(&mut self, handle: u32) -> Result<()> {
+        if handle != 0 {
+            let stream = self
+                .streams
+                .remove(&handle)
+                .context("unknown audio stream handle")?;
+            self.resident -= stream.sound.samples.len() * 2;
+        }
+        Ok(())
+    }
     /// Open a memory-backed OGV stream. PCM is decoded under the shared budget;
     /// the eventual audio host can consume it without access to VM memory.
     pub fn create_audio_stream(&mut self, data: &[u8], flags: u32) -> Result<u32> {
@@ -1015,6 +1025,54 @@ mod tests {
         resources.resident = LIMIT;
         assert!(resources.create_audio_stream(&data, 0x21).is_err());
         assert_eq!(resources.streams.len(), 1);
+        resources.resident = resident;
+        let mut mixer = crate::audio::Mixer::default();
+        mixer
+            .play(handle, resources.audio_stream(handle).unwrap().clone(), 2)
+            .unwrap();
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/stream-lifecycle-probe.json"
+        ))
+        .unwrap();
+        for case in probe["lifecycle"].as_array().unwrap() {
+            let id = if case["null"].as_bool().unwrap() {
+                0
+            } else {
+                handle
+            };
+            match case["opcode"].as_u64().unwrap() {
+                0x6da => mixer.stop(id),
+                0x6d8 => {
+                    mixer.stop(id);
+                    resources.release_audio_stream(id).unwrap();
+                }
+                0x6d9 => mixer
+                    .play(id, resources.audio_stream(id).unwrap().clone(), 2)
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                resources.audio_stream(handle).is_some(),
+                case["registered"].as_bool().unwrap()
+            );
+            assert_eq!(
+                mixer.is_playing(handle),
+                case["state_flags"].as_u64().unwrap() & 1 != 0
+            );
+            let mut pcm = [1.0; 8];
+            mixer.render(&mut pcm, 8000, 1).unwrap();
+            if !mixer.is_playing(handle) {
+                assert_eq!(pcm, [0.0; 8]);
+            }
+        }
+        assert_eq!(resources.resident_bytes(), 0);
+        assert!(resources.release_audio_stream(handle).is_err());
+        for _ in 0..300 {
+            let id = resources.create_audio_stream(&data, 0x21).unwrap();
+            assert_eq!(id, handle);
+            resources.release_audio_stream(id).unwrap();
+            assert_eq!(resources.resident_bytes(), 0);
+        }
     }
     #[test]
     fn sound_decode_and_failed_replacement_preserve_resource_budget() {

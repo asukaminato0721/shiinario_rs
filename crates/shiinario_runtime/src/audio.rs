@@ -302,6 +302,14 @@ impl AudioOutput {
         }
         Ok(())
     }
+    pub fn stop(&self, handle: u32) -> Result<()> {
+        self.check()?;
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .stop(handle);
+        Ok(())
+    }
     pub fn play(&self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
         self.check()?;
         self.mixer

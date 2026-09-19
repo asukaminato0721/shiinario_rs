@@ -139,6 +139,10 @@ impl Host for TracePlatform {
     ) -> Result<u32> {
         self.mixer.sound_command(id, command)
     }
+    fn stop_stream(&mut self, handle: u32) -> Result<()> {
+        self.mixer.stop(handle);
+        Ok(())
+    }
     fn play_stream(
         &mut self,
         handle: u32,

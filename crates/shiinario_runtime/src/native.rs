@@ -140,6 +140,12 @@ impl Host for NativeHost {
             .context("audio has not been initialized")?
             .sound_command(id, command)
     }
+    fn stop_stream(&mut self, handle: u32) -> Result<()> {
+        self.audio
+            .as_ref()
+            .context("audio has not been initialized")?
+            .stop(handle)
+    }
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
         self.audio
             .as_ref()

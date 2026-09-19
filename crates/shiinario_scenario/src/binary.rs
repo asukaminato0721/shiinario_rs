@@ -99,6 +99,12 @@ pub enum PlatformRequest {
         handle: u32,
         percent: u32,
     },
+    StopAudioStream {
+        handle: u32,
+    },
+    ReleaseAudioStream {
+        handle: u32,
+    },
     PlayAudioStream {
         handle: u32,
         flags: u32,
@@ -1394,6 +1400,14 @@ impl BinaryVm {
                 );
                 request = Some(PlatformRequest::SetAudioStreamVolume { handle, percent });
             }
+            0x06d8 | 0x06da => {
+                let handle = self.read(&mut cursor)?;
+                request = Some(if opcode == 0x06d8 {
+                    PlatformRequest::ReleaseAudioStream { handle }
+                } else {
+                    PlatformRequest::StopAudioStream { handle }
+                });
+            }
             0x06d9 => {
                 let handle = self.read(&mut cursor)?;
                 let flags =
@@ -2030,6 +2044,15 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)? as u8;
                 memory_write = Some((self.memory_range(address, size)?, vec![value; size]));
             }
+            0x02bd => {
+                let address = self.read(&mut cursor)?;
+                if address != 0 {
+                    ensure!(
+                        self.allocations.remove(&address).is_some(),
+                        "free of unknown allocation {address:#x}"
+                    );
+                }
+            }
             0x02bc => {
                 let size = self.read(&mut cursor)? as usize;
                 ensure!(
@@ -2303,6 +2326,73 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn free_invalidates_pointers_reuses_space_and_preserves_other_allocations() {
+        let mut code = instruction(0x02bc, &[immediate(64), vec![12, 0, 0]].concat());
+        code.extend(instruction(0x02bd, &[12, 0, 0]));
+        code.extend(instruction(
+            0x02bc,
+            &[immediate(64), vec![12, 1, 0]].concat(),
+        ));
+        code.extend(instruction(0x02bd, &[12, 1, 0]));
+        code.extend(instruction(0x02bd, &[12, 1, 0]));
+        let mut vm = BinaryVm::new("free.scn", code).unwrap();
+        vm.step().unwrap();
+        let pointer = vm.banks[&12][0];
+        let other = vm.allocation_address(64).unwrap();
+        vm.allocations.insert(other, vec![0xa5; 64]);
+        vm.step().unwrap();
+        assert_eq!(vm.banks[&12][0], pointer); // operand is not a write destination
+        assert!(vm.memory_read(pointer, 1).is_err());
+        assert_eq!(vm.memory_read(other, 64).unwrap(), vec![0xa5; 64]);
+        vm.step().unwrap();
+        assert_eq!(vm.banks[&12][1], pointer);
+        vm.step().unwrap();
+        assert!(
+            vm.step()
+                .unwrap_err()
+                .to_string()
+                .contains("unknown allocation")
+        );
+        assert_eq!(vm.allocations.len(), 1);
+    }
+
+    #[test]
+    fn stream_lifecycle_matches_original_operand_boundaries() {
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/stream-lifecycle-probe.json"
+        ))
+        .unwrap();
+        for case in probe["lifecycle"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("stream.scn", code).unwrap();
+            vm.banks.get_mut(&12).unwrap()[0] = 0x70000001;
+            let handle = if case["null"].as_bool().unwrap() {
+                0
+            } else {
+                0x70000001
+            };
+            let expected = match case["opcode"].as_u64().unwrap() {
+                0x6d8 => PlatformRequest::ReleaseAudioStream { handle },
+                0x6da => PlatformRequest::StopAudioStream { handle },
+                0x6d9 => PlatformRequest::PlayAudioStream { handle, flags: 2 },
+                _ => unreachable!(),
+            };
+            let event = vm.step().unwrap();
+            assert!(matches!(&event,Event::Platform {request,..} if *request==expected));
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+        }
     }
 
     #[test]
