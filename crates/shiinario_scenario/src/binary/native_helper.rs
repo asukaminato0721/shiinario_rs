@@ -50,6 +50,14 @@ mod tests {
             }
         }
         let result = thumbnail(&source).unwrap();
+        let reference: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/validation/native-thumbnail-probe.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&result)),
+            reference["expected_sha256"].as_str().unwrap()
+        );
         for y in 0..75 {
             for x in 0..100 {
                 assert_eq!(

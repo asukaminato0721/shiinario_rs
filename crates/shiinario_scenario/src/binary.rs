@@ -2185,6 +2185,29 @@ impl BinaryVm {
                     default,
                 });
             }
+            0x03b7 | 0x03b8 => {
+                ensure!(
+                    self.best_effort,
+                    "local calendar queries require best-effort placeholder metadata"
+                );
+                // 41ce70/41ced0 call GetLocalTime, then write four WORDs:
+                // year/month/day/weekday or hour/minute/second/millisecond.
+                let values = if opcode == 0x03b7 {
+                    [2000, 1, 1, 6]
+                } else {
+                    [0; 4]
+                };
+                for value in values {
+                    writes.push((self.destination(&mut cursor)?, value));
+                }
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: format!(
+                        "local calendar metadata replaced by deterministic placeholder {values:?}; save compatibility is unavailable"
+                    ),
+                };
+            }
             0x03bb..=0x03bd => {
                 if opcode != 0x03bb {
                     response_destination = Some(self.destination(&mut cursor)?);
@@ -2206,7 +2229,7 @@ impl BinaryVm {
                 if opcode == 0x00b4 {
                     ensure!(
                         values[0] == u32::MAX || self.best_effort,
-                        "text drawing into image frames is unresolved; use best-effort playback to omit it"
+                        "original image text rasterization is unresolved; use best-effort playback for native alpha blending"
                     );
                     self.text_image = values;
                     if values[0] != u32::MAX {
@@ -3143,6 +3166,30 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn calendar_placeholder_writes_all_destinations_only_in_best_effort() {
+        let mut code = instruction(0x3b7, &[12, 0, 0, 12, 1, 0, 12, 2, 0, 12, 3, 0]);
+        code.extend(instruction(
+            0x3b8,
+            &[12, 4, 0, 12, 5, 0, 12, 6, 0, 12, 7, 0],
+        ));
+        code.extend(instruction(0x49d, &immediate(9)));
+        let mut strict = BinaryVm::new("strict.scn", code.clone()).unwrap();
+        assert!(strict.step().is_err());
+        assert_eq!(strict.pc, 0);
+        let mut vm = BinaryVm::new("calendar.scn", code).unwrap();
+        vm.set_best_effort(true);
+        vm.banks.get_mut(&12).unwrap()[..8].fill(999);
+        for opcode in [0x3b7, 0x3b8] {
+            assert!(
+                matches!(vm.step().unwrap(), Event::CompatibilitySkip { opcode: actual, .. } if actual == opcode)
+            );
+        }
+        assert_eq!(&vm.banks[&12][..8], &[2000, 1, 1, 6, 0, 0, 0, 0]);
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 9);
     }
 
     #[test]
