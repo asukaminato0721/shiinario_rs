@@ -2217,6 +2217,31 @@ impl BinaryVm {
             0x0136 => self.save_encoding = self.read(&mut cursor)?,
             0x06ba => self.media_flags = self.read(&mut cursor)?,
             0x06bb => writes.push((self.destination(&mut cursor)?, self.media_flags)),
+            0x0bcf => {
+                let left = self.read(&mut cursor)?;
+                let right = self.read(&mut cursor)?;
+                let count = self.read(&mut cursor)?;
+                let mut value = 0;
+                for index in 0..count {
+                    ensure!(index < 65536, "string comparison exceeds 64 KiB cap");
+                    let left = self.memory_read(
+                        left.checked_add(index).context("string address overflow")?,
+                        1,
+                    )?[0];
+                    let right = self.memory_read(
+                        right.checked_add(index).context("string address overflow")?,
+                        1,
+                    )?[0];
+                    if left != right {
+                        value = if left < right { u32::MAX } else { 1 };
+                        break;
+                    }
+                    if left == 0 {
+                        break;
+                    }
+                }
+                writes.push((self.destination(&mut cursor)?, value));
+            }
             0x0bd0 => {
                 let destination = self.read(&mut cursor)?;
                 let source = self.read(&mut cursor)?;
@@ -2946,6 +2971,19 @@ mod tests {
         target.extend(immediate(0));
         target.extend(immediate(0));
         let mut cases = vec![table, crossing, target];
+        for opcode in [0x305, 0x2d0, 0xbcf] {
+            let mut code = instruction(opcode, &immediate(u32::MAX));
+            if opcode == 0xbcf {
+                code.extend(immediate(u32::MAX));
+                code.extend(immediate(1));
+            }
+            code.extend(if opcode == 0x305 {
+                immediate(77)
+            } else {
+                vec![12, 0, 0]
+            });
+            cases.push(code);
+        }
         for opcode in [0x308, 0x309] {
             let mut code = instruction(opcode, &immediate(0xffff_fffe));
             code.extend(immediate(1));
