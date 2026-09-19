@@ -1,4 +1,4 @@
-use crate::{Archive, Entry, compression::MAX_OUTPUT};
+use crate::{Archive, Entry, compression::MAX_OUTPUT, profile::Profile};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
@@ -92,6 +92,11 @@ pub fn normalize(name: &str) -> Result<String> {
 }
 impl Project {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        let profile = Profile::builtin()?;
+        Self::open_with_profile(root, profile)
+    }
+    pub fn open_with_profile(root: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
         let root = root.as_ref().canonicalize()?;
         let mut paths = std::fs::read_dir(&root)?
             .map(|e| e.map(|e| e.path()))
@@ -121,7 +126,7 @@ impl Project {
         let mut files = BTreeMap::new();
         for p in &paths {
             if p.extension().is_some_and(|s| s.eq_ignore_ascii_case("war")) {
-                let a = Archive::open(p)?;
+                let a = Archive::open_with_profile(p, profile.clone())?;
                 for (ei, e) in a.entries.iter().enumerate() {
                     files
                         .entry(normalize(&e.name)?)
@@ -322,10 +327,16 @@ mod tests {
                 Archive {
                     path: root.join("first.war"),
                     entries: vec![entry(17, 25)],
+                    profile: Arc::new(
+                        Profile::from_bytes(&crate::test_support::database()).unwrap(),
+                    ),
                 },
                 Archive {
                     path: root.join("second.war"),
                     entries: vec![entry(100, 64)],
+                    profile: Arc::new(
+                        Profile::from_bytes(&crate::test_support::database()).unwrap(),
+                    ),
                 },
             ],
             files: Default::default(),

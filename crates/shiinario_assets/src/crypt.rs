@@ -1,9 +1,6 @@
 // Ported from GARbro WarcEncryption.cs, Copyright (C) 2015-2017 morkt (MIT).
+use crate::profile::Profile;
 use std::f64::consts::PI;
-const KEY: &[u8] = include_bytes!("../profiles/ransem-v1/CryptKey.bin");
-const IMAGE: &[u8] = include_bytes!("../profiles/ransem-v1/ShiinaImage.bin");
-const REGION: &[u8] = include_bytes!("../profiles/ransem-v1/Region.bin");
-const DECODE: &[u8] = include_bytes!("../profiles/ransem-v1/DecodeBin.bin");
 pub const MAX_INDEX: usize = (32 + 24) * 16384;
 struct Random(u32);
 impl Random {
@@ -129,7 +126,7 @@ fn helper3(key: u32) -> u32 {
     let v3 = !f(3).to_bits();
     v0.wrapping_add(v1) | v2.wrapping_sub(v3)
 }
-fn region_crc(mut flags: u32, rgb: u32) -> u32 {
+fn region_crc(region: &[u8], mut flags: u32, rgb: u32) -> u32 {
     let mut sa = (flags & 511) as i32;
     let mut da = ((flags >> 12) & 511) as i32;
     flags >>= 24;
@@ -153,10 +150,10 @@ fn region_crc(mut flags: u32, rgb: u32) -> u32 {
     let mut sum = 0u32;
     for _ in 0..48 {
         for _ in 0..48 {
-            let alpha = (REGION[pos as usize + 3] as i32 * sa) >> 8;
+            let alpha = (region[pos as usize + 3] as i32 * sa) >> 8;
             let mut color = rgb;
             for i in 0..3 {
-                let v = REGION[pos as usize + i] as i32;
+                let v = region[pos as usize + i] as i32;
                 let c = (((((((color & 255) as i32 - v) * da) >> 8) + v) & 255) * alpha) >> 8;
                 let mut poly = (c as u32 ^ sum) & 255;
                 for _ in 0..8 {
@@ -196,7 +193,7 @@ fn filetime(t: u64) -> [u32; 3] {
         ((ms / 1000) % 60) as u32 | ((ms % 1000) as u32) << 16,
     ]
 }
-fn helper4(data: &mut [u8]) {
+fn helper4(profile: &Profile, data: &mut [u8]) {
     let mut buf = [0u32; 80];
     for (i, b) in buf[..16].iter_mut().enumerate() {
         *b = u32::from_be_bytes(data[40 + i * 4..44 + i * 4].try_into().unwrap());
@@ -204,18 +201,8 @@ fn helper4(data: &mut [u8]) {
     for i in 16..80 {
         buf[i] = (buf[i - 16] ^ buf[i - 14] ^ buf[i - 8] ^ buf[i - 3]).rotate_left(1);
     }
-    let mut key = [
-        1667458680u32,
-        1719289936,
-        1349942115,
-        20061,
-        0,
-        0,
-        0,
-        0,
-        0,
-        0,
-    ];
+    let mut key = [0u32; 10];
+    key[..5].copy_from_slice(&profile.helper_key);
     let [mut k0, mut k1, mut k2, mut k3, mut k4] = key[..5].try_into().unwrap();
     for (i, b) in buf.iter().enumerate() {
         let (f, c) = match i {
@@ -244,14 +231,14 @@ fn helper4(data: &mut [u8]) {
         flags |= 0x98000000;
     }
     key[9] = ((key[2] as i32 as i64 * key[3] as i32 as i64) >> 8) as u32;
-    key[6] = region_crc(flags, buf[1] >> 8).wrapping_add(key[9]);
+    key[6] = region_crc(&profile.region, flags, buf[1] >> 8).wrapping_add(key[9]);
     for (chunk, k) in data[..40].as_chunks_mut::<4>().0.iter_mut().zip(key) {
         for (d, b) in chunk.iter_mut().zip(k.to_le_bytes()) {
             *d ^= b;
         }
     }
 }
-pub fn decrypt(data: &mut [u8]) {
+pub fn decrypt(profile: &Profile, data: &mut [u8]) {
     let len = data.len();
     if len < 3 {
         return;
@@ -263,10 +250,10 @@ pub fn decrypt(data: &mut [u8]) {
     let mut rng = Random(len as u32);
     let mut fac = 0;
     if len != MAX_INDEX {
-        let idx = (rng.next() as f64 * (IMAGE.len() as f64 / 4294967296.0)) as usize;
-        fac = helper3(rng.0.wrapping_add(IMAGE[idx] as u32)) & 0xfffffff;
+        let idx = (rng.next() as f64 * (profile.image.len() as f64 / 4294967296.0)) as usize;
+        fac = helper3(rng.0.wrapping_add(profile.image[idx] as u32)) & 0xfffffff;
         if effective > 128 {
-            helper4(&mut data[4..]);
+            helper4(profile, &mut data[4..]);
             offset = 128;
             effective -= 128;
         }
@@ -281,23 +268,24 @@ pub fn decrypt(data: &mut [u8]) {
     if b < 0 {
         token = 360.0 - token;
     }
-    let mut x = (fac.wrapping_add(rng.helper2(token) as u8 as u32) % KEY.len() as u32) as usize;
+    let mut x =
+        (fac.wrapping_add(rng.helper2(token) as u8 as u32) % profile.key.len() as u32) as usize;
     for i in 2..effective {
         let d = (data[offset + i] ^ (rng.next() >> 24) as u8).rotate_right(1)
-            ^ KEY[(i - 2) % KEY.len()]
-            ^ KEY[x];
+            ^ profile.key[(i - 2) % profile.key.len()]
+            ^ profile.key[x];
         data[offset + i] = d;
-        x = d as usize % KEY.len();
+        x = d as usize % profile.key.len();
     }
 }
-pub fn decrypt_index(offset: u32, data: &mut [u8]) {
-    decrypt(data);
+pub fn decrypt_index(profile: &Profile, offset: u32, data: &mut [u8]) {
+    decrypt(profile, data);
     let key = offset.to_le_bytes();
     for (i, d) in data.iter_mut().enumerate() {
         *d ^= key[i % 4] ^ !170u8;
     }
 }
-pub fn decrypt2(data: &mut [u8]) {
+pub fn decrypt2(profile: &Profile, data: &mut [u8]) {
     if data.len() < 1024 {
         return;
     }
@@ -314,7 +302,7 @@ pub fn decrypt2(data: &mut [u8]) {
     }
     for i in (256..512).step_by(4) {
         let src = (u32::from_le_bytes(data[i..i + 4].try_into().unwrap()) & 0x1ffc) as usize;
-        let k = u32::from_le_bytes(DECODE[src..src + 4].try_into().unwrap()) ^ crc;
+        let k = u32::from_le_bytes(profile.decode[src..src + 4].try_into().unwrap()) ^ crc;
         for (d, b) in data[i + 256..i + 260].iter_mut().zip(k.to_le_bytes()) {
             *d ^= b;
         }

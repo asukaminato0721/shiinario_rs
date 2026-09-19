@@ -96,35 +96,3 @@ fn project_lookup_and_cache_budget() {
     cache.read(&project, "fixture.txt").unwrap();
     assert_eq!(cache.resident_bytes(), before);
 }
-#[test]
-fn exported_profile_integrity() {
-    use sha2::{Digest, Sha256};
-    let meta: serde_json::Value =
-        serde_json::from_str(include_str!("../profiles/ransem-v1/profile.json")).unwrap();
-    assert_eq!(meta["scheme_version"], 2470);
-    assert_eq!(meta["entry_name_size"], 32);
-    for (name, data) in [
-        (
-            "CryptKey",
-            include_bytes!("../profiles/ransem-v1/CryptKey.bin").as_slice(),
-        ),
-        (
-            "Region",
-            include_bytes!("../profiles/ransem-v1/Region.bin").as_slice(),
-        ),
-        (
-            "DecodeBin",
-            include_bytes!("../profiles/ransem-v1/DecodeBin.bin").as_slice(),
-        ),
-        (
-            "ShiinaImage",
-            include_bytes!("../profiles/ransem-v1/ShiinaImage.bin").as_slice(),
-        ),
-    ] {
-        assert_eq!(meta["tables"][name]["size"], data.len());
-        assert_eq!(
-            meta["tables"][name]["sha256"],
-            format!("{:x}", Sha256::digest(data))
-        );
-    }
-}

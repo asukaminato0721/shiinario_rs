@@ -1,8 +1,12 @@
 //! Bounded, read-only access to Ran→Sem's original WARC 1.7 assets.
 mod compression;
 mod crypt;
+mod nrbf;
+pub mod profile;
 use anyhow::{Context, Result, ensure};
+use profile::Profile;
 use serde::Serialize;
+use std::sync::Arc;
 use std::{
     collections::BTreeSet,
     fs::File,
@@ -22,12 +26,18 @@ pub struct Entry {
 pub struct Archive {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
+    pub(crate) profile: Arc<Profile>,
 }
 fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[..4].try_into().unwrap())
 }
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let profile = Profile::builtin()?;
+        Self::open_with_profile(path, profile)
+    }
+    pub fn open_with_profile(path: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
         let path = path.as_ref();
         let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let len = file.metadata()?.len();
@@ -47,7 +57,7 @@ impl Archive {
         let mut index = vec![0; crypt::MAX_INDEX];
         file.seek(SeekFrom::Start(offset as u64))?;
         file.read_exact(&mut index[..n])?;
-        crypt::decrypt_index(offset, &mut index);
+        crypt::decrypt_index(&profile, offset, &mut index);
         let index = compression::zlib(&index[8..n], crypt::MAX_INDEX)
             .context("decoding WARC index (Ran→Sem profile)")?;
         ensure!(index.len() % 56 == 0, "partial WARC index record");
@@ -82,6 +92,7 @@ impl Archive {
         Ok(Self {
             path: path.to_owned(),
             entries,
+            profile,
         })
     }
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
@@ -99,16 +110,16 @@ impl Archive {
         let size = u32le(&data[4..]);
         let sig = u32le(&data) ^ ((size ^ 0x82ad82) & 0xffffff);
         if entry.flags & 0x80000000 != 0 {
-            crypt::decrypt(&mut data[8..]);
+            crypt::decrypt(&self.profile, &mut data[8..]);
         }
         if entry.flags & 0x20000000 != 0 {
-            crypt::decrypt2(&mut data[8..]);
+            crypt::decrypt2(&self.profile, &mut data[8..]);
         }
         let compressed = matches!(sig & 0xffffff, 0x314859 | 0x4b5059 | 0x5a4c59);
         let mut output = compression::unpack(sig, &mut data, size as usize)
             .with_context(|| format!("{}:{}", self.path.display(), entry.name))?;
         if compressed && entry.flags & 0x40000000 != 0 {
-            crypt::decrypt2(&mut output);
+            crypt::decrypt2(&self.profile, &mut output);
         }
         Ok(output)
     }
@@ -121,3 +132,7 @@ impl Archive {
 pub mod audio;
 pub mod image;
 pub mod project;
+
+#[cfg(test)]
+#[path = "../tests/support/mod.rs"]
+mod test_support;

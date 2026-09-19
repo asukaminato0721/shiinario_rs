@@ -18,7 +18,9 @@ Other unknown commands still stop with context because their operands and contro
 effects are not known. Headless traces require explicit `--best-effort` for these omissions.
 Assets are verified against GARbro and original game files remain unchanged.
 
-The workspace builds independently of the reference checkouts. On Linux, CPAL
+The workspace embeds a pinned upstream [GARbro format catalog](crates/shiinario_assets/data/garbro/README.md)
+and reads it directly in Rust. Builds need no external database or reference
+checkout; running the engine only requires the original game directory. On Linux, CPAL
 requires ALSA development headers and pkg-config:
 
 ```sh
@@ -102,7 +104,7 @@ research artifacts outside this repository. No alternative save format is create
 
 See [compatibility and validation](docs/COMPATIBILITY.md) for exact coverage and
 remaining work, [profile documentation](crates/shiinario_assets/profiles/ransem-v1/README.md)
-for reproducible profile export, and [third-party notices](THIRD_PARTY_NOTICES.md).
+for catalog provenance and profile validation, and [third-party notices](THIRD_PARTY_NOTICES.md).
 
 See [SCN reverse-engineering notes](docs/SCN_RESEARCH.md) for the captured engine,
 Ghidra workflow and original-machine-code verification of opcode `0x049d`.
