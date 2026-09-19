@@ -3,38 +3,21 @@
 An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47.
 
 **Full-route gameplay is not complete yet but is mostly usable**
-The Linux winit/wgpu host displays
-an 800×600 title screen, plays music and effects through CPAL, and enters the story
-with Japanese text and transitions. The title pixels match the original x86 renderer.
-Native and headless hosts share the same interpreter and resources. Native text uses
-Fontconfig and an installed Japanese font; the fallback glyphs differ from Windows.
-MPEG-1/2 movies play with audio, including pause, resume, seek and loop controls.
 
-Native playback defaults to best effort: identified optional presentation operations
-print `SKIP` with their scenario location. Currently this approximates image-frame text, omits affine/pixelation filters,
-applies audio fades immediately and uses software buffers for DirectDraw surfaces.
-The DirectShow COM probe reports unavailable; scripts use the implemented legacy
-MPEG movie path. Movie playback also works in strict mode. Other movie formats
-are rejected with an error. Calendar metadata is a fixed placeholder;
-automatic and manual file writes are logged and omitted, so no save is created. Use `--strict` to reject these approximations.
-Other unknown commands still stop with context because their operands and control-flow
-effects are not known. Headless traces require explicit `--best-effort` for these omissions.
-Assets are verified against GARbro and original game files remain unchanged.
+```
+cargo b -r
+```
 
-Wana (`wana.EXE`, v2.36) is recognized using its bundled GARbro scheme. A shared
-`EngineVersion` enum dispatches archive cryptography, program information, and
-version-dependent SCN operands. Its archives decode, the title accepts Start,
-and the first story runs in deterministic replay. Full-route coverage is unverified.
+Copy `target/release/shiinario_engine` into the game directory and run it.
 
-The workspace embeds a pinned upstream [GARbro format catalog](crates/shiinario_assets/data/garbro/README.md)
-and reads it directly in Rust. Builds need no external database or reference
-checkout; running the engine only requires the original game directory.
+you may need to fix the launch program since the key maybe not set
 
-The native window uses the original game EXE's icon (read as PE resources, never
-executed). Winit is pinned to `0.31.0-beta.3` for Wayland's
-`xdg_toplevel_icon_v1` support. Compositors without that protocol keep their default
-icon. X11 uses the same extracted pixels. Pointer coordinates follow the scaled,
-letterboxed canvas regardless of the legacy Windows mouse-adjustment settings.
+(ask your agent for this)
+
+---
+
+
+Development
 
 On Linux, CPAL requires ALSA development headers and pkg-config:
 
@@ -52,18 +35,6 @@ The independent movie regression suite runs with
 `cargo test -p shiinario_runtime --test movie --locked` and uses a synthetic clip.
 
 Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not been verified.
-
-## Commands
-
-Copy `target/release/shiinario_engine` into the game directory, open a terminal there, and
-run `./shiinario_engine`. The current working directory is the game root. Registry string
-queries use that root for every key; integer queries return zero. No system
-registry is accessed. Keep the original EXE filenames: the engine uses GARbro
-`GameMap` to select decryption data from filenames in this directory. It does not
-execute the EXEs. Unknown or ambiguous matches produce an error.
-
-For the research commands below, also copy `target/release/shiinario_tool` into
-the game directory. Run these commands from that directory:
 
 ```sh
 # Open a native window and run the original configured startup.
