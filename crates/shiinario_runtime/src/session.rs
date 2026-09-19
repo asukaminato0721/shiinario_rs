@@ -348,6 +348,17 @@ impl Session {
                 vm.respond_bytes(&[])?;
                 return Ok(true);
             }
+            if let PlatformRequest::CreateSurface { flags, .. } = &request
+                && *flags != 0
+            {
+                emit(&Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode: 0x0546,
+                    detail: format!(
+                        "DirectDraw allocation flags {flags:#x} replaced with a software BGR24 surface"
+                    ),
+                })?;
+            }
             if let PlatformRequest::UnfilteredPixelation { block_size, .. } = &request {
                 emit(&Event::CompatibilitySkip {
                     location: location.clone(),

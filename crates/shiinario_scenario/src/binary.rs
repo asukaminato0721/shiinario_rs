@@ -1,6 +1,7 @@
 //! Verified subset of the supplied v2.47 engine. See docs/SCN_RESEARCH.md.
 use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
+mod native_helper;
 mod text_execution;
 use text_execution::{AsyncText, TextPhase};
 
@@ -97,6 +98,13 @@ pub enum PlatformRequest {
     },
     DrawGlyph {
         surface: u32,
+        position: [i32; 2],
+        character: char,
+        style: crate::TextStyle,
+    },
+    DrawImageGlyph {
+        image: u32,
+        frame: u32,
         position: [i32; 2],
         character: char,
         style: crate::TextStyle,
@@ -479,6 +487,7 @@ pub struct BinaryVm {
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
     best_effort: bool,
+    skipped_movies: std::collections::BTreeSet<u32>,
     text_image: [u32; 2],
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the default text context.
@@ -540,6 +549,7 @@ impl BinaryVm {
             task_timers: Default::default(),
             text_style: Default::default(),
             best_effort: false,
+            skipped_movies: Default::default(),
             text_image: [u32::MAX, 0],
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
@@ -761,6 +771,7 @@ impl BinaryVm {
                 request,
                 PlatformRequest::CreateAudioStream { .. }
                     | PlatformRequest::DrawGlyph { .. }
+                    | PlatformRequest::DrawImageGlyph { .. }
                     | PlatformRequest::CreateSurface { .. }
                     | PlatformRequest::ReleaseSurface { .. }
                     | PlatformRequest::LoadImage { .. }
@@ -1508,6 +1519,92 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x0276 => {
+                let address = self.read(&mut cursor)?;
+                let code = self.memory_read(address, native_helper::THUMBNAIL_CODE_SIZE)?;
+                ensure!(
+                    native_helper::is_thumbnail(&code),
+                    "unsupported native SCN helper at {address:#x}"
+                );
+                let source = self.banks[&12][0];
+                let target = self.banks[&12][1];
+                ensure!(
+                    u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
+                        || u64::from(target) + native_helper::TARGET_SIZE as u64
+                            <= u64::from(source),
+                    "overlapping native thumbnail buffers are unresolved"
+                );
+                let destination = self.memory_range(target, native_helper::TARGET_SIZE)?;
+                let bytes = native_helper::thumbnail(
+                    &self.memory_read(source, native_helper::SOURCE_SIZE)?,
+                )?;
+                memory_write = Some((destination, bytes));
+            }
+            0x05b5 => {
+                ensure!(
+                    self.best_effort,
+                    "movie playback is unavailable; use best-effort playback to skip movies"
+                );
+                let id = self.read(&mut cursor)?;
+                let name = self.string(self.read(&mut cursor)?)?;
+                let flags = self.read(&mut cursor)?;
+                let surface = self.read(&mut cursor)?;
+                ensure!(
+                    id < 16 && (surface < 256 || surface == u32::MAX),
+                    "movie slot or surface out of bounds"
+                );
+                self.skipped_movies.insert(id);
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: format!(
+                        "movie {name:?} omitted; slot {id}, flags {flags:#x}, surface {surface}; report completed with viewport dimensions"
+                    ),
+                };
+            }
+            0x05b6 | 0x05b9 | 0x05bf | 0x05c1 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(
+                    self.best_effort && self.skipped_movies.contains(&id),
+                    "movie operation requires a known skipped movie slot"
+                );
+                match opcode {
+                    0x05b9 => {
+                        let destination = self.destination(&mut cursor)?;
+                        // 40b7f0 maps stopped/completed movie states to 0x20d.
+                        writes.push((destination, 0x20d));
+                    }
+                    0x05bf => {
+                        let width = self.destination(&mut cursor)?;
+                        let height = self.destination(&mut cursor)?;
+                        writes.push((width, self.viewport[0]));
+                        writes.push((height, self.viewport[1]));
+                    }
+                    _ => {}
+                }
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: format!(
+                        "operation on omitted movie slot {id}; playback remains complete"
+                    ),
+                };
+            }
+            0x073f => {
+                // Original 40c5b0 probes DirectShow COM components. No native
+                // movie backend is connected yet; report that capability.
+                let destination = self.destination(&mut cursor)?;
+                ensure!(
+                    self.best_effort,
+                    "movie playback is unavailable; use best-effort playback to report no DirectShow support"
+                );
+                writes.push((destination, 0));
+                event = Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode,
+                    detail: "DirectShow movie capability unavailable; script receives false".into(),
+                };
+            }
             0x0028 => {
                 delay = Some(self.read(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
@@ -2000,6 +2097,10 @@ impl BinaryVm {
                     (operand, 0)
                 };
                 ensure!(id < 256, "surface index {id} out of bounds");
+                ensure!(
+                    flags == 0 || self.best_effort,
+                    "DirectDraw surface allocation requires best-effort software fallback"
+                );
                 request = Some(PlatformRequest::CreateSurface {
                     id,
                     width: self.viewport[0],
@@ -2113,7 +2214,7 @@ impl BinaryVm {
                             location: location.clone(),
                             opcode,
                             detail: format!(
-                                "text pixels in image {} frame {} omitted; text layout still executes",
+                                "original image text rasterization replaced by native alpha blending in image {} frame {}",
                                 values[0], values[1]
                             ),
                         };
@@ -3042,6 +3143,39 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn skipped_movie_reports_completion_and_consumes_query_destinations() {
+        let mut args = immediate(0);
+        args.extend(b"\x10fixture.mpg\0");
+        args.extend(immediate(0));
+        args.extend(immediate(13));
+        let mut code = instruction(0x5b5, &args);
+        let mut args = immediate(0);
+        args.extend([12, 0, 0, 12, 1, 0]);
+        code.extend(instruction(0x5bf, &args));
+        let mut args = immediate(0);
+        args.extend([12, 2, 0]);
+        code.extend(instruction(0x5b9, &args));
+        code.extend(instruction(0x5b6, &immediate(0)));
+        code.extend(instruction(0x49d, &immediate(7)));
+        assert!(
+            BinaryVm::new("strict.scn", code.clone())
+                .unwrap()
+                .step()
+                .is_err()
+        );
+        let mut vm = BinaryVm::new("skip-movie.scn", code).unwrap();
+        vm.set_best_effort(true);
+        for opcode in [0x5b5, 0x5bf, 0x5b9, 0x5b6] {
+            assert!(
+                matches!(vm.step().unwrap(), Event::CompatibilitySkip { opcode: actual, .. } if actual == opcode)
+            );
+        }
+        assert_eq!(vm.banks[&12][..3], [800, 600, 0x20d]);
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 7);
     }
 
     #[test]

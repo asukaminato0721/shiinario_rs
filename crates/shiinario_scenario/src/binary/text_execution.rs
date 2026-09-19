@@ -79,7 +79,10 @@ impl BinaryVm {
                 // respond() commits pending_text_style with this clock value.
                 text.phase = TextPhase::Process;
             }
-            (TextPhase::Drawing, PlatformRequest::DrawGlyph { .. }) => {
+            (
+                TextPhase::Drawing,
+                PlatformRequest::DrawGlyph { .. } | PlatformRequest::DrawImageGlyph { .. },
+            ) => {
                 let (layout, offset) = text.glyph.take().context("missing pending glyph")?;
                 if self.text_style.effects & 1 != 0 {
                     self.text_style.opacity = self.text_style.shadow_opacity;
@@ -259,7 +262,7 @@ impl BinaryVm {
                         self.text_style.line_limit,
                         &self.text_style.punctuation,
                     )?;
-                    if surface == u32::MAX || self.text_image[0] != u32::MAX {
+                    if surface == u32::MAX && self.text_image[0] == u32::MAX {
                         let timed = text.timed;
                         self.text_cursor = layout.cursor;
                         self.text_layout = layout;
@@ -275,6 +278,18 @@ impl BinaryVm {
                     let text = self.async_text.as_mut().unwrap();
                     text.glyph = Some((layout, offset + consumed));
                     text.phase = TextPhase::Drawing;
+                    if self.text_image[0] != u32::MAX {
+                        return Ok(self.text_request(PlatformRequest::DrawImageGlyph {
+                            image: self.text_image[0],
+                            frame: self.text_image[1],
+                            position: [
+                                position[0].wrapping_add(self.text_image_offset[0]) as i32,
+                                position[1].wrapping_add(self.text_image_offset[1]) as i32,
+                            ],
+                            character,
+                            style: self.text_style.clone(),
+                        }));
+                    }
                     return Ok(self.text_request(PlatformRequest::DrawGlyph {
                         surface,
                         position: position.map(|v| v as i32),
@@ -345,6 +360,11 @@ mod tests {
                             character,
                             position,
                             ..
+                        }
+                        | PlatformRequest::DrawImageGlyph {
+                            character,
+                            position,
+                            ..
                         },
                     ..
                 } => {
@@ -356,7 +376,7 @@ mod tests {
             }
         }
         assert_eq!(skipped, 1);
-        assert_eq!(drawn, vec![('B', [8, 0])]);
+        assert_eq!(drawn, vec![('A', [0, 0]), ('B', [8, 0])]);
     }
     fn decode(hex: &str) -> Vec<u8> {
         (0..hex.len())

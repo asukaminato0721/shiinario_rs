@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 encoding_rs.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

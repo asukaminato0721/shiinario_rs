@@ -9,8 +9,10 @@ Fontconfig and an installed Japanese font; the fallback glyphs differ from Windo
 Movies, complete menu/choice coverage and compatible saves remain unfinished.
 
 Native playback defaults to best effort: identified optional presentation operations
-print `SKIP` with their scenario location. Currently this omits text drawn into image
-frames and affine image transforms, and applies audio fades immediately. Use `--strict` to reject these approximations.
+print `SKIP` with their scenario location. Currently this approximates image-frame text, omits affine/pixelation filters,
+applies audio fades immediately and uses software buffers for DirectDraw surfaces.
+The movie capability probe reports unavailable; the reached movie path is skipped
+and reports completion. Actual movie playback is not implemented. Use `--strict` to reject these approximations.
 Other unknown commands still stop with context because their operands and control-flow
 effects are not known. Headless traces require explicit `--best-effort` for these omissions.
 Assets are verified against GARbro and original game files remain unchanged.
@@ -59,6 +61,8 @@ target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-
 # Explicit simulated Windows replies, logged in the output; this does not display a game window.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 16 --max-steps 40000
 target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
+# Generate repeatable Start/advance input (does not select choices).
+python tools/research/make_story_input.py /tmp/input.json --skip
 # Deterministic input replay with compact counts and explicit compatibility omissions.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --best-effort --summary
 ```

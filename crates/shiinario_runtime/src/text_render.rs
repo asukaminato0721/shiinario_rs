@@ -11,6 +11,7 @@ pub(crate) struct Canvas<'a> {
     pub pixels: &'a SharedMemory,
     pub size: [u32; 2],
     pub stride: usize,
+    pub rgba: bool,
 }
 struct Mask {
     offset: [i32; 2],
@@ -178,8 +179,23 @@ fn draw_mask(
         {
             return;
         }
-        let offset = y as usize * target.stride + x as usize * 3;
         let alpha = ((((u32::from(coverage) * 255) >> 6) * opacity) >> 8) as i32;
+        if target.rgba {
+            let offset = y as usize * target.stride + x as usize * 4;
+            let source_alpha = alpha as u32;
+            let retained = u32::from(pixels[offset + 3]) * (255 - source_alpha);
+            let total = source_alpha * 255 + retained;
+            for channel in 0..3 {
+                pixels[offset + channel] = (u32::from(color[channel]) * source_alpha * 255
+                    + u32::from(pixels[offset + channel]) * retained)
+                    .checked_div(total)
+                    .unwrap_or(u32::from(pixels[offset + channel]))
+                    as u8;
+            }
+            pixels[offset + 3] = total.div_ceil(255) as u8;
+            return;
+        }
+        let offset = y as usize * target.stride + x as usize * 3;
         for channel in 0..3 {
             let old = i32::from(pixels[offset + channel]);
             pixels[offset + channel] =
@@ -265,6 +281,35 @@ fn draw_mask(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_glyph_preserves_straight_color_and_transparency() {
+        let pixels = SharedMemory::zeroed(8).unwrap();
+        let mask = Mask {
+            offset: [0, 0],
+            size: [2, 1],
+            coverage: vec![32, 0],
+        };
+        let mut style = TextStyle {
+            color: [220, 80, 30],
+            effects: 0,
+            opacity: 256,
+            ..Default::default()
+        };
+        let target = || Canvas {
+            pixels: &pixels,
+            size: [2, 1],
+            stride: 8,
+            rgba: true,
+        };
+        draw_mask(target(), [0, 0], &style, &mask, [1, 1]).unwrap();
+        assert_eq!(pixels.read(0, 8).unwrap(), [220, 80, 30, 127, 0, 0, 0, 0]);
+        style.color = [0, 0, 255];
+        draw_mask(target(), [0, 0], &style, &mask, [1, 1]).unwrap();
+        let result = pixels.read(0, 8).unwrap();
+        assert_eq!(result[3], 191);
+        assert!(result[0] < 220 && result[2] > 30);
+        assert_eq!(&result[4..], &[0; 4]);
+    }
     fn bytes(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)
@@ -306,6 +351,7 @@ mod tests {
             ];
             draw_mask(
                 Canvas {
+                    rgba: false,
                     pixels: &pixels,
                     size: [9, 8],
                     stride: 28,

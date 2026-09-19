@@ -107,9 +107,10 @@ pub fn trace_with_options(
         }
         session.digests(&mut emit)?;
         bail!(
-            "{}:{:#x}: trace step budget {max_steps} exhausted",
+            "{}:{:#x}: trace step budget {max_steps} exhausted at simulated clock {} ms",
             session.location().scenario,
-            session.location().offset
+            session.location().offset,
+            platform.clock_ms,
         );
     }
     let script = TextScript::parse(name, &project.read(name)?)?;

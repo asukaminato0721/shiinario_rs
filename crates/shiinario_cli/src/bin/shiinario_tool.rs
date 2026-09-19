@@ -174,7 +174,9 @@ fn main() -> Result<()> {
                             );
                         }
                         Event::Platform {
-                            request: PlatformRequest::DrawGlyph { .. },
+                            request:
+                                PlatformRequest::DrawGlyph { .. }
+                                | PlatformRequest::DrawImageGlyph { .. },
                             ..
                         } => glyphs += 1,
                         Event::Platform {

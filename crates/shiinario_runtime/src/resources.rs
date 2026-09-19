@@ -425,7 +425,7 @@ impl Resources {
         let flags = transition.flags;
         let weight = flags & 0x3fff_ffff;
         ensure!(
-            flags & 0x4000_0000 != 0 && weight <= 512,
+            weight <= 512,
             "unsupported mask transition mode or weight {flags:#x}"
         );
         let destination = self
@@ -450,7 +450,24 @@ impl Resources {
         for (index, pixel) in result.as_chunks_mut::<3>().0.iter_mut().enumerate() {
             let offset = index * 3;
             let blue = mask[offset] ^ if flags & 0x8000_0000 != 0 { 255 } else { 0 };
-            if u32::from(blue) >= threshold {
+            if flags & 0x4000_0000 == 0 {
+                // Scalar 437af0 doubles the progress only for the inverted
+                // black-fallback path; two-source transitions use it directly.
+                let progress = if second.is_none() && flags & 0x8000_0000 != 0 {
+                    weight * 2
+                } else {
+                    weight
+                };
+                let alpha = (i32::from(blue) + progress as i32 - 256).clamp(0, 256) as u32;
+                for channel in 0..3 {
+                    let other = second
+                        .as_ref()
+                        .map_or(0, |s| u32::from(s[offset + channel]));
+                    pixel[channel] = ((u32::from(first[offset + channel]) * alpha
+                        + other * (256 - alpha))
+                        >> 8) as u8;
+                }
+            } else if u32::from(blue) >= threshold {
                 pixel.copy_from_slice(&first[offset..offset + 3]);
             } else if let Some(second) = &second {
                 pixel.copy_from_slice(&second[offset..offset + 3]);
@@ -713,9 +730,12 @@ impl Resources {
             id < 256 && width > 0 && height > 0 && width <= 16384 && height <= 16384,
             "invalid drawing surface dimensions or slot"
         );
-        // Other allocation modes request legacy DirectDraw surfaces. Their
-        // locking and pixel layout must be recovered before accepting them.
-        ensure!(flags == 0, "unresolved surface allocation flags {flags:#x}");
+        // The VM authorizes these DirectDraw modes only in best-effort mode;
+        // Session logs their software fallback before allocating BGR24 storage.
+        ensure!(
+            matches!(flags, 0 | 0x80000000 | 0xc0000000),
+            "unresolved surface allocation flags {flags:#x}"
+        );
         let stride = (width as usize * 3 + 3) & !3;
         let size = stride * height as usize;
         let old = self
@@ -908,6 +928,34 @@ impl Resources {
             }));
         }
         match request {
+            PlatformRequest::DrawImageGlyph {
+                image,
+                frame,
+                position,
+                character,
+                style,
+            } => {
+                let Some(Image::Mutable { frames, .. }) = self.images.get_mut(image) else {
+                    anyhow::bail!("image text target must be mutable");
+                };
+                let target = frames
+                    .get_mut(*frame as usize)
+                    .context("image text frame is missing")?;
+                let pixels = SharedMemory::zeroed(target.rgba.len())?;
+                pixels.write(0, &target.rgba)?;
+                self.text_renderer.draw(
+                    crate::text_render::Canvas {
+                        pixels: &pixels,
+                        size: [target.width, target.height],
+                        stride: target.width as usize * 4,
+                        rgba: true,
+                    },
+                    *position,
+                    *character,
+                    style,
+                )?;
+                target.rgba = pixels.read(0, pixels.len())?;
+            }
             PlatformRequest::DrawGlyph {
                 surface,
                 position,
@@ -920,6 +968,7 @@ impl Resources {
                     .context("text surface is not allocated")?;
                 self.text_renderer.draw(
                     crate::text_render::Canvas {
+                        rgba: false,
                         pixels: &target.pixels,
                         size: [target.width, target.height],
                         stride: target.stride,
@@ -1711,7 +1760,7 @@ mod tests {
         for kind in 0..4 {
             let mut transition = valid.clone();
             match kind {
-                0 => transition.flags = 0x80000080,
+                0 => transition.flags = 0x80000201,
                 1 => transition.flags = 0xc0000201,
                 2 => transition.first = 99,
                 _ => transition.second = Some(99),
