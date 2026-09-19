@@ -1,6 +1,8 @@
 //! Host-independent project startup and deterministic research traces.
 pub mod audio;
 pub mod input;
+pub mod native;
+mod presentation;
 pub mod resources;
 pub mod session;
 pub mod viewport;
@@ -11,9 +13,7 @@ use shiinario_scenario::{Event, Input, PlatformRequest, TextScript, TextVm};
 use std::path::Path;
 use std::sync::Arc;
 pub fn boot(project: &Project) -> Result<()> {
-    let name = &project.config.startup;
-    let data = project.read(name)?;
-    shiinario_scenario::boot_binary(name, &data)
+    native::run(project, native::Options::default())
 }
 /// Traces execute the verified SCN or TXT subset and fail at unknown operations.
 pub fn trace(

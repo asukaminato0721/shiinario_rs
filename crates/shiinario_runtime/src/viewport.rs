@@ -14,6 +14,22 @@ impl Default for ViewportTransform {
     }
 }
 impl ViewportTransform {
+    /// Center a logical canvas inside a nonempty physical window.
+    pub fn fit(logical: [u32; 2], physical: [u32; 2]) -> Result<Self> {
+        ensure!(
+            logical
+                .into_iter()
+                .chain(physical)
+                .all(|n| n > 0 && n <= i32::MAX as u32),
+            "invalid viewport dimensions"
+        );
+        let scale =
+            (physical[0] as f32 / logical[0] as f32).min(physical[1] as f32 / logical[1] as f32);
+        let offset = std::array::from_fn(|i| {
+            ((physical[i] as f64 - f64::from(scale) * f64::from(logical[i])) / 2.0).max(0.0) as i32
+        });
+        Self::new([scale; 2], offset)
+    }
     pub fn new(scale: [f32; 2], offset: [i32; 2]) -> Result<Self> {
         ensure!(
             scale.iter().all(|v| v.is_finite() && *v > 0.0),
