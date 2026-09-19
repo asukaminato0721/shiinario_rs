@@ -12,6 +12,9 @@ pub struct TextStyle {
     pub color: [u8; 3],
     pub opacity: u32,
     pub effects: u32,
+    pub shadow_color: [u8; 3],
+    pub shadow_offset: [u32; 2],
+    pub shadow_opacity: u32,
     pub edge_color: [u8; 3],
     pub edge_offset: [u32; 2],
     pub font_height: u32,
@@ -37,6 +40,9 @@ impl Default for TextStyle {
             color: [255; 3],
             opacity: 256,
             effects: 0,
+            shadow_color: [0; 3],
+            shadow_offset: [1; 2],
+            shadow_opacity: 256,
             edge_color: [255; 3],
             edge_offset: [1; 2],
             font_height: 16,
@@ -130,6 +136,22 @@ impl TextStyle {
                         *offset = number(bytes, &mut at)?;
                     }
                 }
+                b'S' => {
+                    if bytes.get(at) == Some(&b'a') {
+                        at += 1;
+                        result.shadow_opacity = number(bytes, &mut at)?;
+                    } else {
+                        for component in &mut result.shadow_color {
+                            *component = number(bytes, &mut at)? as u8;
+                        }
+                        for offset in &mut result.shadow_offset {
+                            *offset = number(bytes, &mut at)?;
+                        }
+                        if at > 0 && bytes[at - 1] == b',' {
+                            result.shadow_opacity = number(bytes, &mut at)?;
+                        }
+                    }
+                }
                 b'H' => result.font_height = number(bytes, &mut at)?,
                 b'f' => result.font_weight = number(bytes, &mut at)?,
                 b'Y' | b'R' => result.line_advance = number(bytes, &mut at)?,
@@ -153,7 +175,7 @@ impl TextStyle {
                     }
                 }
                 b'c' => {}
-                _ => anyhow::bail!("unsupported text control at byte {}", at - 2),
+                _ => anyhow::bail!("unsupported text control _{} ({command:#04x}) at byte {}", char::from(command), at - 2),
             }
             if command != b'c' {
                 continue;

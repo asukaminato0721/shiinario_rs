@@ -66,6 +66,9 @@ impl BinaryVm {
             }
             (TextPhase::Drawing, PlatformRequest::DrawGlyph { .. }) => {
                 let (layout, offset) = text.glyph.take().context("missing pending glyph")?;
+                if self.text_style.effects & 1 != 0 {
+                    self.text_style.opacity = self.text_style.shadow_opacity;
+                }
                 self.text_cursor = layout.cursor;
                 self.text_layout = layout;
                 text.offset = offset;
@@ -141,6 +144,19 @@ impl BinaryVm {
                     }
                     if matches!(phase, TextPhase::Process) {
                         if bytes.starts_with(b"_") && !bytes.starts_with(b"__") {
+                            if bytes.starts_with(b"_r") {
+                                let forced = bytes.get(2) == Some(&b'!');
+                                if forced {
+                                    self.text_layout.wrapped = false;
+                                }
+                                if !self.text_layout.wrapped {
+                                    self.text_cursor[1] = self.text_cursor[0];
+                                    self.text_cursor[2] = self.text_cursor[2].wrapping_add(self.text_style.line_advance);
+                                    self.text_layout.cursor = self.text_cursor;
+                                }
+                                self.async_text.as_mut().unwrap().offset += if forced { 3 } else { 2 };
+                                continue;
+                            }
                             let (style, clock, consumed) = self.text_style.prefix(&bytes)?;
                             self.async_text.as_mut().unwrap().offset += consumed;
                             if let Some(clock) = clock {
@@ -245,6 +261,71 @@ mod tests {
                 }
             }
             assert_eq!(serde_json::json!(events),case["events"],"{}",case["name"]);
+        }
+    }
+
+    #[test]
+    fn glyph_ticks_match_original_clock_reads_input_and_cursor_commits() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/validation/text-ticks-probe.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut code = vec![0x83,0,4,0,0,0,0,0x10];
+            code.extend(decode(case["text"].as_str().unwrap())); code.push(0);
+            code.extend([0,0,4,0,0,0,0]);
+            let mut vm=BinaryVm::new("glyphs.scn",code).unwrap();
+            vm.thread_limit=1;
+            vm.text_style.fullwidth_ascii=false;
+            vm.text_style.character_delay=case["delay"].as_u64().unwrap() as u32;
+            vm.text_style.character_epoch=case["epoch"].as_u64().unwrap() as u32;
+            vm.text_style.skip_mask=case["skip_mask"].as_u64().unwrap() as u32;
+            assert_eq!(vm.scheduled_step().unwrap(),Event::SchedulerPoll); vm.respond(1).unwrap();
+            let first=vm.scheduled_step().unwrap();
+            if let Event::Platform { request: PlatformRequest::TextInput { clear:true }, .. } = first {
+                vm.respond(0).unwrap();
+            } else { assert!(matches!(first,Event::BinaryInstruction {opcode:0x83,..})); }
+            for tick in case["ticks"].as_array().unwrap() {
+                let expected=tick["events"].as_array().unwrap();
+                let mut index=0;
+                for iteration in 0..100 {
+                    assert!(iteration<99);
+                    let event=vm.scheduled_step().unwrap();
+                    match &event {
+                        Event::SchedulerPoll => vm.respond(1).unwrap(),
+                        Event::Platform { request,.. } => {
+                            let entry=&expected[index]; index+=1;
+                            assert_eq!(vm.scheduled_step().unwrap(),event);
+                            let value=match request {
+                                PlatformRequest::TextInput {clear:false} => {
+                                    assert_eq!(entry["event"],"input");entry["value"].as_u64().unwrap() as u32
+                                }
+                                PlatformRequest::ClockMilliseconds => {
+                                    assert_eq!(entry["event"],"clock");entry["value"].as_u64().unwrap() as u32
+                                }
+                                PlatformRequest::DrawGlyph {position,character,..} => {
+                                    assert_eq!(entry["event"],"glyph");
+                                    assert_eq!(serde_json::json!(position.map(|v|v as u32)),entry["position"]);
+                                    assert_eq!(format!("{:02x}",*character as u32),entry["bytes"]);
+                                    let cursor=vm.text_cursor;
+                                    assert!(vm.respond(0).is_err());
+                                    assert_eq!(vm.text_cursor,cursor);
+                                    1
+                                }
+                                other=>panic!("{other:?}"),
+                            };
+                            vm.respond(value).unwrap();
+                        }
+                        Event::TextTick {completed,cursor,..} => {
+                            assert_eq!(*completed,tick["status"]==0);
+                            assert_eq!(serde_json::json!(cursor),tick["cursor"]);
+                            assert_eq!(vm.text_style.character_epoch as u64,tick["epoch"].as_u64().unwrap());
+                            assert_eq!(index,expected.len(),"{}",case["name"]);
+                            break;
+                        }
+                        other=>panic!("{other:?}"),
+                    }
+                }
+            }
+            assert_eq!(vm.context_flags & 8,0);
         }
     }
 }
