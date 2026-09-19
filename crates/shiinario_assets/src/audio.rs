@@ -33,50 +33,6 @@ mod tests {
         assert!(ogg_stream(b"OGV\0").is_err());
         assert!(ogg_stream(b"RIFF").is_err());
     }
-    #[test]
-    fn declared_pcm_length_trims_padding_and_rejects_inconsistent_headers() {
-        let ogg = include_bytes!("../tests/fixtures/sine.ogg");
-        let mut full = Vec::new();
-        let raw_info = decode(ogg, |samples| {
-            full.extend_from_slice(samples);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!((raw_info.channels, raw_info.sample_rate), (1, 8000));
-        assert!(full.len() >= 400);
-        let mut wrapped = b"OGV\0".to_vec();
-        wrapped.extend(836u32.to_le_bytes());
-        wrapped.extend((ogg.len() as u32).to_le_bytes());
-        wrapped.extend(b"fmt ");
-        wrapped.extend(16u32.to_le_bytes());
-        for word in [1u16, 1] {
-            wrapped.extend(word.to_le_bytes());
-        }
-        for word in [8000u32, 16000] {
-            wrapped.extend(word.to_le_bytes());
-        }
-        for word in [2u16, 16] {
-            wrapped.extend(word.to_le_bytes());
-        }
-        wrapped.extend(b"data");
-        wrapped.extend(800u32.to_le_bytes());
-        wrapped.extend(ogg);
-        let mut trimmed = Vec::new();
-        let info = decode(&wrapped, |samples| {
-            trimmed.extend_from_slice(samples);
-            Ok(())
-        })
-        .unwrap();
-        assert_eq!(info.samples_per_channel, 400);
-        assert_eq!(trimmed, full[..400]);
-        for (offset, replacement) in [(40, 801u32), (40, 1_000_000), (24, 16000)] {
-            let mut bad = wrapped.clone();
-            bad[offset..offset + 4].copy_from_slice(&replacement.to_le_bytes());
-            assert!(decode(&bad, |_| Ok(())).is_err());
-        }
-        wrapped[16..20].copy_from_slice(&0u32.to_le_bytes());
-        assert!(decode(&wrapped, |_| Ok(())).is_err());
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

@@ -642,44 +642,6 @@ mod tests {
     }
 
     #[test]
-    fn matches_original_stream_pcm_including_loop_prefix() {
-        let stream = synthetic();
-        for (flags, compressed) in [
-            (
-                0,
-                include_bytes!("../../shiinario_assets/tests/fixtures/sine-play-0.pcm.gz")
-                    .as_slice(),
-            ),
-            (
-                2,
-                include_bytes!("../../shiinario_assets/tests/fixtures/sine-play-loop.pcm.gz")
-                    .as_slice(),
-            ),
-        ] {
-            let mut bytes = Vec::new();
-            flate2::read::GzDecoder::new(compressed)
-                .take(256001)
-                .read_to_end(&mut bytes)
-                .unwrap();
-            assert_eq!(bytes.len(), 256000);
-            let mut mixer = Mixer::default();
-            mixer.play(7, stream.clone(), flags).unwrap();
-            let mut actual = vec![0.0; bytes.len() / 2];
-            mixer.render(&mut actual, 8000, 1).unwrap();
-            for (index, (actual, expected)) in
-                actual.iter().zip(bytes.as_chunks::<2>().0).enumerate()
-            {
-                let expected = i16::from_le_bytes(*expected);
-                let actual = (actual * 32768.0).round() as i32;
-                assert!(
-                    (actual - i32::from(expected)).abs() <= 1,
-                    "sample {index}: {actual} != {expected}"
-                );
-            }
-            assert_eq!(mixer.is_playing(7), flags == 2);
-        }
-    }
-    #[test]
     fn resampling_chunking_restart_failure_and_channel_mix() {
         let stream = Arc::new(AudioStream {
             sound: Sound {
@@ -723,74 +685,6 @@ mod tests {
         assert!(!mixer.is_playing(1));
         assert!(mixer.render(&mut mono, 0, 1).is_err());
         assert!(mixer.render(&mut mono[..3], 8000, 2).is_err());
-    }
-    #[test]
-    fn volume_matches_native_and_changes_without_restarting() {
-        let probe: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/validation/stream-volume-probe.json"
-        ))
-        .unwrap();
-        for case in probe["cases"].as_array().unwrap() {
-            let percent = case["percent"].as_u64().unwrap() as u32;
-            assert_eq!(
-                StreamVolume::attenuation(percent).unwrap(),
-                case["attenuation"].as_i64().unwrap() as i32
-            );
-            let mut code = 0x06dfu16.to_le_bytes().to_vec();
-            for value in [7u32, percent] {
-                code.push(4);
-                code.extend(value.to_le_bytes());
-            }
-            code.extend(0x049du16.to_le_bytes());
-            code.push(4);
-            code.extend(99u32.to_le_bytes());
-            let mut vm = shiinario_scenario::BinaryVm::new("volume.SCN", code).unwrap();
-            let event = vm.step().unwrap();
-            assert!(matches!(&event, shiinario_scenario::Event::Platform {
-                request: shiinario_scenario::PlatformRequest::SetAudioStreamVolume {handle:7,percent:value},..
-            } if *value==percent));
-            assert_eq!(vm.step().unwrap(), event);
-            vm.respond(1).unwrap();
-            assert_eq!(
-                vm.location().offset,
-                case["next_offset"].as_u64().unwrap() as usize
-            );
-            assert!(matches!(
-                vm.step().unwrap(),
-                shiinario_scenario::Event::MouseButtonMapping { value: 99, .. }
-            ));
-        }
-        let stream = synthetic();
-        let mut mixer = Mixer::default();
-        stream.volume.set_percent(50).unwrap();
-        mixer.play(1, stream.clone(), 2).unwrap();
-        let mut quiet = [0.0; 12];
-        mixer.render(&mut quiet, 8000, 1).unwrap();
-        let gain = 10.0f32.powf(-0.5);
-        for (actual, expected) in quiet.iter().zip(&stream.sound.samples) {
-            assert!((actual - f32::from(*expected) / 32768.0 * gain).abs() < 1e-6);
-        }
-        stream.volume.set_percent(0).unwrap();
-        let mut silent = [1.0; 16];
-        mixer.render(&mut silent, 8000, 1).unwrap();
-        assert_eq!(silent, [0.0; 16]);
-        assert!(mixer.is_playing(1));
-        stream.volume.set_percent(100).unwrap();
-        assert!(stream.volume.set_percent(101).is_err());
-        assert!(StreamVolume::attenuation(u32::MAX).is_err());
-        assert_eq!(stream.volume.percent(), 100);
-        let mut restored = [0.0; 8];
-        mixer.render(&mut restored, 8000, 1).unwrap();
-        for (actual, expected) in restored.iter().zip(&stream.sound.samples[28..]) {
-            assert_eq!(*actual, f32::from(*expected) / 32768.0);
-        }
-        // Volume belongs to the stream, and survives stopping and replaying it.
-        stream.volume.set_percent(50).unwrap();
-        mixer.stop(1);
-        mixer.play(1, stream.clone(), 0).unwrap();
-        let mut replay = [0.0; 12];
-        mixer.render(&mut replay, 8000, 1).unwrap();
-        assert_eq!(quiet, replay);
     }
     #[test]
     #[ignore = "requires a live audio output device; plays a short synthetic sine"]

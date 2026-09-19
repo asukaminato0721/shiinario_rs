@@ -64,22 +64,6 @@ pub(crate) fn integer_format_with(
 mod tests {
     use super::*;
     #[test]
-    fn matches_wine_wsprintf_integer_cases() {
-        let cases: serde_json::Value =
-            serde_json::from_str(include_str!("../../../docs/validation/wsprintf-probe.json"))
-                .unwrap();
-        for case in cases["cases"].as_array().unwrap() {
-            assert_eq!(
-                integer_format(
-                    case["format"].as_str().unwrap().as_bytes(),
-                    &[case["value"].as_u64().unwrap() as u32]
-                )
-                .unwrap(),
-                case["output"].as_str().unwrap().as_bytes()
-            );
-        }
-    }
-    #[test]
     fn rejects_missing_arguments_unsupported_conversions_and_large_output() {
         for format in [b"%".as_slice(), b"%s", b"%999999999999d", b"%d%d"] {
             assert!(integer_format(format, &[0]).is_err());

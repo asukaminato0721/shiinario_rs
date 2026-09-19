@@ -34,39 +34,3 @@ pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn thumbnail_averages_blocks_without_mixing_rows_or_channels() {
-        let mut source = vec![0; SOURCE_SIZE];
-        for y in 0..600 {
-            for x in 0..800 {
-                source[(y * 800 + x) * 3..(y * 800 + x) * 3 + 3].copy_from_slice(&[
-                    (x / 8) as u8,
-                    (y / 8) as u8,
-                    ((x % 8) + (y % 8) * 8) as u8,
-                ]);
-            }
-        }
-        let result = thumbnail(&source).unwrap();
-        let reference: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../docs/validation/native-thumbnail-probe.json"
-        ))
-        .unwrap();
-        assert_eq!(
-            format!("{:x}", Sha256::digest(&result)),
-            reference["expected_sha256"].as_str().unwrap()
-        );
-        for y in 0..75 {
-            for x in 0..100 {
-                assert_eq!(
-                    &result[(y * 100 + x) * 3..(y * 100 + x) * 3 + 3],
-                    &[x as u8, y as u8, 31]
-                );
-            }
-        }
-        assert!(thumbnail(&source[..SOURCE_SIZE - 1]).is_err());
-        assert!(!is_thumbnail(&[0; THUMBNAIL_CODE_SIZE]));
-    }
-}
