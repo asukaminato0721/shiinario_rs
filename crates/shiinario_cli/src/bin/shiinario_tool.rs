@@ -31,7 +31,7 @@ enum Command {
         /// Use logged, synthetic window replies for interpreter research.
         #[arg(long)]
         simulate_platform: bool,
-        /// Advance synthetic milliseconds per host poll (zero freezes time).
+        /// Milliseconds per host poll; timer retries advance 1 ms. Zero freezes time.
         #[arg(long, default_value_t = 0, requires = "simulate_platform")]
         tick_ms: u32,
     },

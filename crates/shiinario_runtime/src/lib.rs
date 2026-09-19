@@ -161,6 +161,16 @@ impl Host for TracePlatform {
             PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
             PlatformRequest::ClockMilliseconds => Ok(self.clock_ms),
+            PlatformRequest::WaitTaskTimer { epoch, duration } => {
+                let ready = self.clock_ms.wrapping_sub(*epoch) >= *duration;
+                // Model the original Sleep(1) between unsuccessful checks. A
+                // zero tick retains the explicitly frozen research clock.
+                if !ready && self.tick_ms != 0 {
+                    self.clock_ms = self.clock_ms.wrapping_add(1);
+                    self.mixer.advance_ms(1);
+                }
+                Ok(u32::from(ready))
+            }
             PlatformRequest::InvalidateRect { .. } => Ok(1),
             PlatformRequest::ReadRegistryValue {
                 root: 0x80000001,
@@ -202,6 +212,35 @@ pub fn open(path: impl AsRef<Path>) -> Result<Project> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timer_wait_checks_advance_one_millisecond_without_polling() {
+        let mut clock = TracePlatform {
+            clock_ms: u32::MAX - 1,
+            tick_ms: 16,
+            ..Default::default()
+        };
+        let request = PlatformRequest::WaitTaskTimer {
+            epoch: u32::MAX - 1,
+            duration: 3,
+        };
+        for now in [u32::MAX, 0, 1] {
+            assert_eq!(clock.respond(&request).unwrap(), 0);
+            assert_eq!(clock.clock_ms, now);
+        }
+        assert_eq!(clock.respond(&request).unwrap(), 1);
+        assert_eq!(clock.clock_ms, 1);
+        let mut frozen = TracePlatform::default();
+        assert_eq!(
+            frozen
+                .respond(&PlatformRequest::WaitTaskTimer {
+                    epoch: 0,
+                    duration: 1
+                })
+                .unwrap(),
+            0
+        );
+        assert_eq!(frozen.clock_ms, 0);
+    }
     #[test]
     fn simulated_clock_advances_only_at_polls_and_wraps() {
         let mut clock = TracePlatform {

@@ -66,12 +66,14 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
         loop {
             self.spaces();
             let op = self.bytes.get(self.at).copied();
-            if !matches!(op, Some(b'*' | b'/')) {
+            if !matches!(op, Some(b'*' | b'/' | b'|')) {
                 return Ok(value);
             }
             self.at += 1;
             let rhs = self.atom(depth)?;
-            value = Self::checked(if op == Some(b'*') {
+            value = Self::checked(if op == Some(b'|') {
+                f64::from((value as i64 as i32) | (rhs as i64 as i32))
+            } else if op == Some(b'*') {
                 value * rhs
             } else {
                 ensure!(rhs != 0.0, "expression division by zero");
@@ -137,6 +139,22 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
             }
             b'0'..=b'9' => {
                 let mut value = f64::from(byte - b'0');
+                if self.bytes.get(self.at) == Some(&b'x') {
+                    self.at += 1;
+                    let start = self.at;
+                    loop {
+                        self.spaces();
+                        let digit = match self.bytes.get(self.at) {
+                            Some(b @ b'0'..=b'9') => *b - b'0',
+                            Some(b @ b'a'..=b'f') => *b - b'a' + 10,
+                            _ => break,
+                        };
+                        value = Self::checked(value * 16.0 + f64::from(digit))?;
+                        self.at += 1;
+                    }
+                    ensure!(self.at > start, "missing hexadecimal digits");
+                    return Ok(value);
+                }
                 loop {
                     self.spaces();
                     let Some(byte @ b'0'..=b'9') = self.bytes.get(self.at) else {

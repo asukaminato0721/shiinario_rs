@@ -5,9 +5,10 @@ An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
 800×600 title screen and starts its music through CPAL. The captured native title
 pixels exactly match the original x86 renderer's BGR hash. Title-menu hover now
 runs with static sound-buffer playback. Clicking the first item advances through
-image/task cleanup and stops at unresolved `0x06da`, `start.SCN:0x91c9a`, with
-source/task context. Menu completion, story progression, choices, movies and saves
-remain unfinished.
+cleanup and scene replacement into `t\_MAI.SCN`, loads its story file and enters
+the transition library. Execution currently stops at unresolved `0x0568`,
+`efclib.scn:0x55cf`, with source/task context. Menu completion, dialogue, choices,
+movies and saves remain unfinished.
 
 The simulated startup/title trace passes 20,000 instructions against captured x86:
 instruction/poll order, all final SCN hashes, input replies, frame bounds and title

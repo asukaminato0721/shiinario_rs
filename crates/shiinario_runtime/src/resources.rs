@@ -1,7 +1,9 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
 use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
-use shiinario_scenario::{ImageDraw, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCopy};
+use shiinario_scenario::{
+    ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCopy,
+};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -417,6 +419,43 @@ impl Resources {
         }
         destination.pixels.write(0, &pixels)
     }
+    fn mask_transition(&mut self, transition: &MaskTransition) -> Result<()> {
+        let flags = transition.flags;
+        let weight = flags & 0x3fff_ffff;
+        ensure!(
+            flags & 0x4000_0000 != 0 && weight <= 512,
+            "unsupported mask transition mode or weight {flags:#x}"
+        );
+        let destination = self
+            .surfaces
+            .get(&transition.destination)
+            .context("mask transition destination is not allocated")?;
+        // 437af0 advances packed BGR triples for width * height pixels;
+        // it does not skip row padding even when the stride has padding.
+        let length = destination.width as usize * destination.height as usize * 3;
+        let read = |id: u32| -> Result<Vec<u8>> {
+            self.surfaces
+                .get(&id)
+                .context("mask transition source is not allocated")?
+                .pixels
+                .read(0, length)
+        };
+        let first = read(transition.first)?;
+        let second = transition.second.map(read).transpose()?;
+        let mask = read(transition.mask)?;
+        let mut result = vec![0; length];
+        let threshold = 256u32.wrapping_sub(weight);
+        for (index, pixel) in result.as_chunks_mut::<3>().0.iter_mut().enumerate() {
+            let offset = index * 3;
+            let blue = mask[offset] ^ if flags & 0x8000_0000 != 0 { 255 } else { 0 };
+            if u32::from(blue) >= threshold {
+                pixel.copy_from_slice(&first[offset..offset + 3]);
+            } else if let Some(second) = &second {
+                pixel.copy_from_slice(&second[offset..offset + 3]);
+            }
+        }
+        destination.pixels.write(0, &result)
+    }
     fn copy_surface(&mut self, copy: &SurfaceCopy) -> Result<()> {
         let destination = self
             .surfaces
@@ -615,6 +654,13 @@ impl Resources {
         }
         Ok(())
     }
+    fn release_surface(&mut self, id: u32) -> Result<()> {
+        ensure!(id < 256, "surface release slot out of bounds");
+        if let Some(surface) = self.surfaces.remove(&id) {
+            self.resident -= surface.pixels.len();
+        }
+        Ok(())
+    }
     fn load_image(&mut self, id: u32, data: Vec<u8>) -> Result<()> {
         ensure!(id < 256, "image slot out of bounds");
         image::frames(&data)?;
@@ -767,6 +813,7 @@ impl Resources {
             PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
             }
@@ -797,6 +844,7 @@ impl Resources {
                 flags,
             } => self.create_surface(*id, *width, *height, *flags)?,
             PlatformRequest::ReleaseImage { id } => self.release_image(*id)?,
+            PlatformRequest::ReleaseSurface { id } => self.release_surface(*id)?,
             PlatformRequest::LoadImage { id, name } => {
                 let bytes = project.read_with_archives(name, &self.archives)?;
                 self.load_image(*id, bytes)?;
@@ -810,6 +858,49 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn surface_release_matches_original_and_reclaims_budget() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/surface-release-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let id = case["slot"].as_u64().unwrap() as u32;
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("release.scn", code).unwrap();
+            let mut resources = Resources::default();
+            resources.create_surface(17, 8, 4, 0).unwrap();
+            if case["present"].as_bool().unwrap() {
+                resources.create_surface(id, 8, 4, 0).unwrap();
+            }
+            for state in case["states"].as_array().unwrap() {
+                assert!(matches!(vm.step().unwrap(), Event::Platform {
+                    request: PlatformRequest::ReleaseSurface { id: actual }, ..
+                } if actual == id));
+                resources.release_surface(id).unwrap();
+                vm.respond(1).unwrap();
+                assert_eq!(
+                    vm.location().offset as u64,
+                    state["offset"].as_u64().unwrap()
+                );
+                assert!(resources.surface_memory(id).is_none());
+                assert!(resources.surface(17).is_some());
+                assert_eq!(resources.resident, 96);
+            }
+            for _ in 0..300 {
+                resources.create_surface(id, 8, 4, 0).unwrap();
+                resources.release_surface(id).unwrap();
+                assert_eq!(resources.resident, 96);
+            }
+            assert!(resources.release_surface(256).is_err());
+            assert_eq!(resources.resident, 96);
+        }
+    }
     #[test]
     fn image_release_matches_native_and_reclaims_budget() {
         use shiinario_scenario::{BinaryVm, Event};
@@ -1388,6 +1479,76 @@ mod tests {
             resources.surface(2).unwrap().rgba,
             [0, 0, 0, 255, 0, 0, 0, 255]
         );
+    }
+    #[test]
+    fn mask_transition_matches_original_thresholds_channels_and_aliases() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/mask-transition-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut resources = Resources::default();
+            for (index, id) in [0, 3, 11, 12].into_iter().enumerate() {
+                resources.create_surface(id, 8, 4, 0).unwrap();
+                resources
+                    .surface_memory(id)
+                    .unwrap()
+                    .write(0, &decode(&fixture["initial"][index]))
+                    .unwrap();
+            }
+            let mut vm = BinaryVm::new("mask.scn", decode(&case["code"])).unwrap();
+            let Event::Platform {
+                request: PlatformRequest::MaskTransition(transition),
+                ..
+            } = vm.step().unwrap()
+            else {
+                panic!("expected mask transition");
+            };
+            resources.mask_transition(&transition).unwrap();
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+            assert_eq!(
+                resources.surface_memory(0).unwrap().read(0, 96).unwrap(),
+                decode(&case["pixels"]),
+                "{:?}",
+                case["args"]
+            );
+        }
+        let mut resources = Resources::default();
+        resources.create_surface(0, 8, 4, 0).unwrap();
+        let valid = MaskTransition {
+            destination: 0,
+            first: 0,
+            second: None,
+            mask: 0,
+            flags: 0xc0000080,
+        };
+        for kind in 0..4 {
+            let mut transition = valid.clone();
+            match kind {
+                0 => transition.flags = 0x80000080,
+                1 => transition.flags = 0xc0000201,
+                2 => transition.first = 99,
+                _ => transition.second = Some(99),
+            }
+            let before = resources.surface_memory(0).unwrap().read(0, 96).unwrap();
+            assert!(resources.mask_transition(&transition).is_err());
+            assert_eq!(
+                resources.surface_memory(0).unwrap().read(0, 96).unwrap(),
+                before
+            );
+        }
     }
     #[test]
     fn surface_copy_matches_original_clipping_overlap_and_operand_order() {

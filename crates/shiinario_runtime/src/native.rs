@@ -164,6 +164,9 @@ impl Host for NativeHost {
                 Ok(self.controls.mask())
             }
             PlatformRequest::ClockMilliseconds => Ok(self.started.elapsed().as_millis() as u32),
+            PlatformRequest::WaitTaskTimer { epoch, duration } => Ok(u32::from(
+                (self.started.elapsed().as_millis() as u32).wrapping_sub(*epoch) >= *duration,
+            )),
             PlatformRequest::PumpMessages => {
                 self.poll()?;
                 Ok(1)
@@ -383,7 +386,19 @@ impl ApplicationHandler for App<'_> {
         // Bound interpreter work so input and close events stay responsive.
         let deadline = Instant::now() + Duration::from_millis(4);
         for _ in 0..10000 {
+            let mut timer_wait = false;
             let result = self.session.step(self.project, host, |event| {
+                if matches!(
+                    event,
+                    Event::Platform {
+                        request: PlatformRequest::WaitTaskTimer { .. },
+                        ..
+                    }
+                ) {
+                    timer_wait = true;
+                } else if matches!(event, Event::PlatformReply { value: 1, .. }) {
+                    timer_wait = false;
+                }
                 if matches!(
                     event,
                     Event::BinaryInstruction { .. }
@@ -406,7 +421,7 @@ impl ApplicationHandler for App<'_> {
                     return;
                 }
             }
-            if Instant::now() >= deadline {
+            if timer_wait || Instant::now() >= deadline {
                 break;
             }
         }

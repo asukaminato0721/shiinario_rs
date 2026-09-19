@@ -38,6 +38,14 @@ pub struct SurfaceCopy {
     pub source: SurfacePoint,
     pub size: [i32; 2],
 }
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MaskTransition {
+    pub destination: u32,
+    pub first: u32,
+    pub second: Option<u32>,
+    pub mask: u32,
+    pub flags: u32,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ImageDraw {
@@ -94,6 +102,7 @@ pub enum PlatformRequest {
     },
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
+    MaskTransition(MaskTransition),
     SurfacePixels {
         id: u32,
     },
@@ -149,6 +158,9 @@ pub enum PlatformRequest {
         height: u32,
         flags: u32,
     },
+    ReleaseSurface {
+        id: u32,
+    },
     CpuFeatures,
     ReleaseImage {
         id: u32,
@@ -180,6 +192,12 @@ pub enum PlatformRequest {
     },
     /// Low 32 bits of the host monotonic clock in milliseconds.
     ClockMilliseconds,
+    /// Hold the current task until wrapping clock minus epoch reaches duration.
+    /// A false reply keeps this request pending, without scheduling another task.
+    WaitTaskTimer {
+        epoch: u32,
+        duration: u32,
+    },
     ReadIniInteger {
         file: String,
         section: String,
@@ -637,6 +655,12 @@ impl BinaryVm {
             "platform request requires a byte-string reply"
         );
         if let Some((Event::Platform { location, request }, _)) = &self.pending {
+            if matches!(request, PlatformRequest::WaitTaskTimer { .. }) {
+                ensure!(value <= 1, "timer wait requires a Boolean reply");
+                if value == 0 {
+                    return Ok(());
+                }
+            }
             ensure!(
                 !matches!(
                     request,
@@ -651,6 +675,7 @@ impl BinaryVm {
                 request,
                 PlatformRequest::CreateAudioStream { .. }
                     | PlatformRequest::CreateSurface { .. }
+                    | PlatformRequest::ReleaseSurface { .. }
                     | PlatformRequest::LoadImage { .. }
                     | PlatformRequest::CreateImage { .. }
                     | PlatformRequest::FillImage { .. }
@@ -716,7 +741,8 @@ impl BinaryVm {
             self.write(destination, value);
         }
         if let Event::Platform {
-            request: PlatformRequest::CreateSurface { id, .. },
+            request:
+                PlatformRequest::CreateSurface { id, .. } | PlatformRequest::ReleaseSurface { id },
             ..
         } = event
             && let Some(base) = self.surface_regions.remove(&id)
@@ -1432,6 +1458,27 @@ impl BinaryVm {
                 ];
                 request = Some(PlatformRequest::InvalidateRect { rect });
             }
+            0x0568 => {
+                let destination = self.read(&mut cursor)?;
+                let first = self.read(&mut cursor)?;
+                let second = self.read(&mut cursor)?;
+                let mask = self.read(&mut cursor)?;
+                let flags = self.read(&mut cursor)?;
+                ensure!(
+                    destination < 256
+                        && first < 256
+                        && mask < 256
+                        && (second < 256 || second == u32::MAX),
+                    "mask transition surface slot out of bounds"
+                );
+                request = Some(PlatformRequest::MaskTransition(MaskTransition {
+                    destination,
+                    first,
+                    second: (second != u32::MAX).then_some(second),
+                    mask,
+                    flags,
+                }));
+            }
             0x04e2 => {
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
@@ -1779,6 +1826,16 @@ impl BinaryVm {
                     _ => None,
                 };
                 request = Some(PlatformRequest::ClockMilliseconds);
+            }
+            0x03be => {
+                let duration = self.read(&mut cursor)?;
+                let epoch = *self.task_timers.get(&self.current_task).unwrap_or(&0);
+                request = Some(PlatformRequest::WaitTaskTimer { epoch, duration });
+            }
+            0x0547 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "surface release slot out of bounds");
+                request = Some(PlatformRequest::ReleaseSurface { id });
             }
             0x010e => {
                 let path = self.string(self.read(&mut cursor)?)?;
@@ -2405,6 +2462,30 @@ impl BinaryVm {
                 };
                 writes.push((destination, value));
             }
+            0x03a0 => {
+                let divisor = self.read(&mut cursor)?;
+                ensure!(divisor != 0, "unsigned division by zero");
+                let saved = cursor.pc;
+                let dividend = self.read(&mut cursor)?;
+                // The original also reads the old remainder before writing.
+                self.read(&mut cursor)?;
+                cursor.pc = saved;
+                let mut destinations = Vec::with_capacity(2);
+                for _ in 0..2 {
+                    let tag = *cursor
+                        .data
+                        .get(cursor.pc)
+                        .context("truncated division destination")?
+                        & 0x7f;
+                    ensure!(
+                        matches!(tag, 2 | 6 | 8 | 10 | 12 | 14 | 18),
+                        "indirect division destinations are unresolved"
+                    );
+                    destinations.push(self.destination(&mut cursor)?);
+                }
+                writes.push((destinations[0], dividend / divisor));
+                writes.push((destinations[1], dividend % divisor));
+            }
             0x01f4 | 0x01fe => {
                 let left = self.read(&mut cursor)?;
                 let comparison = cursor.byte()?;
@@ -2934,6 +3015,33 @@ mod tests {
     }
 
     #[test]
+    fn surface_release_invalidates_old_pointers_only_after_success() {
+        let mut args = immediate(20);
+        args.extend([12, 0, 0]);
+        let mut code = instruction(0x528, &args);
+        code.extend(instruction(0x547, &immediate(20)));
+        code.extend(instruction(0x528, &args));
+        let mut vm = BinaryVm::new("release.scn", code).unwrap();
+        vm.step().unwrap();
+        let pointer = vm
+            .respond_surface_pixels(Some(SharedMemory::zeroed(16).unwrap()))
+            .unwrap();
+        vm.step().unwrap();
+        assert!(vm.respond(0).is_err());
+        assert!(vm.memory_read(pointer, 1).is_ok());
+        vm.respond(1).unwrap();
+        assert!(vm.memory_read(pointer, 1).is_err());
+        assert!(vm.shared_regions.is_empty());
+        vm.step().unwrap();
+        assert_eq!(vm.respond_surface_pixels(None).unwrap(), 0);
+        for id in [256, u32::MAX] {
+            let mut vm = BinaryVm::new("invalid.scn", instruction(0x547, &immediate(id))).unwrap();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+        }
+    }
+
+    #[test]
     fn scheduler_matches_original_instruction_order_polls_and_task_memory() {
         let probe: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/validation/scheduler-probe.json"
@@ -3195,11 +3303,34 @@ mod tests {
                 .collect();
             let mut vm = BinaryVm::new(case["name"].as_str().unwrap(), code).unwrap();
             let mut clocks = case["clocks"].as_array().into_iter().flatten();
+            let mut sleeps = 0;
             for (step, expected) in case["states"].as_array().unwrap().iter().enumerate() {
                 if let Some(task) = case["tasks"].get(step) {
                     vm.current_task = task.as_u64().unwrap() as u32;
                 }
                 match vm.step().unwrap() {
+                    Event::Platform {
+                        request: PlatformRequest::WaitTaskTimer { epoch, duration },
+                        ..
+                    } => loop {
+                        let now = clocks.next().unwrap().as_u64().unwrap() as u32;
+                        let ready = now.wrapping_sub(epoch) >= duration;
+                        assert!(vm.respond(2).is_err());
+                        vm.respond(u32::from(ready)).unwrap();
+                        if ready {
+                            break;
+                        }
+                        sleeps += 1;
+                        let steps = vm.steps;
+                        assert!(matches!(
+                            vm.scheduled_step().unwrap(),
+                            Event::Platform {
+                                request: PlatformRequest::WaitTaskTimer { .. },
+                                ..
+                            }
+                        ));
+                        assert_eq!(vm.steps, steps);
+                    },
                     Event::Platform {
                         request: PlatformRequest::ClockMilliseconds,
                         ..
@@ -3229,6 +3360,8 @@ mod tests {
                 });
                 assert_eq!(&actual, expected, "{} step {}", vm.name, vm.steps);
             }
+            assert!(clocks.next().is_none());
+            assert_eq!(sleeps, case["sleeps"].as_array().map_or(0, Vec::len));
         }
     }
 
@@ -3511,6 +3644,16 @@ mod tests {
         assert!(vm.step().is_err());
         assert_eq!(vm.banks[&12][0], 0);
         assert_eq!(vm.pc, 0);
+        for (divisor, remainder) in [(0, vec![12, 1, 0]), (2, vec![12, 232, 3]), (2, vec![0xff])] {
+            let mut args = immediate(divisor);
+            args.extend([12, 0, 0]);
+            args.extend(remainder);
+            let mut vm = BinaryVm::new("bad-divide.scn", instruction(0x3a0, &args)).unwrap();
+            vm.banks.get_mut(&12).unwrap()[0] = 127;
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+            assert_eq!(vm.banks[&12][0], 127);
+        }
     }
 
     #[test]
