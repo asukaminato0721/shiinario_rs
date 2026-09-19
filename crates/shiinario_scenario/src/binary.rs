@@ -1795,6 +1795,15 @@ impl BinaryVm {
                 let value = u32::from(self.memory_read(address, 1)?[0]);
                 writes.push((self.destination(&mut cursor)?, value));
             }
+            0x0305 => {
+                let address = self.read(&mut cursor)?;
+                let value = self.read(&mut cursor)? as u8;
+                memory_write = Some((self.memory_range(address, 1)?, vec![value]));
+            }
+            0x02d0 => {
+                let length = self.string_bytes(self.read(&mut cursor)?)?.len() as u32;
+                writes.push((self.destination(&mut cursor)?, length));
+            }
             0x02d1 | 0x02d3 => {
                 let mut destination = self.read(&mut cursor)?;
                 let source = self.read(&mut cursor)?;
