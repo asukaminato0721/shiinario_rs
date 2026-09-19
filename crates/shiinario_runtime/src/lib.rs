@@ -46,7 +46,7 @@ pub fn trace_with_platform(
             }
         }
         let mut platform = TracePlatform::default();
-        let mut resources = resources::Resources::default();
+        let mut resources = resources::Resources::for_project(project)?;
         let mut audio = audio::Mixer::default();
         for _ in 0..max_steps {
             let event = vm.scheduled_step()?;
@@ -77,6 +77,14 @@ pub fn trace_with_platform(
                         location.scenario,
                         location.offset
                     );
+                }
+                if let PlatformRequest::SurfacePixels { id } = &request {
+                    let address = vm.respond_surface_pixels(resources.surface_memory(*id))?;
+                    emit(&Event::PlatformReply {
+                        value: address,
+                        simulated: false,
+                    })?;
+                    continue;
                 }
                 if let PlatformRequest::CreateAudioStream { address, flags } = &request {
                     let handle = resources

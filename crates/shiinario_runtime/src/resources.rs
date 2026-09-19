@@ -1,7 +1,7 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
 use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
-use shiinario_scenario::PlatformRequest;
+use shiinario_scenario::{PlatformRequest, SharedMemory};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -12,6 +12,12 @@ pub struct Surface {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+struct DrawingSurface {
+    width: u32,
+    height: u32,
+    stride: usize,
+    pixels: SharedMemory,
 }
 pub struct Frame {
     pub x: i32,
@@ -79,7 +85,7 @@ impl Image {
 }
 #[derive(Default)]
 pub struct Resources {
-    surfaces: BTreeMap<u32, Surface>,
+    surfaces: BTreeMap<u32, DrawingSurface>,
     images: BTreeMap<u32, Image>,
     sounds: BTreeMap<u32, Sound>,
     streams: BTreeMap<u32, Arc<AudioStream>>,
@@ -87,6 +93,25 @@ pub struct Resources {
     archives: Vec<String>,
 }
 impl Resources {
+    /// The native pre-SCN initializer allocates Vram buffers (default two).
+    pub fn for_project(project: &Project) -> Result<Self> {
+        let count: i32 = project
+            .config
+            .values
+            .get("vram")
+            .map(|value| value.parse())
+            .transpose()
+            .context("invalid Vram configuration")?
+            .unwrap_or(-1);
+        ensure!(count >= -1, "invalid negative Vram configuration");
+        let count = if count == -1 { 2 } else { count.max(1) };
+        ensure!(count <= 256, "initial surface count exceeds 256");
+        let mut resources = Self::default();
+        for id in 0..count as u32 {
+            resources.create_surface(id, project.config.width, project.config.height, 0)?;
+        }
+        Ok(resources)
+    }
     pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
         project.read_with_archives(name, &self.archives)
     }
@@ -99,8 +124,24 @@ impl Resources {
             self.archives.push(name.to_owned());
         }
     }
-    pub fn surface(&self, id: u32) -> Option<&Surface> {
-        self.surfaces.get(&id)
+    /// Snapshot the top-down BGR24 DIB for an RGBA presentation host.
+    pub fn surface(&self, id: u32) -> Option<Surface> {
+        let surface = self.surfaces.get(&id)?;
+        let bytes = surface.pixels.read(0, surface.pixels.len()).ok()?;
+        let mut rgba = Vec::with_capacity(surface.width as usize * surface.height as usize * 4);
+        for row in bytes.chunks_exact(surface.stride) {
+            for bgr in row[..surface.width as usize * 3].chunks_exact(3) {
+                rgba.extend_from_slice(&[bgr[2], bgr[1], bgr[0], 255]);
+            }
+        }
+        Some(Surface {
+            width: surface.width,
+            height: surface.height,
+            rgba,
+        })
+    }
+    pub fn surface_memory(&self, id: u32) -> Option<SharedMemory> {
+        self.surfaces.get(&id).map(|surface| surface.pixels.clone())
     }
     pub fn sound(&self, id: u32) -> Option<&Sound> {
         self.sounds.get(&id)
@@ -223,14 +264,11 @@ impl Resources {
         if right <= left || bottom <= top {
             return Ok(());
         }
+        let row_bytes: Vec<u8> = [color[2], color[1], color[0]].repeat(right - left);
         for row in top..bottom {
-            let start = (row * surface.width as usize + left) * 4;
-            for pixel in surface.rgba[start..start + (right - left) * 4]
-                .as_chunks_mut::<4>()
-                .0
-            {
-                *pixel = [color[0], color[1], color[2], 255];
-            }
+            surface
+                .pixels
+                .write(row * surface.stride + left * 3, &row_bytes)?;
         }
         Ok(())
     }
@@ -242,24 +280,22 @@ impl Resources {
         // Other allocation modes request legacy DirectDraw surfaces. Their
         // locking and pixel layout must be recovered before accepting them.
         ensure!(flags == 0, "unresolved surface allocation flags {flags:#x}");
-        let size = usize::try_from(u64::from(width) * u64::from(height) * 4)?;
+        let stride = (width as usize * 3 + 3) & !3;
+        let size = stride * height as usize;
         let old = self
             .surfaces
             .get(&id)
-            .map_or(0, |surface| surface.rgba.len());
+            .map_or(0, |surface| surface.pixels.len());
         let resident = self.resident - old + size;
         ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
-        let mut rgba = vec![0; size];
-        // GDI's zeroed BGR bitmap represents opaque black.
-        for pixel in rgba.as_chunks_mut::<4>().0 {
-            pixel[3] = 255;
-        }
+        let pixels = SharedMemory::zeroed(size)?;
         self.surfaces.insert(
             id,
-            Surface {
+            DrawingSurface {
                 width,
                 height,
-                rgba,
+                stride,
+                pixels,
             },
         );
         self.resident = resident;
@@ -586,6 +622,74 @@ mod tests {
         assert_eq!(resources.sound(20).unwrap().samples, samples);
     }
     #[test]
+    fn surface_fill_matches_native_clipping_and_rgb_packing() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/surface-fill-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let code = case["code"].as_str().unwrap();
+            let bytes = (0..code.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&code[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("fill.SCN", bytes).unwrap();
+            let mut resources = Resources::default();
+            resources.create_surface(3, 5, 4, 0).unwrap();
+            let Event::Platform {
+                request: PlatformRequest::FillSurface { id, rect, color },
+                ..
+            } = vm.step().unwrap()
+            else {
+                panic!("expected fill");
+            };
+            assert_eq!((id, color), (3, [0x23, 0xfe, 0x56]));
+            assert!(resources.fill_surface(17, rect, color).is_err());
+            resources.fill_surface(id, rect, color).unwrap();
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset,
+                case["next_offset"].as_u64().unwrap() as usize
+            );
+            let mut expected = vec![0; 5 * 4 * 4];
+            for pixel in expected.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
+            // Rasterize the rectangle recorded at the original GDI call, not
+            // the script's input rectangle. This checks engine clipping too.
+            for fill in case["fills"].as_array().unwrap() {
+                let r: Vec<i64> = fill["rect"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|n| n.as_i64().unwrap())
+                    .collect();
+                let c = fill["color"].as_u64().unwrap();
+                for y in 0..4 {
+                    for x in 0..5 {
+                        if x >= r[0] && x < r[2] && y >= r[1] && y < r[3] {
+                            let offset = ((y * 5 + x) * 4) as usize;
+                            expected[offset..offset + 4].copy_from_slice(&[
+                                c as u8,
+                                (c >> 8) as u8,
+                                (c >> 16) as u8,
+                                255,
+                            ]);
+                        }
+                    }
+                }
+            }
+            assert_eq!(
+                resources.surface(3).unwrap().rgba,
+                expected,
+                "input {:?}",
+                case["args"]
+            );
+            assert_eq!(resources.resident_bytes(), 64);
+        }
+    }
+    #[test]
     fn mutable_images_match_original_dispatcher_snapshots() {
         use shiinario_scenario::{BinaryVm, Event};
         let fixture: serde_json::Value =
@@ -685,13 +789,37 @@ mod tests {
     fn surface_replacement_preserves_budget_and_failed_replacement_keeps_pixels() {
         let mut resources = Resources::default();
         resources.create_surface(2, 800, 600, 0).unwrap();
-        assert_eq!(resources.resident_bytes(), 800 * 600 * 4);
+        assert_eq!(resources.resident_bytes(), 800 * 600 * 3);
         assert_eq!(&resources.surface(2).unwrap().rgba[..4], &[0, 0, 0, 255]);
         assert!(resources.create_surface(2, 16384, 16384, 0).is_err());
         assert_eq!(resources.surface(2).unwrap().width, 800);
         resources.create_surface(2, 2, 3, 0).unwrap();
         assert_eq!(resources.resident_bytes(), 24);
         assert!(resources.create_surface(256, 2, 3, 0).is_err());
+    }
+    #[test]
+    fn shared_bgr_surface_observes_script_writes_and_preserves_row_padding() {
+        let mut resources = Resources::default();
+        resources.create_surface(2, 1, 2, 0).unwrap();
+        let pixels = resources.surface_memory(2).unwrap();
+        assert_eq!(pixels.len(), 8);
+        pixels.write(0, &[3, 2, 1, 99, 6, 5, 4, 88]).unwrap();
+        assert_eq!(
+            resources.surface(2).unwrap().rgba,
+            [1, 2, 3, 255, 4, 5, 6, 255]
+        );
+        resources
+            .fill_surface(2, [0, 1, 1, 1], [10, 20, 30])
+            .unwrap();
+        assert_eq!(pixels.read(0, 8).unwrap(), [3, 2, 1, 99, 30, 20, 10, 88]);
+        assert!(resources.create_surface(2, 1, 2, 1).is_err());
+        assert!(pixels.same_region(&resources.surface_memory(2).unwrap()));
+        resources.create_surface(2, 1, 2, 0).unwrap();
+        assert!(!pixels.same_region(&resources.surface_memory(2).unwrap()));
+        assert_eq!(
+            resources.surface(2).unwrap().rgba,
+            [0, 0, 0, 255, 0, 0, 0, 255]
+        );
     }
     #[test]
     fn invalid_image_does_not_replace_an_existing_slot() {

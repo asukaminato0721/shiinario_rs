@@ -1,5 +1,5 @@
 //! Verified subset of the supplied v2.47 engine. See docs/SCN_RESEARCH.md.
-use crate::{Event, Location};
+use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
 
 /// The original engine stores the full operand and treats every nonzero value as
@@ -22,6 +22,9 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    SurfacePixels {
+        id: u32,
+    },
     FillSurface {
         id: u32,
         rect: [i32; 4],
@@ -145,6 +148,7 @@ enum Destination {
 }
 
 enum MemoryRange {
+    Shared(u32, std::ops::Range<usize>),
     Script(std::ops::Range<usize>),
     Scenario(u32, std::ops::Range<usize>),
     Bank(u8, std::ops::Range<usize>),
@@ -291,6 +295,9 @@ pub struct BinaryVm {
     viewport: [u32; 2],
     pending: Option<(Event, Option<Destination>)>,
     allocations: std::collections::BTreeMap<u32, Vec<u8>>,
+    shared_regions: std::collections::BTreeMap<u32, SharedMemory>,
+    surface_regions: std::collections::BTreeMap<u32, u32>,
+    next_shared: u32,
     next_allocation: u32,
     // Entry points are separate from the task's resumable program counter.
     task_entries: std::collections::BTreeMap<u32, (u32, usize)>,
@@ -338,6 +345,9 @@ impl BinaryVm {
             viewport: [800, 600],
             pending: None,
             allocations: Default::default(),
+            shared_regions: Default::default(),
+            surface_regions: Default::default(),
+            next_shared: 0x9000_0000,
             next_allocation: 0x2000_0000,
             task_entries: Default::default(),
             current_task: 0,
@@ -505,7 +515,9 @@ impl BinaryVm {
             ensure!(
                 !matches!(
                     request,
-                    PlatformRequest::LoadScenario { .. } | PlatformRequest::LoadAsset { .. }
+                    PlatformRequest::LoadScenario { .. }
+                        | PlatformRequest::LoadAsset { .. }
+                        | PlatformRequest::SurfacePixels { .. }
                 ),
                 "asset/scenario loading requires a byte-buffer reply"
             );
@@ -567,7 +579,70 @@ impl BinaryVm {
         if let Some(destination) = destination {
             self.write(destination, value);
         }
+        if let Event::Platform {
+            request: PlatformRequest::CreateSurface { id, .. },
+            ..
+        } = event
+        {
+            if let Some(base) = self.surface_regions.remove(&id) {
+                self.shared_regions.remove(&base);
+            }
+        }
         Ok(())
+    }
+    /// Bind the actual host pixel storage, preserving pointer identity on
+    /// repeated queries. Host drawing and VM writes observe the same bytes.
+    pub fn respond_surface_pixels(&mut self, memory: Option<SharedMemory>) -> Result<u32> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::SurfacePixels { id },
+                ..
+            },
+            destination,
+        )) = &self.pending
+        else {
+            bail!("no pending surface memory request");
+        };
+        let id = *id;
+        let destination = destination.context("surface pointer requires a destination")?;
+        let old = self.surface_regions.get(&id).copied();
+        let address = if let Some(memory) = memory {
+            if let Some(base) = old.filter(|base| self.shared_regions[base].same_region(&memory)) {
+                base
+            } else {
+                let retained: usize = self
+                    .shared_regions
+                    .iter()
+                    .filter(|(base, _)| Some(**base) != old)
+                    .map(|(_, m)| m.len())
+                    .sum();
+                ensure!(
+                    retained + memory.len() <= 256 * 1024 * 1024,
+                    "mapped resources exceed 256 MiB"
+                );
+                let base = self.next_shared;
+                let next = base
+                    .checked_add(((memory.len() as u32 + 4095) & !4095) + 4096)
+                    .context("shared memory address overflow")?;
+                ensure!(next < 0xf000_0000, "shared memory address space exhausted");
+                self.shared_regions.insert(base, memory);
+                self.next_shared = next;
+                self.surface_regions.insert(id, base);
+
+                base
+            }
+        } else {
+            self.surface_regions.remove(&id);
+            0
+        };
+        // Write while the previous region still exists: the script may have
+        // placed the destination inside the region being replaced.
+        self.write(destination, address);
+        if let Some(old) = old.filter(|old| *old != address) {
+            self.shared_regions.remove(&old);
+        }
+        self.pending = None;
+        Ok(address)
     }
     /// Read a whole VM allocation for a pending resource operation.
     pub fn allocation_bytes(&self, address: u32) -> Result<&[u8]> {
@@ -907,10 +982,16 @@ impl BinaryVm {
         {
             return Ok(MemoryRange::Heap(base, r));
         }
+        if let Some((&base, memory)) = self.shared_regions.range(..=address).next_back()
+            && let Some(r) = range(base, memory.len())
+        {
+            return Ok(MemoryRange::Shared(base, r));
+        }
         bail!("invalid memory range {address:#x} + {len:#x}")
     }
     fn memory_read(&self, address: u32, len: usize) -> Result<Vec<u8>> {
         Ok(match self.memory_range(address, len)? {
+            MemoryRange::Shared(base, r) => self.shared_regions[&base].read(r.start, r.len())?,
             MemoryRange::Script(r) => self.data[r].to_vec(),
             MemoryRange::Scenario(base, r) => self.scenarios[&base].data[r].to_vec(),
             MemoryRange::Heap(base, r) => self.allocations[&base][r].to_vec(),
@@ -930,6 +1011,9 @@ impl BinaryVm {
     }
     fn memory_write(&mut self, range: MemoryRange, bytes: &[u8]) {
         match range {
+            MemoryRange::Shared(base, r) => self.shared_regions[&base]
+                .write(r.start, bytes)
+                .expect("validated fixed-size resource range"),
             MemoryRange::Script(r) => self.data[r].copy_from_slice(bytes),
             MemoryRange::Scenario(base, r) => {
                 self.scenarios.get_mut(&base).unwrap().data[r].copy_from_slice(bytes)
@@ -1039,6 +1123,12 @@ impl BinaryVm {
                     name,
                     activate: opcode == 1,
                 });
+            }
+            0x0528 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "drawing surface slot out of bounds: {id}");
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::SurfacePixels { id });
             }
             0x04d8 => {
                 let id = self.read(&mut cursor)?;
@@ -1640,7 +1730,21 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0393 | 0x0396..=0x0398 | 0x039e..=0x039f => {
+            0x0391 | 0x0392 => {
+                let saved = cursor.pc;
+                let value = self.read(&mut cursor)?;
+                cursor.pc = saved;
+                let destination = self.destination(&mut cursor)?;
+                writes.push((
+                    destination,
+                    if opcode == 0x0391 {
+                        value.wrapping_add(1)
+                    } else {
+                        value.wrapping_sub(1)
+                    },
+                ));
+            }
+            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039e..=0x039f => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
@@ -1648,6 +1752,7 @@ impl BinaryVm {
                 let destination = self.destination(&mut cursor)?;
                 let value = match opcode {
                     0x393 => second.wrapping_add(first),
+                    0x394 => second.wrapping_sub(first),
                     0x396 => first & second,
                     0x397 => first | second,
                     0x398 => first ^ second,
@@ -1787,6 +1892,88 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn shared_surface_pointers_match_native_reads_writes_and_identity() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/surface-memory-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let memory = SharedMemory::zeroed(16).unwrap();
+            memory.write(0, &decode(&case["initial"])).unwrap();
+            let mut vm = BinaryVm::new("pixels.scn", decode(&case["code"])).unwrap();
+            for state in case["states"].as_array().unwrap() {
+                let event = vm.step().unwrap();
+                if matches!(
+                    event,
+                    Event::Platform {
+                        request: PlatformRequest::SurfacePixels { .. },
+                        ..
+                    }
+                ) {
+                    assert!(vm.respond(1).is_err());
+                    assert_eq!(vm.step().unwrap(), event);
+                    vm.respond_surface_pixels(Some(memory.clone())).unwrap();
+                }
+                assert_eq!(
+                    vm.location().offset as u64,
+                    state["offset"].as_u64().unwrap()
+                );
+                assert_eq!(
+                    vm.mouse_mapping().value as u64,
+                    state["mouse"].as_u64().unwrap()
+                );
+                assert_eq!(memory.read(0, 16).unwrap(), decode(&state["pixels"]));
+            }
+        }
+    }
+
+    #[test]
+    fn shared_surface_replacement_invalidates_pointers_without_losing_pending_requests() {
+        let mut operands = immediate(3);
+        operands.extend([12, 0, 0]);
+        let query = instruction(0x0528, &operands);
+        let mut code = query.repeat(2);
+        code.extend(instruction(0x0546, &immediate(3)));
+        code.extend(query);
+        let mut vm = BinaryVm::new("pixels.scn", code).unwrap();
+        let memory = SharedMemory::zeroed(16).unwrap();
+        vm.step().unwrap();
+        let first = vm.respond_surface_pixels(Some(memory.clone())).unwrap();
+        memory.write(12, &[1, 2, 3, 4]).unwrap();
+        assert_eq!(vm.memory_read(first + 12, 4).unwrap(), [1, 2, 3, 4]);
+        assert!(vm.memory_read(first + 13, 4).is_err());
+        assert!(memory.write(usize::MAX, &[1]).is_err());
+        assert!(memory.read(16, 1).is_err());
+        assert!(SharedMemory::zeroed(0).is_err());
+        assert!(SharedMemory::zeroed(16 * 1024 * 1024 + 1).is_err());
+        vm.step().unwrap();
+        // A legal destination can itself point into the old resource.
+        vm.pending.as_mut().unwrap().1 = Some(Destination::Memory(first, 4));
+        let replacement = SharedMemory::zeroed(16).unwrap();
+        let second = vm
+            .respond_surface_pixels(Some(replacement.clone()))
+            .unwrap();
+        assert_ne!(first, second);
+        assert_eq!(memory.read(0, 4).unwrap(), second.to_le_bytes());
+        assert!(vm.memory_read(first, 1).is_err());
+        vm.step().unwrap();
+        assert!(vm.respond(0).is_err());
+        assert!(vm.memory_read(second, 1).is_ok());
+        vm.respond(1).unwrap();
+        assert!(vm.memory_read(second, 1).is_err());
+        vm.step().unwrap();
+        assert_eq!(vm.respond_surface_pixels(None).unwrap(), 0);
+        assert_eq!(vm.banks[&12][0], 0);
     }
 
     #[test]

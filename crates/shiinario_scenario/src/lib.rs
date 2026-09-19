@@ -2,7 +2,9 @@
 //! are distinct formats; unknown instructions are never treated as no-ops.
 mod binary;
 mod format;
+mod memory;
 pub use binary::{BinaryVm, MouseButtonMapping, PlatformRequest, boot_binary};
+pub use memory::SharedMemory;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
