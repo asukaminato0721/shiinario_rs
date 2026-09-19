@@ -432,6 +432,7 @@ pub struct BinaryVm {
     background_mode: u32,
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
+    pending_text_style: Option<crate::text::TextStyle>,
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -484,6 +485,7 @@ impl BinaryVm {
             pending_timer: None,
             task_timers: Default::default(),
             text_style: Default::default(),
+            pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -698,6 +700,10 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        if let Some(mut style) = self.pending_text_style.take() {
+            style.character_epoch = value;
+            self.text_style = style;
+        }
         let value = match self.pending_timer.take() {
             Some(true) => {
                 self.task_timers.insert(self.current_task, value);
@@ -1851,7 +1857,13 @@ impl BinaryVm {
                     "text drawing to surfaces is unresolved"
                 );
                 let controls = self.string_bytes(self.read(&mut cursor)?)?;
-                self.text_style = self.text_style.configure(&controls)?;
+                let (style, clock_read) = self.text_style.configure(&controls)?;
+                if clock_read {
+                    self.pending_text_style = Some(style);
+                    request = Some(PlatformRequest::ClockMilliseconds);
+                } else {
+                    self.text_style = style;
+                }
             }
             0x0547 => {
                 let id = self.read(&mut cursor)?;
@@ -3707,9 +3719,32 @@ mod tests {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
             let mut vm = BinaryVm::new("text.scn", code).unwrap();
-            vm.step().unwrap();
-            assert_eq!(serde_json::json!(vm.text_style.color), case["color"]);
-            assert_eq!(serde_json::json!(vm.text_style.opacity), case["opacity"]);
+            let event = vm.step().unwrap();
+            let clocks = case["clocks"].as_array().unwrap();
+            if clocks.is_empty() {
+                assert!(matches!(
+                    event,
+                    Event::BinaryInstruction { opcode: 0x84, .. }
+                ));
+            } else {
+                assert_eq!(clocks.len(), 1);
+                assert!(matches!(
+                    event,
+                    Event::Platform {
+                        request: PlatformRequest::ClockMilliseconds,
+                        ..
+                    }
+                ));
+                assert_eq!(vm.scheduled_step().unwrap(), event);
+                assert_eq!(vm.text_style, crate::text::TextStyle::default());
+                vm.respond(clocks[0].as_u64().unwrap() as u32).unwrap();
+            }
+            assert_eq!(
+                serde_json::json!(vm.text_style),
+                case["style"],
+                "{}",
+                case["text"]
+            );
             assert_eq!(vm.pc as u64, case["next_offset"].as_u64().unwrap());
         }
         let mut args = immediate(u32::MAX);

@@ -1,31 +1,105 @@
 //! Verified non-drawing subset of the engine's inline text controls.
 use anyhow::{Result, ensure};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TextStyle {
     pub color: [u8; 3],
     pub opacity: u32,
+    pub effects: u32,
+    pub edge_color: [u8; 3],
+    pub edge_offset: [u32; 2],
+    pub font_height: u32,
+    pub font_weight: u32,
+    pub half_advance: u32,
+    pub full_advance: u32,
+    pub line_advance: u32,
+    pub line_limit: u32,
+    pub fullwidth_ascii: bool,
+    pub fullwidth_spaces: bool,
+    pub character_delay: u32,
+    pub character_epoch: u32,
 }
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
             color: [255; 3],
             opacity: 256,
+            effects: 0,
+            edge_color: [255; 3],
+            edge_offset: [1; 2],
+            font_height: 16,
+            font_weight: 400,
+            half_advance: 8,
+            full_advance: 16,
+            line_advance: 16,
+            line_limit: 640,
+            fullwidth_ascii: true,
+            fullwidth_spaces: false,
+            character_delay: 0,
+            character_epoch: 0,
         }
     }
 }
 impl TextStyle {
     /// Validate the complete control stream before changing the retained style.
-    pub fn configure(&self, bytes: &[u8]) -> Result<Self> {
+    pub fn configure(&self, bytes: &[u8]) -> Result<(Self, bool)> {
         ensure!(bytes.len() <= 65536, "text controls exceed 64 KiB");
         let mut result = self.clone();
         let mut at = 0;
+        let mut clock_read = false;
         while at < bytes.len() {
             ensure!(
-                bytes.get(at..at + 2) == Some(b"_c"),
+                bytes.get(at) == Some(&b'_') && bytes.get(at + 1).is_some(),
                 "unsupported text control or glyph at byte {at}"
             );
+            let command = bytes[at + 1];
             at += 2;
+            match command {
+                b'e' => result.effects = number(bytes, &mut at)?,
+                b'w' => {
+                    ensure!(
+                        !clock_read,
+                        "multiple timed text controls in one stream are unresolved"
+                    );
+                    result.character_delay = number(bytes, &mut at)?;
+                    clock_read = true;
+                }
+                b'E' => {
+                    for component in &mut result.edge_color {
+                        *component = number(bytes, &mut at)? as u8;
+                    }
+                    for offset in &mut result.edge_offset {
+                        *offset = number(bytes, &mut at)?;
+                    }
+                }
+                b'H' => result.font_height = number(bytes, &mut at)?,
+                b'f' => result.font_weight = number(bytes, &mut at)?,
+                b'Y' | b'R' => result.line_advance = number(bytes, &mut at)?,
+                b'l' => result.line_limit = number(bytes, &mut at)?,
+                b'A' => result.fullwidth_ascii = false,
+                b'Z' | b'z' => {
+                    result.fullwidth_ascii = true;
+                    result.fullwidth_spaces = command == b'z';
+                }
+                b'X' => {
+                    if bytes.get(at) == Some(&b'Z') {
+                        at += 1;
+                        result.full_advance = number(bytes, &mut at)?;
+                    } else {
+                        result.half_advance = number(bytes, &mut at)?;
+                        result.full_advance = result.half_advance.wrapping_mul(2);
+                        ensure!(
+                            at == 0 || bytes[at - 1] != b',',
+                            "optional X text parameter is unresolved"
+                        );
+                    }
+                }
+                b'c' => {}
+                _ => anyhow::bail!("unsupported text control at byte {}", at - 2),
+            }
+            if command != b'c' {
+                continue;
+            }
             if bytes.get(at) == Some(&b'a') {
                 at += 1;
                 result.opacity = number(bytes, &mut at)?;
@@ -38,7 +112,7 @@ impl TextStyle {
                 }
             }
         }
-        Ok(result)
+        Ok((result, clock_read))
     }
 }
 
