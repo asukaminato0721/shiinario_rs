@@ -25,6 +25,7 @@ pub enum PlatformRequest {
     LoadScenario {
         id: u32,
         name: String,
+        activate: bool,
     },
     InitializeAudio {
         flags: u32,
@@ -127,11 +128,52 @@ enum MemoryRange {
     Script(std::ops::Range<usize>),
     Scenario(u32, std::ops::Range<usize>),
     Bank(u8, std::ops::Range<usize>),
+    TaskBank(u32, u8, std::ops::Range<usize>),
     Heap(u32, std::ops::Range<usize>),
 }
 
 fn bank_base(tag: u8) -> u32 {
     0x1100_0000 + u32::from(tag) * 0x10000
+}
+
+fn task_bank_base(task: u32, tag: u8) -> u32 {
+    if task == 0 || !matches!(tag, 8 | 12) {
+        bank_base(tag)
+    } else {
+        0x8000_0000 + task * 0x2000 + if tag == 12 { 0x1000 } else { 0 }
+    }
+}
+
+struct TaskState {
+    base: u32,
+    pc: usize,
+    sp: usize,
+    flags: u32,
+    stack: Vec<u32>,
+    locals: Vec<u32>,
+    scopes: Vec<NamedScope>,
+}
+impl TaskState {
+    fn new(base: u32, pc: usize) -> Self {
+        Self { base, pc, sp: CELLS, flags: 0,
+            stack: vec![0; CELLS], locals: vec![0; CELLS], scopes: Vec::new() }
+    }
+    fn bank(&self, tag: u8) -> &[u32] {
+        if tag == 8 { &self.stack } else { &self.locals }
+    }
+    fn bank_mut(&mut self, tag: u8) -> &mut [u32] {
+        if tag == 8 { &mut self.stack } else { &mut self.locals }
+    }
+}
+
+#[derive(Default)]
+struct Scheduler {
+    started: bool,
+    scan: u32,
+    pass_live: bool,
+    dispatching: bool,
+    used: u32,
+    yielded: bool,
 }
 
 struct NamedScope {
@@ -205,8 +247,7 @@ pub struct BinaryVm {
     steps: usize,
     mouse_mapping: MouseButtonMapping,
     failure: Option<String>,
-    // Direct banks indexed by operand tag. Threads beyond thread zero are not
-    // executable yet. Keeping their scheduling limit does not imply support.
+    // Banks 8 and 12 belong to the selected task; all other banks are shared.
     banks: std::collections::BTreeMap<u8, Vec<u32>>,
     sp: usize,
     thread_limit: u32,
@@ -220,9 +261,12 @@ pub struct BinaryVm {
     pending: Option<(Event, Option<Destination>)>,
     allocations: std::collections::BTreeMap<u32, Vec<u8>>,
     next_allocation: u32,
-    // Defined but inactive task entry points. Activation/scheduling remains a
-    // separate operation; unsupported activation instructions still stop.
+    // Entry points are separate from the task's resumable program counter.
     task_entries: std::collections::BTreeMap<u32, (u32, usize)>,
+    current_task: u32,
+    tasks: std::collections::BTreeMap<u32, TaskState>,
+    scheduler: Scheduler,
+    dispatch_quantum: u32,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
@@ -265,6 +309,10 @@ impl BinaryVm {
             allocations: Default::default(),
             next_allocation: 0x2000_0000,
             task_entries: Default::default(),
+            current_task: 0,
+            tasks: Default::default(),
+            scheduler: Scheduler::default(),
+            dispatch_quantum: 1,
             callback_tasks: Default::default(),
             ended: false,
             named_scopes: Vec::new(),
@@ -277,6 +325,101 @@ impl BinaryVm {
             background_mode: 0,
             archive_paths: Vec::new(),
         })
+    }
+    pub fn current_task(&self) -> u32 {
+        self.current_task
+    }
+    /// Number of instructions per native dispatcher invocation (INI Turbo).
+    pub fn set_dispatch_quantum(&mut self, value: u32) -> Result<()> {
+        ensure!(value > 0, "dispatcher quantum must be positive");
+        self.dispatch_quantum = value;
+        Ok(())
+    }
+    fn task_flags(&self, id: u32) -> u32 {
+        if id == self.current_task { self.context_flags }
+        else { self.tasks.get(&id).map_or(0, |t| t.flags) }
+    }
+    fn rescan_tasks(&mut self) {
+        if self.thread_limit_override == 0 {
+            self.thread_limit = (0..CELLS as u32).rev()
+                .find(|&id| self.task_flags(id) & 1 != 0).unwrap_or(0) + 1;
+        }
+    }
+    fn define_task(&mut self, id: u32, base: u32, pc: usize, activate: bool) {
+        let task = self.tasks.entry(id).or_insert_with(|| TaskState::new(base, pc));
+        task.base = base;
+        task.pc = pc;
+        task.sp = CELLS;
+        task.flags = u32::from(activate);
+        self.task_entries.insert(id, (base, pc));
+    }
+    fn select_task(&mut self, id: u32) {
+        if id == self.current_task { return; }
+        let task = self.tasks.remove(&id).expect("defined runnable task");
+        let old = TaskState {
+            base: self.script_base, pc: self.pc, sp: self.sp, flags: self.context_flags,
+            stack: std::mem::replace(self.banks.get_mut(&8).unwrap(), task.stack),
+            locals: std::mem::replace(self.banks.get_mut(&12).unwrap(), task.locals),
+            scopes: std::mem::replace(&mut self.named_scopes, task.scopes),
+        };
+        self.tasks.insert(self.current_task, old);
+        self.switch_scenario(task.base);
+        self.pc = task.pc;
+        self.sp = task.sp;
+        self.context_flags = task.flags;
+        self.current_task = id;
+    }
+    fn scheduler_poll(&mut self) -> Event {
+        let event = Event::SchedulerPoll;
+        self.pending = Some((event.clone(), None));
+        event
+    }
+    /// Advance the original cooperative scheduler, including explicit host polls.
+    /// Outstanding platform requests must be answered before another task runs.
+    pub fn scheduled_step(&mut self) -> Result<Event> {
+        if self.failure.is_some() || self.ended || self.pending.is_some() {
+            return self.step();
+        }
+        if !self.scheduler.started {
+            self.scheduler.started = true;
+            return Ok(self.scheduler_poll());
+        }
+        if self.scheduler.dispatching && self.scheduler.yielded {
+            self.scheduler.dispatching = false;
+            if self.context_flags & 4 != 0 {
+                return Ok(self.scheduler_poll());
+            }
+            self.scheduler.pass_live |= self.context_flags & 1 != 0;
+            self.scheduler.scan = self.current_task + 1;
+        }
+        while !self.scheduler.dispatching {
+            if self.scheduler.scan >= self.thread_limit {
+                if !self.scheduler.pass_live {
+                    self.ended = true;
+                    return Ok(Event::End);
+                }
+                self.scheduler.scan = 0;
+                self.scheduler.pass_live = false;
+                return Ok(self.scheduler_poll());
+            }
+            let flags = self.task_flags(self.scheduler.scan);
+            ensure!(flags & (2 | 8) == 0,
+                "task {}: unsupported timer/transition flags {flags:#x}", self.scheduler.scan);
+            if flags & 1 == 0 {
+                self.scheduler.scan += 1;
+                continue;
+            }
+            self.select_task(self.scheduler.scan);
+            self.scheduler.dispatching = true;
+            self.scheduler.used = 0;
+            self.scheduler.yielded = false;
+        }
+        let event = self.step()?;
+        self.scheduler.used += 1;
+        self.scheduler.yielded = self.scheduler.used >= self.dispatch_quantum
+            || self.message_mode != 0 || self.context_flags == 0
+            || matches!(&event, Event::Platform { request: PlatformRequest::PumpMessages, .. });
+        Ok(event)
     }
     pub fn location(&self) -> Location {
         Location {
@@ -343,7 +486,7 @@ impl BinaryVm {
         }
         if matches!(
             event,
-            Event::Platform {
+            Event::SchedulerPoll | Event::Platform {
                 request: PlatformRequest::PumpMessages,
                 ..
             }
@@ -356,11 +499,11 @@ impl BinaryVm {
         }
         Ok(())
     }
-    /// Install scenario bytes requested by 0002 without executing its entry.
+    /// Install scenario bytes; 0001 also activates the target task, 0002 does not.
     pub fn respond_scenario(&mut self, data: Vec<u8>) -> Result<()> {
         let Some((
             Event::Platform {
-                request: PlatformRequest::LoadScenario { id, name },
+                request: PlatformRequest::LoadScenario { id, name, activate },
                 ..
             },
             _,
@@ -391,7 +534,9 @@ impl BinaryVm {
                 data,
             },
         );
-        self.task_entries.insert(*id, (base, 0));
+        let (id, activate) = (*id, *activate);
+        self.define_task(id, base, 0, activate);
+        if activate { self.rescan_tasks(); }
         self.next_scenario_base = next;
         self.pending = None;
         Ok(())
@@ -486,8 +631,11 @@ impl BinaryVm {
             return match tag & 0x3f {
                 4 => Ok(self.script_base.wrapping_add(cursor.dword()?)),
                 bank @ (2 | 6 | 8 | 10 | 12 | 14) => {
-                    let index = self.bank_index(bank, cursor.word()?)?;
-                    Ok(bank_base(bank) + (index * if bank == 6 { 1 } else { 4 }) as u32)
+                    let index = usize::from(cursor.word()?) + if bank == 8 { self.sp } else { 0 };
+                    // Taking the address of the empty stack's end is valid;
+                    // dereferencing it still requires an in-bounds memory range.
+                    ensure!(index <= CELLS, "bank address index {index} out of bounds");
+                    Ok(task_bank_base(self.current_task, bank) + (index * if bank == 6 { 1 } else { 4 }) as u32)
                 }
                 0x12 => self.named_address(&cursor.variable_name()?),
                 _ => bail!("unsupported address operand tag {tag:#04x} at {start:#x}"),
@@ -632,8 +780,15 @@ impl BinaryVm {
             return Ok(MemoryRange::Scenario(base, r));
         }
         for &bank in self.banks.keys() {
-            if let Some(r) = range(bank_base(bank), CELLS * if bank == 6 { 1 } else { 4 }) {
+            if let Some(r) = range(task_bank_base(self.current_task, bank), CELLS * if bank == 6 { 1 } else { 4 }) {
                 return Ok(MemoryRange::Bank(bank, r));
+            }
+        }
+        for &id in self.tasks.keys() {
+            for tag in [8, 12] {
+                if let Some(r) = range(task_bank_base(id, tag), CELLS * 4) {
+                    return Ok(MemoryRange::TaskBank(id, tag, r));
+                }
             }
         }
         if let Some((&base, data)) = self.allocations.range(..=address).next_back()
@@ -648,6 +803,8 @@ impl BinaryVm {
             MemoryRange::Script(r) => self.data[r].to_vec(),
             MemoryRange::Scenario(base, r) => self.scenarios[&base].data[r].to_vec(),
             MemoryRange::Heap(base, r) => self.allocations[&base][r].to_vec(),
+            MemoryRange::TaskBank(id, tag, r) => r.map(|index|
+                self.tasks[&id].bank(tag)[index / 4].to_le_bytes()[index % 4]).collect(),
             MemoryRange::Bank(bank, r) => r
                 .map(|index| {
                     if bank == 6 {
@@ -667,6 +824,14 @@ impl BinaryVm {
             }
             MemoryRange::Heap(base, r) => {
                 self.allocations.get_mut(&base).unwrap()[r].copy_from_slice(bytes)
+            }
+            MemoryRange::TaskBank(id, tag, r) => {
+                let cells = self.tasks.get_mut(&id).unwrap().bank_mut(tag);
+                for (index, &value) in r.zip(bytes) {
+                    let mut cell = cells[index / 4].to_le_bytes();
+                    cell[index % 4] = value;
+                    cells[index / 4] = u32::from_le_bytes(cell);
+                }
             }
             MemoryRange::Bank(bank, r) => {
                 let cells = self.banks.get_mut(&bank).unwrap();
@@ -692,6 +857,7 @@ impl BinaryVm {
         if let Some((event, _)) = &self.pending {
             return Ok(event.clone());
         }
+        if self.context_flags & 1 == 0 { return Ok(Event::End); }
         match self.execute() {
             Ok(event) => Ok(event),
             Err(error) => {
@@ -701,9 +867,10 @@ impl BinaryVm {
                     .map(|b| format!("0x{:04x}", u16::from_le_bytes([b[0], b[1]])))
                     .unwrap_or_else(|| "truncated".into());
                 let message = format!(
-                    "{}:{:#x}: {error:#}; opcode={opcode}, executed_steps={}, stack_pointer={}, thread_limit={}, mouse_button_mapping={:#x}, next_bytes={:02x?}",
+                    "{}:{:#x}: {error:#}; opcode={opcode}, task={}, executed_steps={}, stack_pointer={}, thread_limit={}, mouse_button_mapping={:#x}, next_bytes={:02x?}",
                     self.name,
                     self.pc,
+                    self.current_task,
                     self.steps,
                     self.sp,
                     self.thread_limit,
@@ -728,6 +895,8 @@ impl BinaryVm {
         let mut memory_write = None;
         let mut byte_destination = None;
         let mut next_base = self.script_base;
+        let mut definition = None;
+        let mut rescan = false;
         let mut event = Event::BinaryInstruction {
             location: location.clone(),
             opcode,
@@ -736,14 +905,20 @@ impl BinaryVm {
             0x07e5 => self.background_mode = 1,
             0x07e6 => self.background_mode = 0,
             0x07e8 => writes.push((self.destination(&mut cursor)?, self.background_mode)),
-            0x0002 => {
+            0x0000 => {
+                let result = self.read(&mut cursor)?;
+                self.context_flags = 0;
+                rescan = true;
+                if result != 0 { self.ended = true; }
+            }
+            0x0001 | 0x0002 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(
-                    id > 0 && id < CELLS as u32,
+                    id != self.current_task && id < CELLS as u32,
                     "unsupported scenario task slot {id}"
                 );
                 let name = self.string(self.read(&mut cursor)?)?;
-                request = Some(PlatformRequest::LoadScenario { id, name });
+                request = Some(PlatformRequest::LoadScenario { id, name, activate: opcode == 1 });
             }
             0x06a6 => {
                 let id = self.read(&mut cursor)?;
@@ -963,6 +1138,25 @@ impl BinaryVm {
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
             }
+            0x0259 => {
+                let table_end = cursor.dword()? as usize;
+                let selector = self.read(&mut cursor)?;
+                ensure!(table_end >= cursor.pc && table_end <= self.data.len(),
+                    "indexed jump table end {table_end:#x} outside scenario");
+                let mut index = 0;
+                while cursor.pc < table_end {
+                    let address = self.read(&mut cursor)?;
+                    ensure!(cursor.pc <= table_end, "operand crosses indexed jump table end");
+                    if index == selector {
+                        let target = address.checked_sub(self.script_base)
+                            .context("indexed jump address outside scenario")? as usize;
+                        ensure!(target < self.data.len(), "indexed jump target outside scenario");
+                        cursor.pc = target;
+                        break;
+                    }
+                    index += 1;
+                }
+            }
             0x0258 => {
                 let address = self.read(&mut cursor)?;
                 let target = address
@@ -1102,7 +1296,7 @@ impl BinaryVm {
             0x000c => {
                 let task = self.read(&mut cursor)?;
                 ensure!(
-                    task > 0 && task < CELLS as u32,
+                    task != self.current_task && task < CELLS as u32,
                     "unsupported task definition {task:#x}"
                 );
                 let address = self.read(&mut cursor)?;
@@ -1114,7 +1308,7 @@ impl BinaryVm {
                     target < self.data.len(),
                     "task target {target:#x} outside scenario"
                 );
-                self.task_entries.insert(task, (self.script_base, target));
+                definition = Some((task, self.script_base, target));
             }
             0x076c | 0x076d | 0x078a | 0x07e4 => {
                 let task = self.read(&mut cursor)?;
@@ -1161,7 +1355,7 @@ impl BinaryVm {
                 if value != 0 {
                     self.thread_limit = value;
                 } else if self.thread_limit_override == 0 {
-                    self.thread_limit = 1;
+                    rescan = true;
                 }
                 self.thread_limit_override = value;
             }
@@ -1285,6 +1479,8 @@ impl BinaryVm {
         for (destination, value) in writes {
             self.write(destination, value);
         }
+        if let Some((id, base, pc)) = definition { self.define_task(id, base, pc, false); }
+        if rescan { self.rescan_tasks(); }
         self.switch_scenario(next_base);
         self.steps += 1;
         if let Some(request) = request {
@@ -1329,6 +1525,67 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_matches_original_instruction_order_polls_and_task_memory() {
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/scheduler-probe.json")).unwrap();
+        for case in probe["cases"].as_array().unwrap() {
+            let programs: Vec<Vec<u8>> = case["programs"].as_array().unwrap().iter().map(|hex| {
+                let hex = hex.as_str().unwrap();
+                (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
+            }).collect();
+            let mut vm = BinaryVm::new("caller.scn", programs[0].clone()).unwrap();
+            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32).unwrap();
+            vm.scenarios.insert(0x4000_0000, Scenario { name: "worker.scn".into(), data: programs[1].clone() });
+            vm.next_scenario_base = 0x4000_1000;
+            vm.define_task(1, 0x4000_0000, 0, case.get("active").is_none());
+            vm.thread_limit = 2;
+            let mut events = Vec::new();
+            loop {
+                assert!(events.len() < 1000, "{}", case["name"]);
+                let before: Vec<_> = (0..2).map(|id| {
+                    if id == vm.current_task { (vm.sp, vm.banks[&12][0]) }
+                    else { let task = &vm.tasks[&id]; (task.sp, task.locals[0]) }
+                }).collect();
+                let shared = vm.banks[&10][0];
+                let event = vm.scheduled_step().unwrap();
+                if event == Event::End { break; }
+                if event == Event::SchedulerPoll {
+                    events.push(serde_json::json!({"event":"poll"}));
+                    assert_eq!(vm.scheduled_step().unwrap(), event);
+                    vm.respond(1).unwrap();
+                    continue;
+                }
+                let location = match &event {
+                    Event::BinaryInstruction { location, .. } | Event::Platform { location, .. }
+                    | Event::MouseButtonMapping { location, .. } => location,
+                    other => panic!("unexpected event {other:?}"),
+                };
+                let (sp, local) = before[vm.current_task as usize];
+                events.push(serde_json::json!({"event":"instruction", "task":vm.current_task,
+                    "pc":location.offset, "sp":sp, "local":local, "shared":shared}));
+                if let Event::Platform { request, .. } = &event {
+                    assert_eq!(vm.scheduled_step().unwrap(), event);
+                    match request {
+                        PlatformRequest::LoadScenario { activate: true, .. } => vm.respond_scenario(programs[1].clone()).unwrap(),
+                        PlatformRequest::PumpMessages => {
+                            events.push(serde_json::json!({"event":"poll"}));
+                            vm.respond(1).unwrap();
+                        }
+                        _ => panic!("unexpected request {request:?}"),
+                    }
+                }
+            }
+            assert_eq!(serde_json::json!(events), case["events"], "{}", case["name"]);
+            for id in 0..2 {
+                vm.select_task(id);
+                assert_eq!(serde_json::json!({"sp":vm.sp, "local":vm.banks[&12][0],
+                    "popped":vm.banks[&12][1], "flags":vm.context_flags}), case["final"][id as usize], "{} task {id}", case["name"]);
+            }
+            assert_eq!(vm.banks[&10][0], case["shared"].as_u64().unwrap() as u32);
+        }
+    }
+
+    #[test]
     fn cross_scenario_calls_match_original_loader_and_dispatcher() {
         let probe: serde_json::Value = serde_json::from_str(include_str!(
             "../../../docs/validation/scenario-call-probe.json"
@@ -1348,7 +1605,8 @@ mod tests {
                     request,
                     PlatformRequest::LoadScenario {
                         id: 2,
-                        name: "library.scn".into()
+                        name: "library.scn".into(),
+                        activate: false
                     }
                 );
                 assert!(vm.respond(1).is_err());

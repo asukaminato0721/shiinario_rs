@@ -151,6 +151,8 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
+    /// Host poll between scheduler passes or priority-task dispatches.
+    SchedulerPoll,
     ArchiveSearchPath {
         location: Location,
         name: String,

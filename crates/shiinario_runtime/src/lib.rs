@@ -38,11 +38,21 @@ pub fn trace_with_platform(
                 vm.set_background_mode(value as u32);
             }
         }
+        if let Some(value) = project.config.values.get("turbo") {
+            let value: i32 = value.parse().context("invalid Turbo configuration")?;
+            if value != -1 { vm.set_dispatch_quantum((value as u32).max(1))?; }
+        }
         let mut platform = TracePlatform::default();
         let mut resources = resources::Resources::default();
         for _ in 0..max_steps {
-            let event = vm.step()?;
+            let event = vm.scheduled_step()?;
             emit(&event)?;
+            if event == Event::SchedulerPoll {
+                if !simulate_platform { bail!("scheduler requires a platform host; use --simulate-platform for a synthetic host"); }
+                vm.respond(1)?;
+                emit(&Event::PlatformReply { value: 1, simulated: true })?;
+                continue;
+            }
             if let Event::ArchiveSearchPath { name, .. } = &event {
                 resources.register_archive(name);
             }
@@ -106,7 +116,7 @@ pub fn trace_with_platform(
         }
         bail!(
             "{}:{:#x}: trace step budget {max_steps} exhausted",
-            name,
+            vm.location().scenario,
             vm.location().offset
         );
     }
