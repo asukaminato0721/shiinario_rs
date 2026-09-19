@@ -317,6 +317,11 @@ impl Session {
                     location.scenario, location.offset
                 )
             })?;
+            if matches!(&request, PlatformRequest::DrawGlyph { surface: 0, .. }) {
+                host.respond(&PlatformRequest::InvalidateRect {
+                    rect: [0,0,project.config.width as i32,project.config.height as i32],
+                })?;
+            }
             if let PlatformRequest::LoadSound { id, .. } = &request {
                 host.install_sound(
                     *id,

@@ -206,3 +206,45 @@ impl BinaryVm {
 fn cp932_len(first: u8) -> usize {
     if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) { 2 } else { 1 }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn decode(hex: &str) -> Vec<u8> {
+        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
+    }
+    #[test]
+    fn asynchronous_control_text_matches_original_scheduler_passes() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../docs/validation/text-scheduler-probe.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut vm = BinaryVm::new("text.scn",decode(case["programs"][0].as_str().unwrap())).unwrap();
+            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32).unwrap();
+            vm.scenarios.insert(0x40000000,Scenario { name: "worker.scn".into(),data:decode(case["programs"][1].as_str().unwrap()) });
+            vm.define_task(1,0x40000000,0,true);
+            vm.thread_limit = 2;
+            let mut events = Vec::new();
+            loop {
+                assert!(events.len()<100);
+                let event=vm.scheduled_step().unwrap();
+                match event {
+                    Event::End => break,
+                    Event::SchedulerPoll => {
+                        events.push(serde_json::json!({"event":"poll"})); vm.respond(1).unwrap();
+                    }
+                    Event::TextTick { task,completed,cursor } => {
+                        assert!(completed);
+                        events.push(serde_json::json!({"event":"text-tick","task":task,"status":1,"cursor":cursor}));
+                        events.push(serde_json::json!({"event":"text-status","task":task,"status":0,"cursor":cursor}));
+                    }
+                    Event::BinaryInstruction { location,.. } | Event::MouseButtonMapping {location,..} => {
+                        events.push(serde_json::json!({"event":"instruction","task":vm.current_task,
+                            "pc":location.offset,"sp":1000,"local":0,"shared":0}));
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+            assert_eq!(serde_json::json!(events),case["events"],"{}",case["name"]);
+        }
+    }
+}

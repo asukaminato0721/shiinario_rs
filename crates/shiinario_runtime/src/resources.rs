@@ -88,6 +88,7 @@ impl Image {
 }
 #[derive(Default)]
 pub struct Resources {
+    text_renderer: crate::text_render::TextRenderer,
     surfaces: BTreeMap<u32, DrawingSurface>,
     images: BTreeMap<u32, Image>,
     sounds: BTreeMap<u32, Arc<Sound>>,
@@ -807,6 +808,12 @@ impl Resources {
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         match request {
+            PlatformRequest::DrawGlyph { surface,position,character,style } => {
+                let target = self.surfaces.get(surface).context("text surface is not allocated")?;
+                self.text_renderer.draw(crate::text_render::Canvas {
+                    pixels: &target.pixels, size: [target.width,target.height], stride: target.stride,
+                },*position,*character,style)?;
+            }
             PlatformRequest::HitTestImages { x, y, items } => {
                 return Ok(Some(self.hit_test_images(*x, *y, items)?));
             }
