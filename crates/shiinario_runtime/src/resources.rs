@@ -87,7 +87,7 @@ impl Image {
 pub struct Resources {
     surfaces: BTreeMap<u32, DrawingSurface>,
     images: BTreeMap<u32, Image>,
-    sounds: BTreeMap<u32, Sound>,
+    sounds: BTreeMap<u32, Arc<Sound>>,
     streams: BTreeMap<u32, Arc<AudioStream>>,
     resident: usize,
     archives: Vec<String>,
@@ -144,7 +144,10 @@ impl Resources {
         self.surfaces.get(&id).map(|surface| surface.pixels.clone())
     }
     pub fn sound(&self, id: u32) -> Option<&Sound> {
-        self.sounds.get(&id)
+        self.sounds.get(&id).map(Arc::as_ref)
+    }
+    pub fn sound_buffer(&self, id: u32) -> Option<Arc<Sound>> {
+        self.sounds.get(&id).cloned()
     }
     pub fn audio_stream(&self, handle: u32) -> Option<&Arc<AudioStream>> {
         self.streams.get(&handle)
@@ -550,11 +553,11 @@ impl Resources {
         self.resident = retained + samples.len() * 2;
         self.sounds.insert(
             id,
-            Sound {
+            Arc::new(Sound {
                 sample_rate: info.sample_rate,
                 channels: info.channels,
                 samples,
-            },
+            }),
         );
         Ok(())
     }

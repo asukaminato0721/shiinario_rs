@@ -1,7 +1,11 @@
 //! Stream playback, independent of SCN and windowing. Device output uses CPAL.
-use crate::resources::{AudioStream, StreamVolume};
+use crate::{
+    buffer_audio::BufferVoice,
+    resources::{AudioStream, Sound, StreamVolume},
+};
 use anyhow::{Context, Result, bail, ensure};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use shiinario_scenario::SoundCommand;
 use std::{
     collections::BTreeMap,
     sync::{
@@ -82,8 +86,48 @@ impl Voice {
 #[derive(Default)]
 pub struct Mixer {
     voices: BTreeMap<u32, Voice>,
+    buffers: BTreeMap<u32, BufferVoice>,
 }
 impl Mixer {
+    pub fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()> {
+        ensure!(
+            id < 256
+                && matches!(sound.channels, 1 | 2)
+                && sound.sample_rate > 0
+                && sound
+                    .samples
+                    .len()
+                    .is_multiple_of(usize::from(sound.channels)),
+            "invalid sound buffer"
+        );
+        self.buffers.insert(id, BufferVoice::new(sound));
+        Ok(())
+    }
+    pub fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32> {
+        ensure!(id < 256, "sound slot out of bounds");
+        match self.buffers.get_mut(&id) {
+            Some(buffer) => buffer.command(command),
+            None => Ok(if matches!(command, SoundCommand::Status) {
+                u32::MAX
+            } else {
+                1
+            }),
+        }
+    }
+    /// Advance the synthetic host clock without generating discarded PCM.
+    pub fn advance_ms(&mut self, ms: u32) {
+        let frames = u64::from(ms) * 48;
+        for buffer in self.buffers.values_mut() {
+            buffer.advance(frames, 48000);
+        }
+        for voice in self.voices.values_mut() {
+            let total = u128::from(voice.fraction)
+                + u128::from(frames) * u128::from(voice.stream.sound.sample_rate);
+            voice.frame =
+                (u128::from(voice.frame) + total / 48000).min(u128::from(u64::MAX)) as u64;
+            voice.fraction = (total % 48000) as u64;
+        }
+    }
     pub fn play(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
         ensure!(
             matches!(flags, 0 | 2),
@@ -146,6 +190,12 @@ impl Mixer {
                 false
             }
         });
+        for buffer in self.buffers.values_mut() {
+            if let Some(frame) = buffer.next(rate) {
+                sum[0] += frame[0];
+                sum[1] += frame[1];
+            }
+        }
         [sum[0].clamp(-1.0, 1.0), sum[1].clamp(-1.0, 1.0)]
     }
     pub fn render(&mut self, output: &mut [f32], rate: u32, channels: u16) -> Result<()> {
@@ -178,6 +228,20 @@ pub struct AudioOutput {
     frames: Arc<AtomicU64>,
 }
 impl AudioOutput {
+    pub fn install_sound(&self, id: u32, sound: Arc<Sound>) -> Result<()> {
+        self.check()?;
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .install_sound(id, sound)
+    }
+    pub fn sound_command(&self, id: u32, command: &SoundCommand) -> Result<u32> {
+        self.check()?;
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .sound_command(id, command)
+    }
     pub fn open() -> Result<Self> {
         let device = cpal::default_host()
             .default_output_device()

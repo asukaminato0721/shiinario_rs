@@ -1,5 +1,6 @@
 //! Host-independent project startup and deterministic research traces.
 pub mod audio;
+mod buffer_audio;
 pub mod input;
 pub mod native;
 mod presentation;
@@ -116,6 +117,7 @@ impl Host for TracePlatform {
     }
     fn poll(&mut self) -> Result<()> {
         self.clock_ms = self.clock_ms.wrapping_add(self.tick_ms);
+        self.mixer.advance_ms(self.tick_ms);
         Ok(())
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
@@ -126,6 +128,16 @@ impl Host for TracePlatform {
             }
             _ => bail!("unsupported point request: {request:?}"),
         }
+    }
+    fn install_sound(&mut self, id: u32, sound: Arc<resources::Sound>) -> Result<()> {
+        self.mixer.install_sound(id, sound)
+    }
+    fn sound_command(
+        &mut self,
+        id: u32,
+        command: &shiinario_scenario::SoundCommand,
+    ) -> Result<u32> {
+        self.mixer.sound_command(id, command)
     }
     fn play_stream(
         &mut self,

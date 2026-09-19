@@ -1,9 +1,9 @@
 //! Shared scenario execution and resource handling for traces and native hosts.
-use crate::resources::{AudioStream, Resources, Surface};
+use crate::resources::{AudioStream, Resources, Sound, Surface};
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
-use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
+use shiinario_scenario::{BinaryVm, Event, PlatformRequest, SoundCommand};
 use std::sync::Arc;
 
 pub trait Host {
@@ -15,6 +15,8 @@ pub trait Host {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32>;
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]>;
     fn mouse_mapping(&mut self, _value: u32) {}
+    fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()>;
+    fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32>;
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()>;
 }
 
@@ -175,6 +177,20 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::Sound { id, command } = &request {
+                let value = host.sound_command(*id, command).with_context(|| {
+                    format!(
+                        "{}:{:#x}: sound slot {id}: {command:?}",
+                        location.scenario, location.offset
+                    )
+                })?;
+                vm.respond(value)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::PlayAudioStream { handle, flags } = &request {
                 let stream = resources
                     .audio_stream(*handle)
@@ -240,6 +256,20 @@ impl Session {
                     location.scenario, location.offset
                 )
             })?;
+            if let PlatformRequest::LoadSound { id, .. } = &request {
+                host.install_sound(
+                    *id,
+                    resources
+                        .sound_buffer(*id)
+                        .context("loaded sound missing")?,
+                )
+                .with_context(|| {
+                    format!(
+                        "{}:{:#x}: install sound {id}",
+                        location.scenario, location.offset
+                    )
+                })?;
+            }
             if let PlatformRequest::DrawImages { id, .. } = &request {
                 let memory = resources
                     .surface_memory(*id)

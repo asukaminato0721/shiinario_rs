@@ -44,9 +44,23 @@ pub struct ImageDraw {
     pub extra: [u32; 2],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum SoundCommand {
+    Play { flags: u32 },
+    Stop,
+    Volume { attenuation: i32 },
+    Pan { attenuation: i32 },
+    Frequency { hz: u32 },
+    Status,
+}
+
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    Sound {
+        id: u32,
+        command: SoundCommand,
+    },
     ReadKeyState {
         key: u32,
     },
@@ -1242,6 +1256,30 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x06a7..=0x06ab | 0x06af => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "unsupported sound slot/handle {id:#x}");
+                let command = match opcode {
+                    0x06a7 => SoundCommand::Play {
+                        flags: self.read(&mut cursor)?,
+                    },
+                    0x06a8 => SoundCommand::Stop,
+                    0x06a9 => SoundCommand::Volume {
+                        attenuation: self.read(&mut cursor)? as i32,
+                    },
+                    0x06aa => SoundCommand::Pan {
+                        attenuation: self.read(&mut cursor)? as i32,
+                    },
+                    0x06ab => SoundCommand::Frequency {
+                        hz: self.read(&mut cursor)?,
+                    },
+                    _ => {
+                        response_destination = Some(self.destination(&mut cursor)?);
+                        SoundCommand::Status
+                    }
+                };
+                request = Some(PlatformRequest::Sound { id, command });
+            }
             0x03e8 => {
                 let key = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);

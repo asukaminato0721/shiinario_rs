@@ -3,13 +3,13 @@ use crate::{
     audio::AudioOutput,
     input::{AsyncKeys, ControlState},
     presentation::Presentation,
-    resources::AudioStream,
+    resources::{AudioStream, Sound},
     session::{Host, Session},
     viewport::ViewportTransform,
 };
 use anyhow::{Context, Result, bail};
 use shiinario_assets::project::Project;
-use shiinario_scenario::{Event, MouseButtonMapping, PlatformRequest};
+use shiinario_scenario::{Event, MouseButtonMapping, PlatformRequest, SoundCommand};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -127,6 +127,18 @@ impl Host for NativeHost {
             PlatformRequest::MapCursor { point } => self.transform.to_logical(*point),
             _ => bail!("unsupported point request: {request:?}"),
         }
+    }
+    fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()> {
+        self.audio
+            .as_ref()
+            .context("audio has not been initialized")?
+            .install_sound(id, sound)
+    }
+    fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32> {
+        self.audio
+            .as_ref()
+            .context("audio has not been initialized")?
+            .sound_command(id, command)
     }
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
         self.audio

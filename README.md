@@ -1,20 +1,18 @@
 # shiinario_rs
 
 An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
-**This is not yet a playable port.** Asset decoding is verified against GARbro;
-binary scenario execution, native presentation, menus, choices, movies, and saves
-remain unfinished. Startup execution stops at an unresolved instruction or a platform request that
-has no host. The optional simulated-platform trace now reaches the title input
-routine after 15,541 instructions, stopping at `_SPRIT\title.SCN:0x2784`, opcode
-`0x03e9`. Instruction/poll order, final SCN memory and three title-buffer hashes
-match captured x86 execution with the same synthetic services. It supports the title redraw request, explicit synthetic clock progression,
-S25 drawing and hit testing, frame bounds, parameterized calls and case lists.
-Window input and timer/transition scheduling remain unfinished.
-The Rust host allocates drawing buffers and mutable images, loads the initial and title S25 images,
-and decodes seven sound slots plus the title music stream. Device/window replies
-remain simulated in traces. A separate CPAL audio host passes a live-device
-synthetic-tone test; it is not yet connected to a native game window. No game
-presentation or playable menu is available.
+**This is not yet a playable port.** The Linux winit/wgpu host now displays the
+800×600 title screen and starts its music through CPAL. The captured native title
+pixels exactly match the original x86 renderer's BGR hash. Mouse hover reaches
+an unresolved sound-status command, `0x06af` at `start.SCN:0x91e74`, and stops with
+source/task context. Menu actions, story progression, choices, movies and saves
+remain unfinished.
+
+The simulated startup/title trace passes 20,000 instructions against captured x86:
+instruction/poll order, all final SCN hashes, input replies, frame bounds and title
+buffer hashes match. Native and headless hosts share the same interpreter and
+resource handling. Unknown operations always stop execution. Assets are verified
+against GARbro; original game files remain unchanged.
 
 The workspace builds independently of the reference checkouts. On Linux, CPAL
 requires ALSA development headers and pkg-config:
@@ -31,8 +29,10 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 ## Commands
 
 ```sh
-# Read original configuration and execute until a native platform host is required.
+# Open a native window and run the original configured startup.
 target/release/shiinario_engine --project-dir /path/to/game
+# Optional bounded native startup run.
+target/release/shiinario_engine --project-dir /path/to/game --run-for-ms 18000
 
 # Inspect CP932 configuration and list the original archive entries.
 target/release/shiinario_tool inspect --project-dir /path/to/game
@@ -72,9 +72,9 @@ research artifacts outside this repository. No alternative save format is create
   memory, task-local scopes and stacks, branches, calls, strings, cooperative scheduling,
   and platform requests.
   Unsupported commands produce sticky errors with source context.
-- `shiinario_runtime`: host-independent startup and trace orchestration, bounded
-  drawing buffers, registered archive lookup and image slots with on-demand frames.
-- `shiinario_cli`: the engine and inspection tools. No native window backend yet.
+- `shiinario_runtime`: shared session and host interface, bounded drawing buffers,
+  image/audio resources, synthetic traces, winit/wgpu window presentation and CPAL.
+- `shiinario_cli`: the native engine and inspection tools.
 
 See [compatibility and validation](docs/COMPATIBILITY.md) for exact coverage and
 remaining work, [profile documentation](crates/shiinario_assets/profiles/ransem-v1/README.md)

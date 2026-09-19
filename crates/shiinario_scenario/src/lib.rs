@@ -5,8 +5,8 @@ mod expression;
 mod format;
 mod memory;
 pub use binary::{
-    BinaryVm, ImageDraw, MouseButtonMapping, PlatformRequest, SurfaceBlend, SurfacePoint,
-    boot_binary,
+    BinaryVm, ImageDraw, MouseButtonMapping, PlatformRequest, SoundCommand, SurfaceBlend,
+    SurfacePoint, boot_binary,
 };
 pub use memory::SharedMemory;
 
