@@ -15,6 +15,9 @@ pub trait Host {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32>;
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]>;
     fn mouse_mapping(&mut self, _value: u32) {}
+    fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
+        Vec::new()
+    }
     fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()>;
     fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32>;
     fn stop_stream(&mut self, handle: u32) -> Result<()>;
@@ -75,6 +78,9 @@ impl Session {
         mut emit: impl FnMut(&Event) -> Result<()>,
     ) -> Result<bool> {
         let vm = &mut self.vm;
+        for [message, wparam, lparam] in host.take_window_messages() {
+            vm.window_message(message, wparam, lparam);
+        }
         let resources = &mut self.resources;
         let event = match vm.scheduled_step() {
             Ok(event) => event,

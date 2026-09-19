@@ -108,6 +108,7 @@ struct NativeHost {
     audio: Option<AudioOutput>,
     streams_started: usize,
     text_key: bool,
+    window_messages: Vec<[u32; 3]>,
 }
 impl NativeHost {
     fn key(&mut self, virtual_key: usize, pressed: bool) {
@@ -119,6 +120,14 @@ impl NativeHost {
                 return;
             }
             self.controls.keys[scan] = pressed;
+            let message_key = match vk {
+                0xa0 | 0xa1 => 0x10,
+                0xa2 | 0xa3 => 0x11,
+                0xa4 | 0xa5 => 0x12,
+                _ => vk,
+            };
+            self.window_messages
+                .push([if pressed { 0x100 } else { 0x101 }, message_key as u32, 0]);
             self.key(
                 vk,
                 if vk == 0x0d {
@@ -137,6 +146,9 @@ impl NativeHost {
     }
 }
 impl Host for NativeHost {
+    fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
+        std::mem::take(&mut self.window_messages)
+    }
     fn simulated(&self) -> bool {
         false
     }
@@ -332,6 +344,7 @@ impl App<'_> {
             audio: None,
             streams_started: 0,
             text_key: false,
+            window_messages: Vec::new(),
         });
         self.presentation = Some(presentation);
         Ok(())
@@ -368,6 +381,11 @@ impl ApplicationHandler for App<'_> {
             WindowEvent::Focused(focused) => {
                 host.controls.focused = focused;
                 if !focused {
+                    for key in 0..256 {
+                        if host.async_keys.is_down(key) {
+                            host.window_messages.push([0x101, key as u32, 0]);
+                        }
+                    }
                     host.controls.keys.fill(false);
                     host.async_keys.clear();
                     host.mouse = 0;
@@ -400,6 +418,12 @@ impl ApplicationHandler for App<'_> {
                         host.mouse &= !bit;
                     }
                     host.key(vk, pressed);
+                    let message = match button {
+                        MouseButton::Left => 0x201,
+                        MouseButton::Right => 0x204,
+                        _ => 0x207,
+                    } + u32::from(!pressed);
+                    host.window_messages.push([message, 0, 0]);
                 }
             }
             WindowEvent::RedrawRequested => {

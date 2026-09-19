@@ -467,6 +467,8 @@ pub struct BinaryVm {
     scheduler: Scheduler,
     dispatch_quantum: u32,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
+    window_messages: std::collections::VecDeque<[u32; 4]>,
+    window_callback: Option<(u32, usize)>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
     parameters: Vec<u32>,
@@ -534,6 +536,8 @@ impl BinaryVm {
             scheduler: Scheduler::default(),
             dispatch_quantum: 1,
             callback_tasks: Default::default(),
+            window_messages: Default::default(),
+            window_callback: None,
             ended: false,
             named_scopes: Vec::new(),
             parameters: Vec::new(),
@@ -631,6 +635,14 @@ impl BinaryVm {
         self.pending = Some((event.clone(), None));
         event
     }
+    /// Deliver a Win32-style input message to the task registered by 07e4.
+    /// Original 4355b0 pushes hwnd/message/wparam/lparam; 42bf60 runs the
+    /// registered entry synchronously. Queue it until any pending reply is done.
+    pub fn window_message(&mut self, message: u32, wparam: u32, lparam: u32) {
+        if self.callback_tasks.contains_key(&0x07e4) {
+            self.window_messages.push_back([0, message, wparam, lparam]);
+        }
+    }
     /// Advance the original cooperative scheduler, including explicit host polls.
     /// Outstanding platform requests must be answered before another task runs.
     pub fn scheduled_step(&mut self) -> Result<Event> {
@@ -639,6 +651,37 @@ impl BinaryVm {
         }
         if self.async_text.as_ref().is_some_and(|text| text.ticking) {
             return self.text_step();
+        }
+        if let Some((previous, sp)) = self.window_callback
+            && self.context_flags & 1 == 0
+        {
+            self.sp = sp;
+            self.window_callback = None;
+            self.select_task(previous);
+        }
+        if self.window_callback.is_none() {
+            while let Some(arguments) = self.window_messages.pop_front() {
+                let Some(&id) = self.callback_tasks.get(&0x07e4) else {
+                    continue;
+                };
+                let Some(&(base, pc)) = self.task_entries.get(&id) else {
+                    continue;
+                };
+                ensure!(id != self.current_task, "recursive window callback");
+                let previous = self.current_task;
+                self.select_task(id);
+                ensure!(self.sp >= 4, "window callback stack overflow");
+                self.window_callback = Some((previous, self.sp));
+                self.sp -= 4;
+                self.banks.get_mut(&8).unwrap()[self.sp..self.sp + 4].copy_from_slice(&arguments);
+                self.switch_scenario(base);
+                self.pc = pc;
+                self.context_flags = 1;
+                break;
+            }
+        }
+        if self.window_callback.is_some() {
+            return self.step();
         }
         if !self.scheduler.started {
             self.scheduler.started = true;
@@ -1666,7 +1709,9 @@ impl BinaryVm {
                 let result = self.read(&mut cursor)?;
                 self.context_flags = 0;
                 rescan = true;
-                if result != 0 {
+                // A window procedure's nonzero return consumes the message;
+                // it is not a request to terminate the scenario session.
+                if result != 0 && self.window_callback.is_none() {
                     self.ended = true;
                 }
             }
@@ -3188,6 +3233,61 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn window_key_release_callback_clears_skip_and_preserves_interrupted_task() {
+        let mut code = instruction(0x03e9, &[12, 0, 0]);
+        code.extend(instruction(0x0258, &[0x84, 0, 0, 0, 0]));
+        let callback = code.len();
+        // Callback arguments are hwnd, message, wparam, lparam in _Z000..003.
+        for index in 0..4 {
+            code.extend(instruction(0x038e, &[8, index, 0, 12, index, 0]));
+        }
+        let mut compare = vec![8, 1, 0, 0];
+        compare.extend(immediate(0x101));
+        let jump = code.len() + 2 + compare.len();
+        compare.extend([0; 4]);
+        code.extend(instruction(0x01f4, &compare));
+        let mut clear = immediate(0);
+        clear.extend([14, 23, 0]);
+        code.extend(instruction(0x038e, &clear));
+        let end = code.len() as u32;
+        code[jump..jump + 4].copy_from_slice(&end.to_le_bytes());
+        code.extend(instruction(0x0000, &immediate(1)));
+        let mut vm = BinaryVm::new("callback.scn", code).unwrap();
+        vm.define_task(10, vm.script_base, callback, false);
+        vm.callback_tasks.insert(0x07e4, 10);
+        vm.banks.get_mut(&14).unwrap()[23] = 2;
+
+        assert_eq!(vm.scheduled_step().unwrap(), Event::SchedulerPoll);
+        vm.respond(1).unwrap();
+        let pending = vm.scheduled_step().unwrap();
+        assert!(matches!(
+            pending,
+            Event::Platform {
+                request: PlatformRequest::ReadControls,
+                ..
+            }
+        ));
+        vm.window_message(0x100, 0x11, 0);
+        vm.window_message(0x101, 0x11, 0xc01d0001);
+        assert_eq!(vm.scheduled_step().unwrap(), pending);
+        vm.respond(123).unwrap();
+        for _ in 0..100 {
+            let event = vm.scheduled_step().unwrap();
+            assert_ne!(event, Event::End); // callback return 1 does not exit the game
+            if vm.window_messages.is_empty() && vm.window_callback.is_none() {
+                break;
+            }
+        }
+        assert_eq!(vm.banks[&14][23], 0);
+        assert_eq!(vm.current_task, 0);
+        assert_eq!(vm.banks[&12][0], 123);
+        assert_eq!(vm.sp, CELLS);
+        assert_eq!(vm.tasks[&10].sp, CELLS);
+        assert_eq!(&vm.tasks[&10].locals[..4], &[0, 0x101, 0x11, 0xc01d0001]);
+        assert!(!vm.ended);
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub(crate) struct Replay {
     mapping: MouseButtonMapping,
     last_clock: u32,
     elapsed_ms: u64,
+    pub window_messages: Vec<[u32; 3]>,
 }
 impl Replay {
     pub fn new(frames: Vec<InputFrame>) -> Result<Self> {
@@ -54,10 +55,24 @@ impl Replay {
             .filter(|f| f.at_ms <= self.elapsed_ms)
         {
             self.cursor = frame.cursor;
+            for (button, message) in [(1, 0x201), (2, 0x204), (4, 0x207)] {
+                if (self.mouse ^ frame.mouse_buttons) & button != 0 {
+                    self.window_messages.push([
+                        message + u32::from(frame.mouse_buttons & button == 0),
+                        0,
+                        0,
+                    ]);
+                }
+            }
             self.mouse = frame.mouse_buttons;
             self.control_mask = frame.control_mask;
             for key in 0..256 {
-                self.keys.set(key, frame.keys.contains(&(key as u8)));
+                let down = frame.keys.contains(&(key as u8));
+                if key > 6 && down != self.keys.is_down(key) {
+                    self.window_messages
+                        .push([if down { 0x100 } else { 0x101 }, key as u32, 0]);
+                }
+                self.keys.set(key, down);
             }
             for (button, key) in [(1, 1), (2, 2), (4, 4)] {
                 self.keys.set(key, self.mouse & button != 0);
@@ -81,6 +96,40 @@ impl Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_delivers_ctrl_release_and_mouse_edges_once() {
+        let mut replay = Replay::new(vec![
+            InputFrame {
+                at_ms: 10,
+                cursor: [0, 0],
+                mouse_buttons: 1,
+                control_mask: 256,
+                keys: vec![17],
+            },
+            InputFrame {
+                at_ms: 20,
+                cursor: [0, 0],
+                mouse_buttons: 0,
+                control_mask: 0,
+                keys: vec![],
+            },
+        ])
+        .unwrap();
+        replay.advance(10);
+        assert_eq!(
+            std::mem::take(&mut replay.window_messages),
+            vec![[0x201, 0, 0], [0x100, 17, 0]]
+        );
+        replay.advance(19);
+        assert!(replay.window_messages.is_empty());
+        replay.advance(20);
+        assert_eq!(
+            std::mem::take(&mut replay.window_messages),
+            vec![[0x202, 0, 0], [0x101, 17, 0]]
+        );
+        assert_eq!(replay.controls(), 0);
+        assert_eq!(replay.keys.query(17, true), 1); // recent press is independent of key-up delivery
+    }
     #[test]
     fn replay_timestamps_continue_across_engine_clock_wrap() {
         let mut replay = Replay::new(vec![

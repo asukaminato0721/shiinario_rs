@@ -179,6 +179,9 @@ impl Default for TracePlatform {
     }
 }
 impl Host for TracePlatform {
+    fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
+        std::mem::take(&mut self.replay.window_messages)
+    }
     fn available(&self) -> bool {
         self.enabled
     }
