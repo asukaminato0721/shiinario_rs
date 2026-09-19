@@ -1,7 +1,7 @@
 //! Linux window, input and audio services for the shared scenario session.
 use crate::{
     audio::AudioOutput,
-    input::{ControlState, key_state_reply},
+    input::{AsyncKeys, ControlState},
     presentation::Presentation,
     resources::AudioStream,
     session::{Host, Session},
@@ -57,7 +57,7 @@ struct NativeHost {
     window: Arc<Window>,
     started: Instant,
     controls: ControlState,
-    async_keys: [u16; 256],
+    async_keys: AsyncKeys,
     mouse: u8,
     mapping: MouseButtonMapping,
     cursor: [i32; 2],
@@ -69,12 +69,7 @@ struct NativeHost {
 }
 impl NativeHost {
     fn key(&mut self, virtual_key: usize, pressed: bool) {
-        let state = &mut self.async_keys[virtual_key];
-        if pressed {
-            *state |= 0x8001;
-        } else {
-            *state &= 1;
-        }
+        self.async_keys.set(virtual_key, pressed);
     }
     fn keyboard(&mut self, key: KeyCode, pressed: bool) {
         if let Some((scan, vk)) = keyboard_codes(key) {
@@ -82,10 +77,17 @@ impl NativeHost {
                 return;
             }
             self.controls.keys[scan] = pressed;
-            self.key(vk, pressed);
+            self.key(
+                vk,
+                if vk == 0x0d {
+                    self.controls.keys[0x1c] || self.controls.keys[0x9c]
+                } else {
+                    pressed
+                },
+            );
             for (vk, left, right) in [(0x10, 0x2a, 0x36), (0x11, 0x1d, 0x9d), (0x12, 0x38, 0xb8)] {
                 let down = self.controls.keys[left] || self.controls.keys[right];
-                if down != (self.async_keys[vk] & 0x8000 != 0) {
+                if down != self.async_keys.is_down(vk) {
                     self.key(vk, down);
                 }
             }
@@ -127,12 +129,7 @@ impl Host for NativeHost {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
             PlatformRequest::ReadKeyState { key } => {
-                let raw = self.async_keys.get_mut(*key as usize).map_or(0, |state| {
-                    let raw = *state;
-                    *state &= 0x8000;
-                    raw
-                });
-                Ok(key_state_reply(raw as i16, self.controls.focused))
+                Ok(self.async_keys.query(*key, self.controls.focused))
             }
             PlatformRequest::ReadControls => {
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
@@ -251,7 +248,7 @@ impl App<'_> {
             },
             window,
             started: Instant::now(),
-            async_keys: [0; 256],
+            async_keys: AsyncKeys::default(),
             mouse: 0,
             mapping: Default::default(),
             cursor: [0; 2],
@@ -267,10 +264,10 @@ impl App<'_> {
 }
 impl ApplicationHandler for App<'_> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.host.is_none() {
-            if let Err(error) = self.initialize(event_loop) {
-                self.fail(event_loop, error);
-            }
+        if self.host.is_none()
+            && let Err(error) = self.initialize(event_loop)
+        {
+            self.fail(event_loop, error);
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -297,7 +294,7 @@ impl ApplicationHandler for App<'_> {
                 host.controls.focused = focused;
                 if !focused {
                     host.controls.keys.fill(false);
-                    host.async_keys.fill(0);
+                    host.async_keys.clear();
                     host.mouse = 0;
                 }
             }

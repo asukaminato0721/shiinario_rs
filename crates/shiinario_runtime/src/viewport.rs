@@ -68,6 +68,26 @@ mod tests {
     use super::*;
     use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
     #[test]
+    fn fitted_canvas_and_input_share_letterbox_coordinates() {
+        for (physical, rect, center) in [
+            ([800, 600], [0, 0, 800, 600], [400, 300]),
+            ([1000, 600], [100, 0, 900, 600], [500, 300]),
+            ([800, 800], [0, 100, 800, 700], [400, 400]),
+            ([1600, 1200], [0, 0, 1600, 1200], [800, 600]),
+            ([400, 300], [0, 0, 400, 300], [200, 150]),
+        ] {
+            let transform = ViewportTransform::fit([800, 600], physical).unwrap();
+            assert_eq!(transform.to_window_rect([0, 0, 800, 600]).unwrap(), rect);
+            assert_eq!(transform.to_logical(center).unwrap(), [400, 300]);
+            assert_eq!(
+                transform.to_logical([rect[0] - 2, rect[1] - 2]).unwrap(),
+                [-1600 / (rect[2] - rect[0]), -1200 / (rect[3] - rect[1])]
+            );
+        }
+        assert!(ViewportTransform::fit([0, 600], [800, 600]).is_err());
+        assert!(ViewportTransform::fit([800, 600], [800, 0]).is_err());
+    }
+    #[test]
     fn cursor_queries_and_transforms_match_original_signed_coordinates() {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../../../docs/validation/cursor-probe.json"))

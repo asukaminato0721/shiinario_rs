@@ -7,6 +7,42 @@ pub fn key_state_reply(raw: i16, active: bool) -> u32 {
     if active { raw as i32 as u32 } else { 0 }
 }
 
+/// Host-side asynchronous key flags. Reading consumes the recent-press bit,
+/// including when opcode 03e8 subsequently masks the reply for inactivity.
+pub struct AsyncKeys([u16; 256]);
+impl Default for AsyncKeys {
+    fn default() -> Self {
+        Self([0; 256])
+    }
+}
+impl AsyncKeys {
+    pub fn is_down(&self, key: usize) -> bool {
+        self.0.get(key).is_some_and(|bits| bits & 0x8000 != 0)
+    }
+    pub fn set(&mut self, key: usize, down: bool) {
+        if let Some(bits) = self.0.get_mut(key) {
+            if down {
+                if *bits & 0x8000 == 0 {
+                    *bits |= 0x8001;
+                }
+            } else {
+                *bits &= 1;
+            }
+        }
+    }
+    pub fn query(&mut self, key: u32, active: bool) -> u32 {
+        let raw = self.0.get_mut(key as usize).map_or(0, |bits| {
+            let raw = *bits;
+            *bits &= 0x8000;
+            raw
+        });
+        key_state_reply(raw as i16, active)
+    }
+    pub fn clear(&mut self) {
+        self.0.fill(0);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct JoystickState {
     pub x: u32,
@@ -101,6 +137,26 @@ impl ControlState {
 mod tests {
     use super::*;
     use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
+    #[test]
+    fn asynchronous_press_latches_survive_release_and_are_consumed_once() {
+        let mut keys = AsyncKeys::default();
+        keys.set(0x70, true);
+        assert_eq!(keys.query(0x70, true), 0xffff8001);
+        keys.set(0x70, true); // OS repeats must not create another press edge.
+        assert_eq!(keys.query(0x70, true), 0xffff8000);
+        keys.set(0x70, false);
+        assert_eq!(keys.query(0x70, true), 0);
+        keys.set(0x70, true);
+        keys.set(0x70, false);
+        assert_eq!(keys.query(0x70, true), 1);
+        assert_eq!(keys.query(0x70, true), 0);
+        keys.set(0x70, true);
+        assert_eq!(keys.query(0x70, false), 0);
+        assert_eq!(keys.query(0x70, true), 0xffff8000);
+        keys.clear();
+        assert!(!keys.is_down(0x70));
+        assert_eq!(keys.query(u32::MAX, true), 0);
+    }
     #[test]
     fn individual_key_queries_match_original_short_and_activation_behavior() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(

@@ -199,7 +199,7 @@ mod tests {
                 u32::MAX - 7
             );
         }
-        clock.poll();
+        clock.poll().unwrap();
         assert_eq!(
             clock.respond(&PlatformRequest::ClockMilliseconds).unwrap(),
             8
@@ -210,7 +210,7 @@ mod tests {
             24
         );
         let mut frozen = TracePlatform::default();
-        frozen.poll();
+        frozen.poll().unwrap();
         frozen.respond(&PlatformRequest::PumpMessages).unwrap();
         assert_eq!(
             frozen.respond(&PlatformRequest::ClockMilliseconds).unwrap(),

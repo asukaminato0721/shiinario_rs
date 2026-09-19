@@ -18,7 +18,10 @@ pub struct Presentation {
 impl Presentation {
     pub async fn new(window: Arc<Window>, logical: [u32; 2]) -> Result<Self> {
         let size = window.inner_size();
-        let instance = wgpu::Instance::default();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::util::backend_bits_from_env().unwrap_or_default(),
+            ..Default::default()
+        });
         let surface = instance.create_surface(window)?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -48,7 +51,11 @@ impl Presentation {
             .find(wgpu::TextureFormat::is_srgb)
             .context("window surface has no sRGB format")?;
         config.present_mode = wgpu::PresentMode::Fifo;
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
+        if let Some(error) = device.pop_error_scope().await {
+            anyhow::bail!("configure presentation surface: {error}");
+        }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("logical canvas"),
             size: wgpu::Extent3d {

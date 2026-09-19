@@ -11,6 +11,7 @@ struct Args {
     run_for_ms: Option<u64>,
 }
 fn main() -> Result<()> {
+    env_logger::init();
     let args = Args::parse();
     let project = shiinario_runtime::open(args.project_dir)?;
     shiinario_runtime::native::run(
