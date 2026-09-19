@@ -272,11 +272,6 @@ impl Host for NativeHost {
             // The verified startup has an empty INI search prefix; the original
             // command returns its operand default even when RANDL.ini exists.
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
-            PlatformRequest::ReadRegistryValue {
-                root: 0x80000001,
-                path,
-                name,
-            } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "InstMode" => Ok(0),
             _ => bail!("unsupported native platform request: {request:?}"),
         }
     }

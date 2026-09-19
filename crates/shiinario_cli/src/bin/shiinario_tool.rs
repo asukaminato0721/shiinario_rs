@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use shiinario_assets::Archive;
 use std::path::PathBuf;
 #[derive(Parser)]
+#[command(about = "Inspect and trace game files in the current directory")]
 struct Args {
     #[command(subcommand)]
     command: Command,
@@ -14,17 +15,10 @@ enum Command {
         archive: PathBuf,
     },
     Dump {
-        #[arg(long)]
-        project_dir: PathBuf,
         name: String,
     },
-    Inventory {
-        #[arg(long)]
-        project_dir: PathBuf,
-    },
+    Inventory,
     Trace {
-        #[arg(long)]
-        project_dir: PathBuf,
         name: String,
         #[arg(long, default_value_t = 10000)]
         max_steps: usize,
@@ -57,14 +51,9 @@ enum Command {
     },
     Verify {
         #[arg(long)]
-        project_dir: PathBuf,
-        #[arg(long)]
         media: bool,
     },
-    Inspect {
-        #[arg(long)]
-        project_dir: PathBuf,
-    },
+    Inspect,
     Image {
         archive: PathBuf,
         name: String,
@@ -83,8 +72,8 @@ enum Command {
 }
 fn main() -> Result<()> {
     match Args::parse().command {
-        Command::Dump { project_dir, name } => {
-            let p = shiinario_runtime::open(project_dir)?;
+        Command::Dump { name } => {
+            let p = shiinario_runtime::open(".")?;
             let data = p.read(&name)?;
             if name.to_ascii_lowercase().ends_with(".txt") {
                 println!(
@@ -102,8 +91,8 @@ fn main() -> Result<()> {
                 );
             }
         }
-        Command::Inventory { project_dir } => {
-            let p = shiinario_runtime::open(project_dir)?;
+        Command::Inventory => {
+            let p = shiinario_runtime::open(".")?;
             let mut commands = std::collections::BTreeMap::<String, usize>::new();
             let mut text_files = 0;
             let mut binary_files = 0;
@@ -130,7 +119,6 @@ fn main() -> Result<()> {
             );
         }
         Command::Trace {
-            project_dir,
             name,
             max_steps,
             simulate_platform,
@@ -142,7 +130,7 @@ fn main() -> Result<()> {
             tail_events,
         } => {
             anyhow::ensure!(tail_events <= 10000, "tail-events exceeds 10000");
-            let p = shiinario_runtime::open(project_dir)?;
+            let p = shiinario_runtime::open(".")?;
             let input = input
                 .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
                 .transpose()?
@@ -280,8 +268,8 @@ fn main() -> Result<()> {
             let d = a.read(e)?;
             std::fs::write(output, d)?;
         }
-        Command::Inspect { project_dir } => {
-            let p = shiinario_assets::project::Project::open(project_dir)?;
+        Command::Inspect => {
+            let p = shiinario_assets::project::Project::open(".")?;
             println!("{}", serde_json::to_string_pretty(&p.config)?);
         }
         Command::Image {
@@ -323,8 +311,8 @@ fn main() -> Result<()> {
                 std::fs::write(output, shiinario_assets::audio::ogg_stream(&d)?)?;
             }
         }
-        Command::Verify { project_dir, media } => {
-            let mut paths = std::fs::read_dir(project_dir)?
+        Command::Verify { media } => {
+            let mut paths = std::fs::read_dir(".")?
                 .map(|p| p.map(|p| p.path()))
                 .collect::<std::io::Result<Vec<_>>>()?;
             paths.sort();

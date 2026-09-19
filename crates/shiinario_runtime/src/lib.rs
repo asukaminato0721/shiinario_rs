@@ -253,11 +253,6 @@ impl Host for TracePlatform {
                 Ok(u32::from(ready))
             }
             PlatformRequest::InvalidateRect { .. } => Ok(1),
-            PlatformRequest::ReadRegistryValue {
-                root: 0x80000001,
-                path,
-                name,
-            } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "InstMode" => Ok(0),
             PlatformRequest::PumpMessages => {
                 self.poll()?;
                 Ok(1)

@@ -1,6 +1,6 @@
 # shiinario_rs
 
-An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
+An in-progress Rust compatibility runtime for  (Shiina Rio v2.47).
 **Full-route gameplay is not complete yet.** The Linux winit/wgpu host displays
 an 800×600 title screen, plays music and effects through CPAL, and enters the story
 with Japanese text and transitions. The title pixels match the original x86 renderer.
@@ -34,40 +34,48 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 
 ## Commands
 
+Copy `target/release/shiinario_engine` into the game directory, open a terminal there, and
+run `./shiinario_engine`. The current working directory is the game root. Registry string
+queries use that root for every key; integer queries return zero. No system
+registry is accessed.
+
+For the research commands below, also copy `target/release/shiinario_tool` into
+the game directory. Run these commands from that directory:
+
 ```sh
 # Open a native window and run the original configured startup.
-target/release/shiinario_engine --project-dir /path/to/game
+./shiinario_engine
 # Optional bounded native startup run.
-target/release/shiinario_engine --project-dir /path/to/game --run-for-ms 18000
+./shiinario_engine --run-for-ms 18000
 # Export runtime-modified SCNs for research; the destination must be new.
-target/release/shiinario_engine --project-dir /path/to/game --scenario-dump /tmp/rio-scn-dump
+./shiinario_engine --scenario-dump /tmp/rio-scn-dump
 
 # Inspect CP932 configuration and list the original archive entries.
-target/release/shiinario_tool inspect --project-dir /path/to/game
-target/release/shiinario_tool list /path/to/game/RAN_T0.WAR
+./shiinario_tool inspect
+./shiinario_tool list RAN_T0.WAR
 
 # Decode every entry; --media additionally decodes all S25 frames and Vorbis packets.
-target/release/shiinario_tool verify --project-dir /path/to/game --media
+./shiinario_tool verify --media
 
 # Extract one entry to an explicit output path, or convert an image/audio asset.
-target/release/shiinario_tool extract /path/to/game/RAN_T0.WAR START.SCN /tmp/start.scn
-target/release/shiinario_tool image /path/to/game/RAN_BG.WAR BG01A.S25 --frame 0 /tmp/bg.png
-target/release/shiinario_tool audio /path/to/game/RAN_D0.WAR SEA.OGV /tmp/se.ogg
+./shiinario_tool extract RAN_T0.WAR START.SCN /tmp/start.scn
+./shiinario_tool image RAN_BG.WAR BG01A.S25 --frame 0 /tmp/bg.png
+./shiinario_tool audio RAN_D0.WAR SEA.OGV /tmp/se.ogg
 
 # Dump text records with original byte offsets; binary dumps show candidate strings only.
-target/release/shiinario_tool dump --project-dir /path/to/game A001.TXT
-target/release/shiinario_tool dump --project-dir /path/to/game START.SCN
-target/release/shiinario_tool inventory --project-dir /path/to/game
+./shiinario_tool dump A001.TXT
+./shiinario_tool dump START.SCN
+./shiinario_tool inventory
 
 # Research traces for the recovered SCN/TXT subsets.
-target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-steps 10000
+./shiinario_tool trace START.SCN --max-steps 10000
 # Explicit simulated Windows replies, logged in the output; this does not display a game window.
-target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 16 --max-steps 40000
-target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
+./shiinario_tool trace START.SCN --simulate-platform --tick-ms 16 --max-steps 40000
+./shiinario_tool trace A001.TXT --max-steps 10000
 # Generate repeatable Start/advance input (does not select choices).
 python tools/research/make_story_input.py /tmp/input.json --skip
 # Deterministic input replay with compact counts and explicit compatibility omissions.
-target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --best-effort --summary
+./shiinario_tool trace START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --best-effort --summary
 ```
 
 Replay input is a JSON array of frames with strictly increasing `at_ms`, logical

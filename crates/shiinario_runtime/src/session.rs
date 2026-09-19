@@ -341,17 +341,25 @@ impl Session {
                 })?;
                 return Ok(true);
             }
-            if matches!(&request, PlatformRequest::ProjectDirectory)
-                || matches!(&request, PlatformRequest::ReadRegistryString { root: 0x80000001, path, name } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "DataPath")
-            {
-                // An empty registry DataPath makes the SCN ask for the
-                // installation directory. Empty project-relative paths
-                // refer to Project.root; no host absolute path enters SCN.
+            if matches!(
+                &request,
+                PlatformRequest::ProjectDirectory | PlatformRequest::ReadRegistryString { .. }
+            ) {
+                // All registry strings use the empty project-relative prefix,
+                // which resolves to Project.root even when SCN appends a filename.
                 emit(&Event::PlatformBytesReply {
                     bytes: Vec::new(),
                     simulated: host.simulated(),
                 })?;
                 vm.respond_bytes(&[])?;
+                return Ok(true);
+            }
+            if matches!(&request, PlatformRequest::ReadRegistryValue { .. }) {
+                vm.respond(0)?;
+                emit(&Event::PlatformReply {
+                    value: 0,
+                    simulated: host.simulated(),
+                })?;
                 return Ok(true);
             }
             if let PlatformRequest::CreateSurface { flags, .. } = &request

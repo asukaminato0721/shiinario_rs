@@ -2,10 +2,8 @@ use anyhow::Result;
 use clap::Parser;
 use std::path::PathBuf;
 #[derive(Parser)]
-#[command(about = "Ran→Sem compatibility runtime (binary SCN support is incomplete)")]
+#[command(about = "Run the game in the current directory (binary SCN support is incomplete)")]
 struct Args {
-    #[arg(long)]
-    project_dir: PathBuf,
     /// Stop at known presentation omissions instead of printing SKIP and continuing.
     #[arg(long)]
     strict: bool,
@@ -19,7 +17,7 @@ struct Args {
 fn main() -> Result<()> {
     env_logger::init();
     let args = Args::parse();
-    let project = shiinario_runtime::open(args.project_dir)?;
+    let project = shiinario_runtime::open(".")?;
     shiinario_runtime::native::run(
         &project,
         shiinario_runtime::native::Options {

@@ -1,4 +1,4 @@
-//! Bounded, read-only access to Ran→Sem's original WARC 1.7 assets.
+//! Bounded, read-only access to 's original WARC 1.7 assets.
 mod compression;
 mod crypt;
 mod nrbf;
@@ -59,7 +59,7 @@ impl Archive {
         file.read_exact(&mut index[..n])?;
         crypt::decrypt_index(&profile, offset, &mut index);
         let index = compression::zlib(&index[8..n], crypt::MAX_INDEX)
-            .context("decoding WARC index (Ran→Sem profile)")?;
+            .context("decoding WARC index ( profile)")?;
         ensure!(index.len() % 56 == 0, "partial WARC index record");
         let mut entries = Vec::new();
         let mut names = BTreeSet::new();

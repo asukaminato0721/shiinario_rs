@@ -15,7 +15,7 @@ use std::{
 const MAX_DATABASE: usize = 16 * 1024 * 1024;
 const BUNDLED_DATABASE: &[u8] = include_bytes!("../data/garbro/Formats.dat");
 
-/// Validated Ran→Sem v2.47 decryption data read from a GARbro catalog.
+/// Validated  v2.47 decryption data read from a GARbro catalog.
 /// Loading does not execute .NET code. Other games/scheme versions are unsupported.
 #[derive(Debug)]
 pub struct Profile {
@@ -86,33 +86,33 @@ impl Profile {
         doc.class(war, "GameRes.Formats.ShiinaRio.WarcScheme")?;
         let mut scheme = None;
         for candidate in doc.array(doc.field(war, "KnownSchemes")?)? {
-            if doc.string(doc.field(candidate, "<Name>k__BackingField")?)? == "Ran→Sem" {
-                ensure!(scheme.is_none(), "duplicate Ran→Sem scheme");
+            if doc.string(doc.field(candidate, "<Name>k__BackingField")?)? == "" {
+                ensure!(scheme.is_none(), "duplicate  scheme");
                 scheme = Some(candidate);
             }
         }
-        let scheme = scheme.context("GARbro catalog has no Ran→Sem scheme")?;
+        let scheme = scheme.context("GARbro catalog has no  scheme")?;
         doc.class(scheme, "GameRes.Formats.ShiinaRio.EncryptionScheme")?;
         ensure!(
             doc.number(doc.field(scheme, "<Version>k__BackingField")?)? == 2470,
-            "unsupported Ran→Sem scheme version"
+            "unsupported  scheme version"
         );
         ensure!(
             doc.number(doc.field(scheme, "EntryNameSize")?)? == 32,
-            "unsupported Ran→Sem entry name size"
+            "unsupported  entry name size"
         );
         ensure!(
             matches!(doc.field(scheme, "ExtraCrypt")?, Value::Null),
-            "unsupported Ran→Sem extra crypt stage"
+            "unsupported  extra crypt stage"
         );
         let key = doc.bytes(doc.field(scheme, "CryptKey")?)?;
         let region = doc.bytes(doc.field(scheme, "Region")?)?;
         let decode = doc.bytes(doc.field(scheme, "DecodeBin")?)?;
-        ensure!(key.len() == 64, "invalid Ran→Sem CryptKey length");
-        ensure!(region.len() == 48 * 48 * 4, "invalid Ran→Sem Region length");
-        ensure!(decode.len() == 8192, "invalid Ran→Sem DecodeBin length");
+        ensure!(key.len() == 64, "invalid  CryptKey length");
+        ensure!(region.len() == 48 * 48 * 4, "invalid  Region length");
+        ensure!(decode.len() == 8192, "invalid  DecodeBin length");
         let helpers = doc.array(doc.field(scheme, "HelperKey")?)?;
-        ensure!(helpers.len() == 5, "invalid Ran→Sem HelperKey length");
+        ensure!(helpers.len() == 5, "invalid  HelperKey length");
         let mut helper_key = [0u32; 5];
         for (out, value) in helper_key.iter_mut().zip(helpers) {
             *out = doc
@@ -184,7 +184,7 @@ mod tests {
 
         let raw = test_support::stream();
         let mut bad = raw.clone();
-        let title = "Ran→Sem".as_bytes();
+        let title = "".as_bytes();
         let at = bad.windows(title.len()).position(|w| w == title).unwrap();
         bad[at] = b'X';
         assert!(Profile::from_bytes(&test_support::wrap(&bad)).is_err());

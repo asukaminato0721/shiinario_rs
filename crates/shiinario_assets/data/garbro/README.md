@@ -9,7 +9,7 @@
 - License: MIT; see [third-party notices](../../../../THIRD_PARTY_NOTICES.md).
 
 The Rust build embeds this file. On first use, the Rust reader decompresses its
-NRBF records and selects the Ran→Sem v2.47 scheme. It reads data only and does not
+NRBF records and selects the  v2.47 scheme. It reads data only and does not
 instantiate .NET classes. The validated profile is shared between archives; the
 other catalog records are discarded. No external catalog, Python, .NET runtime,
 or GARbro installation is required to build or run the engine.
