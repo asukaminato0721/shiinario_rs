@@ -58,6 +58,9 @@ enum Command {
         archive: PathBuf,
         name: String,
         output: PathBuf,
+        /// Decode to interleaved signed 16-bit little-endian PCM; print stream metadata.
+        #[arg(long)]
+        pcm: bool,
     },
 }
 fn main() -> Result<()> {
@@ -164,10 +167,24 @@ fn main() -> Result<()> {
             archive,
             name,
             output,
+            pcm,
         } => {
             let a = Archive::open(archive)?;
             let d = a.read(a.find(&name).context("entry not found")?)?;
-            std::fs::write(output, shiinario_assets::audio::ogg_stream(&d)?)?;
+            if pcm {
+                use std::io::Write;
+                let mut file = std::io::BufWriter::new(std::fs::File::create(output)?);
+                let info = shiinario_assets::audio::decode(&d, |samples| {
+                    for sample in samples {
+                        file.write_all(&sample.to_le_bytes())?;
+                    }
+                    Ok(())
+                })?;
+                file.flush()?;
+                println!("{}", serde_json::to_string(&info)?);
+            } else {
+                std::fs::write(output, shiinario_assets::audio::ogg_stream(&d)?)?;
+            }
         }
         Command::Verify { project_dir, media } => {
             let mut paths = std::fs::read_dir(project_dir)?

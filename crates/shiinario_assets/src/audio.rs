@@ -33,6 +33,50 @@ mod tests {
         assert!(ogg_stream(b"OGV\0").is_err());
         assert!(ogg_stream(b"RIFF").is_err());
     }
+    #[test]
+    fn declared_pcm_length_trims_padding_and_rejects_inconsistent_headers() {
+        let ogg = include_bytes!("../tests/fixtures/sine.ogg");
+        let mut full = Vec::new();
+        let raw_info = decode(ogg, |samples| {
+            full.extend_from_slice(samples);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!((raw_info.channels, raw_info.sample_rate), (1, 8000));
+        assert!(full.len() >= 400);
+        let mut wrapped = b"OGV\0".to_vec();
+        wrapped.extend(836u32.to_le_bytes());
+        wrapped.extend((ogg.len() as u32).to_le_bytes());
+        wrapped.extend(b"fmt ");
+        wrapped.extend(16u32.to_le_bytes());
+        for word in [1u16, 1] {
+            wrapped.extend(word.to_le_bytes());
+        }
+        for word in [8000u32, 16000] {
+            wrapped.extend(word.to_le_bytes());
+        }
+        for word in [2u16, 16] {
+            wrapped.extend(word.to_le_bytes());
+        }
+        wrapped.extend(b"data");
+        wrapped.extend(800u32.to_le_bytes());
+        wrapped.extend(ogg);
+        let mut trimmed = Vec::new();
+        let info = decode(&wrapped, |samples| {
+            trimmed.extend_from_slice(samples);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(info.samples_per_channel, 400);
+        assert_eq!(trimmed, full[..400]);
+        for (offset, replacement) in [(40, 801u32), (40, 1_000_000), (24, 16000)] {
+            let mut bad = wrapped.clone();
+            bad[offset..offset + 4].copy_from_slice(&replacement.to_le_bytes());
+            assert!(decode(&bad, |_| Ok(())).is_err());
+        }
+        wrapped[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert!(decode(&wrapped, |_| Ok(())).is_err());
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -45,6 +89,38 @@ pub struct AudioInfo {
 /// The cap also bounds work for malicious streams with excessive packet counts.
 pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Result<AudioInfo> {
     let stream = ogg_stream(data)?;
+    let wrapper = if data.starts_with(b"OGV\0") {
+        let format_size = u32::from_le_bytes(data[16..20].try_into()?) as usize;
+        ensure!(format_size >= 16, "truncated OGV PCM format");
+        let format = data.get(20..36).context("truncated OGV PCM format")?;
+        let word = |p| u16::from_le_bytes([format[p], format[p + 1]]);
+        let rate = u32::from_le_bytes(format[4..8].try_into()?);
+        let byte_rate = u32::from_le_bytes(format[8..12].try_into()?);
+        let channels = word(2);
+        ensure!(
+            word(0) == 1 && word(14) == 16 && channels > 0 && channels <= 8,
+            "unsupported OGV PCM format"
+        );
+        ensure!(
+            word(12) == channels * 2
+                && u64::from(byte_rate) == u64::from(rate) * u64::from(channels) * 2,
+            "inconsistent OGV PCM format"
+        );
+        let length_pos = 24 + format_size;
+        let length = u32::from_le_bytes(
+            data.get(length_pos..length_pos + 4)
+                .context("truncated OGV PCM length")?
+                .try_into()?,
+        );
+        ensure!(
+            length % (u32::from(channels) * 2) == 0,
+            "unaligned OGV PCM length"
+        );
+        ensure!(length <= 512 * 1024 * 1024, "OGV PCM length exceeds cap");
+        Some((channels as u8, rate, u64::from(length / 2)))
+    } else {
+        None
+    };
     // wav2ogv appends eight zero bytes after the end-of-stream page. Bound the
     // Vorbis reader at EOS, preserving strict CRC checks on actual Ogg pages.
     let mut end = 0usize;
@@ -77,11 +153,18 @@ pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Resu
         .map_err(|e| anyhow::anyhow!("Vorbis header: {e:?}"))?;
     let channels = decoder.ident_hdr.audio_channels;
     let sample_rate = decoder.ident_hdr.audio_sample_rate;
+    if let Some((expected_channels, expected_rate, _)) = wrapper {
+        ensure!(
+            channels == expected_channels && sample_rate == expected_rate,
+            "OGV format differs from Vorbis stream"
+        );
+    }
     ensure!(
         channels > 0 && channels <= 8 && sample_rate > 0 && sample_rate <= 384000,
         "invalid Vorbis stream parameters"
     );
     let mut samples = 0u64;
+    let mut emitted = 0u64;
     while let Some(packet) = decoder
         .read_dec_packet_itl()
         .map_err(|e| anyhow::anyhow!("Vorbis packet: {e:?}"))?
@@ -92,11 +175,25 @@ pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Resu
         );
         samples += packet.len() as u64;
         ensure!(samples <= 256 * 1024 * 1024, "audio sample limit exceeded");
-        output(&packet)?;
+        // The original buffer size comes from the OGV PCM length. Vorbis can
+        // produce padding beyond that size, which must not extend playback.
+        let count = wrapper.map_or(packet.len(), |(_, _, limit)| {
+            packet.len().min(limit.saturating_sub(emitted) as usize)
+        });
+        if count > 0 {
+            output(&packet[..count])?;
+            emitted += count as u64;
+        }
+    }
+    if let Some((_, _, limit)) = wrapper {
+        ensure!(
+            emitted == limit,
+            "Vorbis stream is shorter than declared OGV PCM length"
+        );
     }
     Ok(AudioInfo {
         channels,
         sample_rate,
-        samples_per_channel: samples / channels as u64,
+        samples_per_channel: emitted / channels as u64,
     })
 }

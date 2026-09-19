@@ -1,6 +1,6 @@
 //! Host-independent project startup and deterministic research traces.
 pub mod resources;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use shiinario_assets::project::Project;
 use shiinario_scenario::{BinaryVm, Event, Input, PlatformRequest, TextScript, TextVm};
 use std::path::Path;
@@ -64,7 +64,12 @@ pub fn trace_with_platform(
                     vm.respond_bytes(&[])?;
                     continue;
                 }
-                let resource_reply = resources.respond(project, &request)?;
+                let resource_reply = resources.respond(project, &request).with_context(|| {
+                    format!(
+                        "{}:{:#x}: resource request {request:?}",
+                        location.scenario, location.offset
+                    )
+                })?;
                 let value = if let Some(value) = resource_reply {
                     value
                 } else if let PlatformRequest::FileExists { path } = &request {

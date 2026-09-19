@@ -41,6 +41,11 @@ pub enum PlatformRequest {
         id: u32,
         name: String,
     },
+    LoadSound {
+        id: u32,
+        name: String,
+        flags: u32,
+    },
     CreateImage {
         id: u32,
         width: u32,
@@ -285,6 +290,7 @@ impl BinaryVm {
                     | PlatformRequest::LoadImage { .. }
                     | PlatformRequest::CreateImage { .. }
                     | PlatformRequest::FillImage { .. }
+                    | PlatformRequest::LoadSound { .. }
             ) {
                 ensure!(
                     value != 0,
@@ -615,6 +621,16 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x06a6 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "sound slot {id} out of bounds");
+                let name = self.string(self.read(&mut cursor)?)?;
+                request = Some(PlatformRequest::LoadSound {
+                    id,
+                    name,
+                    flags: self.media_flags,
+                });
+            }
             0x055a => {
                 request = Some(PlatformRequest::CreateImage {
                     id: self.read(&mut cursor)?,

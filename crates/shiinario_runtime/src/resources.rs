@@ -1,6 +1,6 @@
 //! Window-independent image slots and drawing buffers used by binary SCN.
 use anyhow::{Context, Result, ensure};
-use shiinario_assets::{image, project::Project};
+use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::PlatformRequest;
 use std::collections::BTreeMap;
 
@@ -15,6 +15,11 @@ pub struct Frame {
     pub x: i32,
     pub y: i32,
     pub surface: Surface,
+}
+pub struct Sound {
+    pub sample_rate: u32,
+    pub channels: u8,
+    pub samples: Vec<i16>,
 }
 enum Image {
     Encoded(Vec<u8>),
@@ -35,6 +40,7 @@ impl Image {
 pub struct Resources {
     surfaces: BTreeMap<u32, Surface>,
     images: BTreeMap<u32, Image>,
+    sounds: BTreeMap<u32, Sound>,
     resident: usize,
     archives: Vec<String>,
 }
@@ -50,6 +56,9 @@ impl Resources {
     }
     pub fn surface(&self, id: u32) -> Option<&Surface> {
         self.surfaces.get(&id)
+    }
+    pub fn sound(&self, id: u32) -> Option<&Sound> {
+        self.sounds.get(&id)
     }
     /// Decode only the requested frame. The caller owns the decoded pixels.
     pub fn frame(&self, id: u32, index: usize) -> Result<Frame> {
@@ -118,6 +127,48 @@ impl Resources {
         ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
         self.images.insert(id, Image::Encoded(data));
         self.resident = resident;
+        Ok(())
+    }
+    fn load_sound(&mut self, id: u32, data: &[u8], flags: u32) -> Result<()> {
+        ensure!(id < 256, "sound slot out of bounds");
+        // The traced game requests software mixing (DSBCAPS_LOCSOFTWARE).
+        // Other device capability flags need separate host semantics.
+        ensure!(
+            flags == 0x8000,
+            "unresolved sound creation flags {flags:#x}"
+        );
+        let old = self
+            .sounds
+            .get(&id)
+            .map_or(0, |sound| sound.samples.len() * 2);
+        let retained = self.resident - old;
+        let mut samples = Vec::new();
+        let info = audio::decode(data, |packet| {
+            let bytes = samples
+                .len()
+                .checked_add(packet.len())
+                .and_then(|n| n.checked_mul(2))
+                .context("audio buffer size overflow")?;
+            ensure!(
+                bytes <= LIMIT - retained,
+                "drawing and audio resources exceed 256 MiB"
+            );
+            samples.extend_from_slice(packet);
+            Ok(())
+        })?;
+        ensure!(
+            matches!(info.channels, 1 | 2),
+            "unsupported sound channel count"
+        );
+        self.resident = retained + samples.len() * 2;
+        self.sounds.insert(
+            id,
+            Sound {
+                sample_rate: info.sample_rate,
+                channels: info.channels,
+                samples,
+            },
+        );
         Ok(())
     }
     fn create_image(
@@ -214,6 +265,10 @@ impl Resources {
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         match request {
+            PlatformRequest::LoadSound { id, name, flags } => {
+                let bytes = project.read_with_archives(name, &self.archives)?;
+                self.load_sound(*id, &bytes, *flags)?;
+            }
             PlatformRequest::CreateImage {
                 id,
                 width,
@@ -249,6 +304,28 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sound_decode_and_failed_replacement_preserve_resource_budget() {
+        let mut resources = Resources::default();
+        let ogg = include_bytes!("../../shiinario_assets/tests/fixtures/sine.ogg");
+        resources.load_sound(20, ogg, 0x8000).unwrap();
+        let sound = resources.sound(20).unwrap();
+        assert_eq!((sound.channels, sound.sample_rate), (1, 8000));
+        let samples = sound.samples.clone();
+        let size = samples.len() * 2;
+        assert_eq!(resources.resident_bytes(), size);
+        assert!(resources.load_sound(20, b"OGV\0", 0x8000).is_err());
+        assert!(resources.load_sound(20, ogg, 0).is_err());
+        assert!(resources.load_sound(256, ogg, 0x8000).is_err());
+        assert_eq!(resources.sound(20).unwrap().samples, samples);
+        assert_eq!(resources.resident_bytes(), size);
+        resources.load_sound(20, ogg, 0x8000).unwrap();
+        assert_eq!(resources.resident_bytes(), size);
+        resources.resident = LIMIT;
+        assert!(resources.load_sound(21, ogg, 0x8000).is_err());
+        assert!(resources.sound(21).is_none());
+        assert_eq!(resources.sound(20).unwrap().samples, samples);
+    }
     #[test]
     fn mutable_images_match_original_dispatcher_snapshots() {
         use shiinario_scenario::{BinaryVm, Event};
