@@ -1800,6 +1800,35 @@ impl BinaryVm {
                 );
                 cursor.pc = target;
             }
+            0x03d0 => {
+                let task = self.read(&mut cursor)?;
+                let count = self.read(&mut cursor)? as i32;
+                ensure!(
+                    task == u32::MAX || task < CELLS as u32,
+                    "scope release task out of bounds"
+                );
+                let scopes = std::iter::once((self.current_task, &mut self.named_scopes)).chain(
+                    self.tasks
+                        .iter_mut()
+                        .map(|(&id, state)| (id, &mut state.scopes)),
+                );
+                for (id, scopes) in scopes {
+                    if task != u32::MAX && task != id {
+                        continue;
+                    }
+                    // Native count -1 is the top index, not the scope count:
+                    // retain the oldest scope. Explicit positive counts may pop it.
+                    let count = if count == -1 {
+                        scopes.len().saturating_sub(1)
+                    } else {
+                        count.max(0) as usize
+                    }
+                    .min(scopes.len());
+                    for scope in scopes.drain(scopes.len() - count..) {
+                        self.allocations.remove(&scope.allocation);
+                    }
+                }
+            }
             0x03cf => {
                 let count = cursor.word()? as usize;
                 ensure!(count <= 256, "named declaration exceeds 256 variables");
@@ -2326,6 +2355,58 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn scope_release_matches_original_across_tasks_and_preserves_oldest_for_minus_one() {
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/scope-release-probe.json"
+        ))
+        .unwrap();
+        for case in probe["cases"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("scopes.scn", code).unwrap();
+            vm.define_task(1, vm.script_base, 0, true);
+            let mut allocated = 0;
+            for state in case["steps"].as_array().unwrap() {
+                vm.select_task(state["task"].as_u64().unwrap() as u32);
+                vm.pc = state["offset"].as_u64().unwrap() as usize;
+                if vm.data[vm.pc..vm.pc + 2] == [0xcf, 3] {
+                    allocated += 1;
+                }
+                vm.step().unwrap();
+                assert_eq!(vm.pc as u64, state["next_offset"].as_u64().unwrap());
+                let scopes: Vec<Vec<u32>> = (0..2)
+                    .map(|id| {
+                        let scopes = if id == vm.current_task {
+                            &vm.named_scopes
+                        } else {
+                            &vm.tasks[&id].scopes
+                        };
+                        scopes
+                            .iter()
+                            .map(|scope| {
+                                u32::from_le_bytes(
+                                    vm.memory_read(scope.allocation + 32, 4)
+                                        .unwrap()
+                                        .try_into()
+                                        .unwrap(),
+                                )
+                            })
+                            .collect()
+                    })
+                    .collect();
+                assert_eq!(serde_json::json!(scopes), state["scopes"]);
+                assert_eq!(
+                    (allocated - vm.allocations.len()) as u64,
+                    state["freed"].as_u64().unwrap()
+                );
+            }
+        }
     }
 
     #[test]
