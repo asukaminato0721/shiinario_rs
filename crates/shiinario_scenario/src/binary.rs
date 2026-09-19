@@ -1989,6 +1989,20 @@ impl BinaryVm {
                 self.sp = next_sp;
                 next_base = base;
             }
+            0x000f => {
+                let task = self.read(&mut cursor)?;
+                ensure!(task < CELLS as u32, "task release slot out of bounds");
+                if task == self.current_task {
+                    self.context_flags = 0;
+                } else if let Some(state) = self.tasks.get_mut(&task) {
+                    state.flags = 0;
+                }
+                self.task_entries.remove(&task);
+                // Keep the scenario cache and task-local banks. Original 415460
+                // clears entry/PC/flags, but does not reset stack or local data.
+                // A later definition supplies a new entry and resets the stack.
+                rescan = true;
+            }
             0x000c => {
                 let task = self.read(&mut cursor)?;
                 ensure!(
@@ -2289,6 +2303,28 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn released_task_entry_cannot_be_called_and_locals_survive_redefinition() {
+        let mut code = instruction(0x000f, &immediate(10));
+        code.extend(instruction(0x0267, &immediate(10)));
+        let mut vm = BinaryVm::new("release.scn", code).unwrap();
+        vm.define_task(10, vm.script_base, 0, true);
+        vm.tasks.get_mut(&10).unwrap().locals[0] = 77;
+        vm.step().unwrap();
+        assert_eq!(vm.task_flags(10), 0);
+        assert!(!vm.task_entries.contains_key(&10));
+        assert_eq!(vm.thread_limit, 1);
+        assert!(
+            vm.step()
+                .unwrap_err()
+                .to_string()
+                .contains("undefined task 10")
+        );
+        vm.define_task(10, vm.script_base, 0, true);
+        assert_eq!(vm.tasks[&10].locals[0], 77);
+        assert_eq!(vm.tasks[&10].sp, CELLS);
     }
 
     #[test]
