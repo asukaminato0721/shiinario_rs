@@ -2032,7 +2032,8 @@ impl BinaryVm {
             0x00d2 => {
                 ensure!(self.best_effort, "save-file writes are unavailable");
                 // 424793 reads data pointer, length, path; 405ba0 writes the
-                // file. The dispatcher discards its result (no destination).
+                // file. There is no result destination; native failure stops
+                // dispatch. Best-effort logs the omitted write and continues.
                 let address = self.read(&mut cursor)?;
                 let length = self.read(&mut cursor)?;
                 let name = self.string(self.read(&mut cursor)?)?;

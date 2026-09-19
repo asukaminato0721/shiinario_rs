@@ -46,6 +46,9 @@ enum Command {
         /// Write the last binary-replay display to a new PNG file, even on failure.
         #[arg(long)]
         final_frame: Option<PathBuf>,
+        /// Include up to 10000 recent events in the summary for stalled-input diagnosis.
+        #[arg(long, default_value_t = 0, requires = "summary")]
+        tail_events: usize,
     },
     Extract {
         archive: PathBuf,
@@ -136,7 +139,9 @@ fn main() -> Result<()> {
             best_effort,
             summary,
             final_frame,
+            tail_events,
         } => {
+            anyhow::ensure!(tail_events <= 10000, "tail-events exceeds 10000");
             let p = shiinario_runtime::open(project_dir)?;
             let input = input
                 .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
@@ -146,6 +151,7 @@ fn main() -> Result<()> {
             let mut skips = std::collections::BTreeMap::<u16, usize>::new();
             let mut glyphs = 0usize;
             let mut events = 0usize;
+            let mut recent = std::collections::VecDeque::with_capacity(tail_events);
             let mut stories = Vec::new();
             let mut scenarios = std::collections::BTreeSet::new();
             scenarios.insert(name.clone());
@@ -180,6 +186,12 @@ fn main() -> Result<()> {
                 |event| {
                     use shiinario_scenario::{Event, PlatformRequest};
                     events += 1;
+                    if tail_events != 0 {
+                        if recent.len() == tail_events {
+                            recent.pop_front();
+                        }
+                        recent.push_back(event.clone());
+                    }
                     match event {
                         Event::BinaryInstruction { opcode, .. } => {
                             *instructions.entry(*opcode).or_default() += 1
@@ -230,7 +242,7 @@ fn main() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))})
+                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}")),"recent_events":recent})
                     )?
                 );
             }

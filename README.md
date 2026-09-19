@@ -75,6 +75,13 @@ The optional `--final-frame /tmp/new-frame.png` captures the last SCN display ev
 on failure and refuses to overwrite an existing file. State persists until the next frame. Exhausting the instruction budget is a failure,
 not evidence that a story route ended.
 
+For choice testing, the generator accepts `--cursor 400 190` (the first observed
+option) and `--skip --release-skip-every 3`. Releasing skip between clicks allows
+the first two menus to accept selection; holding it continuously leaves them
+waiting. Input timestamps use elapsed u64 milliseconds and continue across the
+engine's u32 clock wrap. `--summary --tail-events 2000` keeps recent events for
+diagnosing a stalled replay.
+
 Extraction writes only to the explicitly provided output path. Reading, inspecting,
 verifying, and tracing do not write to the installation. Keep extracted assets and
 research artifacts outside this repository. No alternative save format is created.

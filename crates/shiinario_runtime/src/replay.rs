@@ -7,7 +7,7 @@ use shiinario_scenario::MouseButtonMapping;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputFrame {
-    pub at_ms: u32,
+    pub at_ms: u64,
     pub cursor: [i32; 2],
     #[serde(default)]
     pub mouse_buttons: u8,
@@ -27,6 +27,8 @@ pub(crate) struct Replay {
     control_mask: u32,
     pub keys: AsyncKeys,
     mapping: MouseButtonMapping,
+    last_clock: u32,
+    elapsed_ms: u64,
 }
 impl Replay {
     pub fn new(frames: Vec<InputFrame>) -> Result<Self> {
@@ -44,7 +46,13 @@ impl Replay {
         })
     }
     pub fn advance(&mut self, now: u32) {
-        while let Some(frame) = self.frames.get(self.next).filter(|f| f.at_ms <= now) {
+        self.elapsed_ms += u64::from(now.wrapping_sub(self.last_clock));
+        self.last_clock = now;
+        while let Some(frame) = self
+            .frames
+            .get(self.next)
+            .filter(|f| f.at_ms <= self.elapsed_ms)
+        {
             self.cursor = frame.cursor;
             self.mouse = frame.mouse_buttons;
             self.control_mask = frame.control_mask;
@@ -73,6 +81,34 @@ impl Replay {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replay_timestamps_continue_across_engine_clock_wrap() {
+        let mut replay = Replay::new(vec![
+            InputFrame {
+                at_ms: u64::from(u32::MAX) - 1,
+                cursor: [1, 2],
+                mouse_buttons: 1,
+                control_mask: 0,
+                keys: vec![],
+            },
+            InputFrame {
+                at_ms: u64::from(u32::MAX) + 2,
+                cursor: [3, 4],
+                mouse_buttons: 0,
+                control_mask: 0,
+                keys: vec![],
+            },
+        ])
+        .unwrap();
+        replay.advance(u32::MAX - 1);
+        assert_eq!(replay.cursor, [1, 2]);
+        assert_eq!(replay.controls(), 0x20);
+        replay.advance(0);
+        assert_eq!(replay.cursor, [1, 2]);
+        replay.advance(1);
+        assert_eq!(replay.cursor, [3, 4]);
+        assert_eq!(replay.controls(), 0);
+    }
     #[test]
     fn snapshots_preserve_mouse_mapping_and_consumed_key_edges() {
         let mut replay = Replay::new(vec![
