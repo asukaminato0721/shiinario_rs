@@ -1,7 +1,7 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
 //! are distinct formats; unknown instructions are never treated as no-ops.
 mod binary;
-pub use binary::{BinaryVm, MouseButtonMapping, boot_binary};
+pub use binary::{BinaryVm, MouseButtonMapping, PlatformRequest, boot_binary};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -150,6 +150,18 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
+    BinaryInstruction {
+        location: Location,
+        opcode: u16,
+    },
+    Platform {
+        location: Location,
+        request: PlatformRequest,
+    },
+    PlatformReply {
+        value: u32,
+        simulated: bool,
+    },
     MouseButtonMapping {
         location: Location,
         value: u32,

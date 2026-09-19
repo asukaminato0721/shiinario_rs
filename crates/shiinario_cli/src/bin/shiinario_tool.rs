@@ -28,6 +28,9 @@ enum Command {
         name: String,
         #[arg(long, default_value_t = 10000)]
         max_steps: usize,
+        /// Use logged, synthetic window replies for interpreter research.
+        #[arg(long)]
+        simulate_platform: bool,
     },
     Extract {
         archive: PathBuf,
@@ -109,12 +112,19 @@ fn main() -> Result<()> {
             project_dir,
             name,
             max_steps,
+            simulate_platform,
         } => {
             let p = shiinario_runtime::open(project_dir)?;
-            shiinario_runtime::trace(&p, &name, max_steps, |event| {
-                println!("{}", serde_json::to_string(event)?);
-                Ok(())
-            })?;
+            shiinario_runtime::trace_with_platform(
+                &p,
+                &name,
+                max_steps,
+                simulate_platform,
+                |event| {
+                    println!("{}", serde_json::to_string(event)?);
+                    Ok(())
+                },
+            )?;
         }
         Command::List { archive } => println!(
             "{}",
