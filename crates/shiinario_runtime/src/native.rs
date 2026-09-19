@@ -191,7 +191,10 @@ impl Host for NativeHost {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
             PlatformRequest::TextInput { clear } => {
-                if *clear { self.text_key = false; return Ok(0); }
+                if *clear {
+                    self.text_key = false;
+                    return Ok(0);
+                }
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
                 Ok(self.controls.mask() | if self.text_key { 0x10000 } else { 0 })
             }
@@ -374,7 +377,9 @@ impl ApplicationHandler for App<'_> {
                 host.cursor = [position.x as i32, position.y as i32]
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed && event.text.as_ref().is_some_and(|s| !s.is_empty()) {
+                if event.state == ElementState::Pressed
+                    && event.text.as_ref().is_some_and(|s| !s.is_empty())
+                {
                     host.text_key = true;
                 }
                 if let PhysicalKey::Code(key) = event.physical_key {
@@ -431,8 +436,16 @@ impl ApplicationHandler for App<'_> {
         for _ in 0..10000 {
             let mut timer_wait = false;
             let result = self.session.step(self.project, host, |event| {
-                if let Event::CompatibilitySkip { location, opcode, detail } = event {
-                    eprintln!("SKIP {}:{:#x} opcode={opcode:#06x}: {detail}", location.scenario, location.offset);
+                if let Event::CompatibilitySkip {
+                    location,
+                    opcode,
+                    detail,
+                } = event
+                {
+                    eprintln!(
+                        "SKIP {}:{:#x} opcode={opcode:#06x}: {detail}",
+                        location.scenario, location.offset
+                    );
                 }
                 if matches!(
                     event,

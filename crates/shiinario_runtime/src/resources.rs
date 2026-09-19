@@ -807,12 +807,32 @@ impl Resources {
     }
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        if let PlatformRequest::GetAudioStreamVolume { handle } = request {
+            return Ok(Some(if *handle == 0 { u32::MAX } else {
+                self.streams.get(handle).context("unknown audio stream in volume query")?.volume.percent()
+            }));
+        }
         match request {
-            PlatformRequest::DrawGlyph { surface,position,character,style } => {
-                let target = self.surfaces.get(surface).context("text surface is not allocated")?;
-                self.text_renderer.draw(crate::text_render::Canvas {
-                    pixels: &target.pixels, size: [target.width,target.height], stride: target.stride,
-                },*position,*character,style)?;
+            PlatformRequest::DrawGlyph {
+                surface,
+                position,
+                character,
+                style,
+            } => {
+                let target = self
+                    .surfaces
+                    .get(surface)
+                    .context("text surface is not allocated")?;
+                self.text_renderer.draw(
+                    crate::text_render::Canvas {
+                        pixels: &target.pixels,
+                        size: [target.width, target.height],
+                        stride: target.stride,
+                    },
+                    *position,
+                    *character,
+                    style,
+                )?;
             }
             PlatformRequest::HitTestImages { x, y, items } => {
                 return Ok(Some(self.hit_test_images(*x, *y, items)?));

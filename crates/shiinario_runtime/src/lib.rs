@@ -4,10 +4,11 @@ mod buffer_audio;
 pub mod input;
 pub mod native;
 mod presentation;
+pub mod replay;
 pub mod resources;
 pub mod session;
-pub mod viewport;
 mod text_render;
+pub mod viewport;
 use anyhow::{Result, bail};
 use session::Host;
 use shiinario_assets::project::Project;
@@ -46,15 +47,55 @@ pub fn trace_with_clock(
     max_steps: usize,
     simulate_platform: bool,
     tick_ms: u32,
+    emit: impl FnMut(&Event) -> Result<()>,
+) -> Result<()> {
+    trace_with_options(
+        project,
+        name,
+        max_steps,
+        TraceOptions {
+            simulate_platform,
+            tick_ms,
+            ..Default::default()
+        },
+        emit,
+    )
+}
+
+#[derive(Default)]
+pub struct TraceOptions {
+    pub simulate_platform: bool,
+    pub tick_ms: u32,
+    pub best_effort: bool,
+    pub input: Vec<replay::InputFrame>,
+}
+
+pub fn trace_with_options(
+    project: &Project,
+    name: &str,
+    max_steps: usize,
+    options: TraceOptions,
     mut emit: impl FnMut(&Event) -> Result<()>,
 ) -> Result<()> {
+    let TraceOptions {
+        simulate_platform,
+        tick_ms,
+        best_effort,
+        input,
+    } = options;
+    anyhow::ensure!(
+        input.is_empty() || (simulate_platform && tick_ms > 0),
+        "input replay requires a simulated advancing clock"
+    );
     anyhow::ensure!(
         simulate_platform || tick_ms == 0,
         "trace clock requires a simulated platform"
     );
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut session = session::Session::new(project, name)?;
+        session.set_best_effort(best_effort);
         let mut platform = TracePlatform {
+            replay: replay::Replay::new(input)?,
             tick_ms,
             enabled: simulate_platform,
             ..Default::default()
@@ -92,6 +133,7 @@ pub fn trace_with_clock(
 }
 
 struct TracePlatform {
+    replay: replay::Replay,
     enabled: bool,
     mixer: audio::Mixer,
     class_style: u32,
@@ -101,6 +143,7 @@ struct TracePlatform {
 impl Default for TracePlatform {
     fn default() -> Self {
         Self {
+            replay: Default::default(),
             enabled: true,
             mixer: audio::Mixer::default(),
             class_style: 0xb,
@@ -116,14 +159,18 @@ impl Host for TracePlatform {
     fn simulated(&self) -> bool {
         true
     }
+    fn mouse_mapping(&mut self, value: u32) {
+        self.replay.mapping(value);
+    }
     fn poll(&mut self) -> Result<()> {
         self.clock_ms = self.clock_ms.wrapping_add(self.tick_ms);
         self.mixer.advance_ms(self.tick_ms);
+        self.replay.advance(self.clock_ms);
         Ok(())
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
-            PlatformRequest::CursorPosition => Ok([0, 0]),
+            PlatformRequest::CursorPosition => Ok(self.replay.cursor),
             PlatformRequest::MapCursor { point } => {
                 viewport::ViewportTransform::default().to_logical(*point)
             }
@@ -154,9 +201,11 @@ impl Host for TracePlatform {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
-            PlatformRequest::TextInput { .. } => Ok(0),
-            PlatformRequest::ReadKeyState { .. } => Ok(input::key_state_reply(0, true)),
-            PlatformRequest::ReadControls => Ok(input::ControlState::default().mask()),
+            PlatformRequest::TextInput { clear } => {
+                Ok(if *clear { 0 } else { self.replay.controls() })
+            }
+            PlatformRequest::ReadKeyState { key } => Ok(self.replay.keys.query(*key, true)),
+            PlatformRequest::ReadControls => Ok(self.replay.controls()),
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
             PlatformRequest::ReleaseGraphics | PlatformRequest::SetFullscreen { .. } => Ok(1),
@@ -170,6 +219,7 @@ impl Host for TracePlatform {
                 if !ready && self.tick_ms != 0 {
                     self.clock_ms = self.clock_ms.wrapping_add(1);
                     self.mixer.advance_ms(1);
+                    self.replay.advance(self.clock_ms);
                 }
                 Ok(u32::from(ready))
             }

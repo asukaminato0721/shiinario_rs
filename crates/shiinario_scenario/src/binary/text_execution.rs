@@ -28,8 +28,17 @@ pub(super) struct AsyncText {
 }
 impl AsyncText {
     pub fn new(owner: u32, surface: u32, address: u32, location: Location) -> Self {
-        Self { owner, surface, address, offset: 0, location, ticking: false,
-            timed: true, phase: TextPhase::Begin, glyph: None }
+        Self {
+            owner,
+            surface,
+            address,
+            offset: 0,
+            location,
+            ticking: false,
+            timed: true,
+            phase: TextPhase::Begin,
+            glyph: None,
+        }
     }
 }
 
@@ -38,23 +47,29 @@ impl BinaryVm {
         let Some(text) = self.async_text.as_mut().filter(|text| text.ticking) else {
             return Ok(());
         };
-        let Event::Platform { request, .. } = event else { return Ok(()); };
+        let Event::Platform { request, .. } = event else {
+            return Ok(());
+        };
         match (text.phase, request) {
             (TextPhase::Input, PlatformRequest::TextInput { clear: false }) => {
                 let mask = self.text_style.skip_mask;
                 if (mask & 1 != 0 && value & 0x20 != 0)
                     || (mask & 2 != 0 && value & 0x10 != 0)
                     || (mask & 4 != 0 && value & 0x100 != 0)
-                    || (mask & 8 != 0 && value & 0x10000 != 0) {
+                    || (mask & 8 != 0 && value & 0x10000 != 0)
+                {
                     text.timed = false;
                 }
                 text.phase = TextPhase::Process;
             }
             (TextPhase::CheckDelay, PlatformRequest::ClockMilliseconds) => {
                 text.phase = if value.wrapping_sub(self.text_style.character_epoch)
-                    < self.text_style.character_delay {
+                    < self.text_style.character_delay
+                {
                     TextPhase::Finish(false)
-                } else { TextPhase::Epoch };
+                } else {
+                    TextPhase::Epoch
+                };
             }
             (TextPhase::Epoch, PlatformRequest::ClockMilliseconds) => {
                 self.text_style.character_epoch = value;
@@ -74,7 +89,9 @@ impl BinaryVm {
                 text.offset = offset;
                 text.phase = if text.timed && self.text_style.character_delay != 0 {
                     TextPhase::Finish(false)
-                } else { TextPhase::Process };
+                } else {
+                    TextPhase::Process
+                };
             }
             _ => bail!("unexpected text response: {request:?}"),
         }
@@ -83,7 +100,8 @@ impl BinaryVm {
 
     fn text_request(&mut self, request: PlatformRequest) -> Event {
         let event = Event::Platform {
-            location: self.async_text.as_ref().unwrap().location.clone(), request,
+            location: self.async_text.as_ref().unwrap().location.clone(),
+            request,
         };
         self.pending = Some((event.clone(), None));
         event
@@ -94,8 +112,10 @@ impl BinaryVm {
             Ok(event) => Ok(event),
             Err(error) => {
                 let text = self.async_text.as_ref().unwrap();
-                let message = format!("{}:{:#x}: {error:#}; opcode=0x0083, task={}, text_byte={:#x}",
-                    text.location.scenario, text.location.offset, text.owner, text.offset);
+                let message = format!(
+                    "{}:{:#x}: {error:#}; opcode=0x0083, task={}, text_byte={:#x}",
+                    text.location.scenario, text.location.offset, text.owner, text.offset
+                );
                 self.failure = Some(message.clone());
                 bail!("{message}")
             }
@@ -105,7 +125,10 @@ impl BinaryVm {
     fn text_execute(&mut self) -> Result<Event> {
         loop {
             let text = self.async_text.as_ref().context("missing text context")?;
-            ensure!(text.owner == self.current_task, "text task changed during a pending tick");
+            ensure!(
+                text.owner == self.current_task,
+                "text task changed during a pending tick"
+            );
             let phase = text.phase;
             let surface = text.surface;
             let offset = text.offset;
@@ -113,15 +136,22 @@ impl BinaryVm {
                 TextPhase::Begin => {
                     self.async_text.as_mut().unwrap().phase = if self.text_style.skip_mask != 0 {
                         TextPhase::Input
-                    } else { TextPhase::Process };
+                    } else {
+                        TextPhase::Process
+                    };
                 }
-                TextPhase::Input => return Ok(self.text_request(PlatformRequest::TextInput { clear: false })),
+                TextPhase::Input => {
+                    return Ok(self.text_request(PlatformRequest::TextInput { clear: false }));
+                }
                 TextPhase::CheckDelay | TextPhase::Epoch => {
                     return Ok(self.text_request(PlatformRequest::ClockMilliseconds));
                 }
                 TextPhase::Finish(completed) => {
-                    let event = Event::TextTick { task: text.owner, completed,
-                        cursor: [self.text_cursor[1], self.text_cursor[2]] };
+                    let event = Event::TextTick {
+                        task: text.owner,
+                        completed,
+                        cursor: [self.text_cursor[1], self.text_cursor[2]],
+                    };
                     if completed {
                         self.context_flags &= !8;
                         self.async_text = None;
@@ -135,7 +165,10 @@ impl BinaryVm {
                 }
                 TextPhase::Process | TextPhase::Glyph => {
                     ensure!(offset <= 65536, "text exceeds 64 KiB");
-                    let address = text.address.checked_add(offset as u32).context("text address overflow")?;
+                    let address = text
+                        .address
+                        .checked_add(offset as u32)
+                        .context("text address overflow")?;
                     let bytes = self.string_bytes(address)?;
                     ensure!(bytes.len() <= 65536 - offset, "text exceeds 64 KiB");
                     if bytes.is_empty() {
@@ -151,10 +184,12 @@ impl BinaryVm {
                                 }
                                 if !self.text_layout.wrapped {
                                     self.text_cursor[1] = self.text_cursor[0];
-                                    self.text_cursor[2] = self.text_cursor[2].wrapping_add(self.text_style.line_advance);
+                                    self.text_cursor[2] = self.text_cursor[2]
+                                        .wrapping_add(self.text_style.line_advance);
                                     self.text_layout.cursor = self.text_cursor;
                                 }
-                                self.async_text.as_mut().unwrap().offset += if forced { 3 } else { 2 };
+                                self.async_text.as_mut().unwrap().offset +=
+                                    if forced { 3 } else { 2 };
                                 continue;
                             }
                             let (style, clock, consumed) = self.text_style.prefix(&bytes)?;
@@ -170,22 +205,39 @@ impl BinaryVm {
                         self.async_text.as_mut().unwrap().phase =
                             if text.timed && self.text_style.character_delay != 0 {
                                 TextPhase::CheckDelay
-                            } else { TextPhase::Glyph };
+                            } else {
+                                TextPhase::Glyph
+                            };
                         continue;
                     }
-                    let escaped = matches!(bytes[0], b'_' | b'$' | b'*' | b'+' | b'@' | b'{' | b'}' | b'~');
+                    let escaped = matches!(
+                        bytes[0],
+                        b'_' | b'$' | b'*' | b'+' | b'@' | b'{' | b'}' | b'~'
+                    );
                     let start = usize::from(escaped);
                     if escaped {
-                        ensure!(bytes.get(1) == Some(&bytes[0]), "unresolved inline text command {:#x}", bytes[0]);
+                        ensure!(
+                            bytes.get(1) == Some(&bytes[0]),
+                            "unresolved inline text command {:#x}",
+                            bytes[0]
+                        );
                     }
                     let length = cp932_len(bytes[start]);
-                    ensure!(start + length <= bytes.len(), "truncated CP932 text character");
-                    let glyph = &bytes[start..start+length];
-                    ensure!(!self.text_style.fullwidth_ascii || length == 2
-                        || (glyph == b" " && !self.text_style.fullwidth_spaces),
-                        "single-byte text conversion is unresolved");
+                    ensure!(
+                        start + length <= bytes.len(),
+                        "truncated CP932 text character"
+                    );
+                    let glyph = &bytes[start..start + length];
+                    ensure!(
+                        !self.text_style.fullwidth_ascii
+                            || length == 2
+                            || (glyph == b" " && !self.text_style.fullwidth_spaces),
+                        "single-byte text conversion is unresolved"
+                    );
                     let consumed = start + length;
-                    let next = if consumed == bytes.len() { &[] } else {
+                    let next = if consumed == bytes.len() {
+                        &[]
+                    } else {
                         let end = consumed + cp932_len(bytes[consumed]);
                         ensure!(end <= bytes.len(), "truncated following CP932 character");
                         &bytes[consumed..end]
@@ -194,141 +246,246 @@ impl BinaryVm {
                     ensure!(!bad, "invalid CP932 text character");
                     let mut chars = decoded.chars();
                     let character = chars.next().context("empty decoded glyph")?;
-                    ensure!(chars.next().is_none() && !character.is_control(), "unresolved text character {character:?}");
+                    ensure!(
+                        chars.next().is_none() && !character.is_control(),
+                        "unresolved text character {character:?}"
+                    );
                     let mut layout = self.text_layout.clone();
-                    let position = layout.place(glyph, next,
-                        [self.text_style.half_advance,self.text_style.full_advance],
-                        self.text_style.line_advance,self.text_style.line_limit,&self.text_style.punctuation)?;
+                    let position = layout.place(
+                        glyph,
+                        next,
+                        [self.text_style.half_advance, self.text_style.full_advance],
+                        self.text_style.line_advance,
+                        self.text_style.line_limit,
+                        &self.text_style.punctuation,
+                    )?;
                     if surface == u32::MAX || self.text_image[0] != u32::MAX {
                         let timed = text.timed;
                         self.text_cursor = layout.cursor;
                         self.text_layout = layout;
                         self.async_text.as_mut().unwrap().offset += consumed;
-                        self.async_text.as_mut().unwrap().phase = if timed && self.text_style.character_delay != 0 {
-                            TextPhase::Finish(false)
-                        } else { TextPhase::Process };
+                        self.async_text.as_mut().unwrap().phase =
+                            if timed && self.text_style.character_delay != 0 {
+                                TextPhase::Finish(false)
+                            } else {
+                                TextPhase::Process
+                            };
                         continue;
                     }
                     let text = self.async_text.as_mut().unwrap();
-                    text.glyph = Some((layout,offset+consumed));
+                    text.glyph = Some((layout, offset + consumed));
                     text.phase = TextPhase::Drawing;
                     return Ok(self.text_request(PlatformRequest::DrawGlyph {
-                        surface,position: position.map(|v| v as i32),character,style: self.text_style.clone(),
+                        surface,
+                        position: position.map(|v| v as i32),
+                        character,
+                        style: self.text_style.clone(),
                     }));
                 }
-                TextPhase::Drawing | TextPhase::StyleClock => bail!("text continuation has no platform request"),
+                TextPhase::Drawing | TextPhase::StyleClock => {
+                    bail!("text continuation has no platform request")
+                }
             }
         }
     }
 }
 
 fn cp932_len(first: u8) -> usize {
-    if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) { 2 } else { 1 }
+    if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) {
+        2
+    } else {
+        1
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn best_effort_image_text_is_logged_and_surface_drawing_resumes() {
+        let mut code=Vec::new();
+        let immediate=|value:u32| { let mut out=vec![4];out.extend(value.to_le_bytes());out };
+        for (target,text) in [(17,b"_AA".as_slice()),(u32::MAX,b"B")] {
+            code.extend(0xb4u16.to_le_bytes());code.extend(immediate(target));code.extend(immediate(0));
+            code.extend(0x83u16.to_le_bytes());code.extend(immediate(0));code.push(0x10);code.extend(text);code.push(0);
+        }
+        code.extend(0u16.to_le_bytes());code.extend(immediate(0));
+        let mut strict=BinaryVm::new("image-text.scn",code.clone()).unwrap();
+        assert!(strict.step().unwrap_err().to_string().contains("image frames"));
+        let mut vm=BinaryVm::new("image-text.scn",code).unwrap();vm.set_best_effort(true);
+        let mut skipped=0;let mut drawn=Vec::new();
+        for step in 0..100 {
+            assert!(step<99);
+            match vm.scheduled_step().unwrap() {
+                Event::End=>break,
+                Event::CompatibilitySkip {opcode:0xb4,..}=>skipped+=1,
+                Event::SchedulerPoll=>vm.respond(1).unwrap(),
+                Event::Platform {request:PlatformRequest::DrawGlyph {character,position,..},..}=> {
+                    drawn.push((character,position));vm.respond(1).unwrap();
+                }
+                Event::BinaryInstruction {..}|Event::TextTick {..}=>{},
+                event=>panic!("{event:?}"),
+            }
+        }
+        assert_eq!(skipped,1);assert_eq!(drawn,vec![('B',[8,0])]);
+    }
     fn decode(hex: &str) -> Vec<u8> {
-        (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
     }
     #[test]
     fn asynchronous_control_text_matches_original_scheduler_passes() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../docs/validation/text-scheduler-probe.json")).unwrap();
+            "../../../../docs/validation/text-scheduler-probe.json"
+        ))
+        .unwrap();
         for case in fixture["cases"].as_array().unwrap() {
-            let mut vm = BinaryVm::new("text.scn",decode(case["programs"][0].as_str().unwrap())).unwrap();
-            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32).unwrap();
-            vm.scenarios.insert(0x40000000,Scenario { name: "worker.scn".into(),data:decode(case["programs"][1].as_str().unwrap()) });
-            vm.define_task(1,0x40000000,0,true);
+            let mut vm =
+                BinaryVm::new("text.scn", decode(case["programs"][0].as_str().unwrap())).unwrap();
+            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32)
+                .unwrap();
+            vm.scenarios.insert(
+                0x40000000,
+                Scenario {
+                    name: "worker.scn".into(),
+                    data: decode(case["programs"][1].as_str().unwrap()),
+                },
+            );
+            vm.define_task(1, 0x40000000, 0, true);
             vm.thread_limit = 2;
             let mut events = Vec::new();
             loop {
-                assert!(events.len()<100);
-                let event=vm.scheduled_step().unwrap();
+                assert!(events.len() < 100);
+                let event = vm.scheduled_step().unwrap();
                 match event {
                     Event::End => break,
                     Event::SchedulerPoll => {
-                        events.push(serde_json::json!({"event":"poll"})); vm.respond(1).unwrap();
+                        events.push(serde_json::json!({"event":"poll"}));
+                        vm.respond(1).unwrap();
                     }
-                    Event::TextTick { task,completed,cursor } => {
+                    Event::TextTick {
+                        task,
+                        completed,
+                        cursor,
+                    } => {
                         assert!(completed);
                         events.push(serde_json::json!({"event":"text-tick","task":task,"status":1,"cursor":cursor}));
                         events.push(serde_json::json!({"event":"text-status","task":task,"status":0,"cursor":cursor}));
                     }
-                    Event::BinaryInstruction { location,.. } | Event::MouseButtonMapping {location,..} => {
-                        events.push(serde_json::json!({"event":"instruction","task":vm.current_task,
-                            "pc":location.offset,"sp":1000,"local":0,"shared":0}));
+                    Event::BinaryInstruction { location, .. }
+                    | Event::MouseButtonMapping { location, .. } => {
+                        events.push(
+                            serde_json::json!({"event":"instruction","task":vm.current_task,
+                            "pc":location.offset,"sp":1000,"local":0,"shared":0}),
+                        );
                     }
                     other => panic!("{other:?}"),
                 }
             }
-            assert_eq!(serde_json::json!(events),case["events"],"{}",case["name"]);
+            assert_eq!(
+                serde_json::json!(events),
+                case["events"],
+                "{}",
+                case["name"]
+            );
         }
     }
 
     #[test]
     fn glyph_ticks_match_original_clock_reads_input_and_cursor_commits() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../docs/validation/text-ticks-probe.json")).unwrap();
+            "../../../../docs/validation/text-ticks-probe.json"
+        ))
+        .unwrap();
         for case in fixture["cases"].as_array().unwrap() {
-            let mut code = vec![0x83,0,4,0,0,0,0,0x10];
-            code.extend(decode(case["text"].as_str().unwrap())); code.push(0);
-            code.extend([0,0,4,0,0,0,0]);
-            let mut vm=BinaryVm::new("glyphs.scn",code).unwrap();
-            vm.thread_limit=1;
-            vm.text_style.fullwidth_ascii=false;
-            vm.text_style.character_delay=case["delay"].as_u64().unwrap() as u32;
-            vm.text_style.character_epoch=case["epoch"].as_u64().unwrap() as u32;
-            vm.text_style.skip_mask=case["skip_mask"].as_u64().unwrap() as u32;
-            assert_eq!(vm.scheduled_step().unwrap(),Event::SchedulerPoll); vm.respond(1).unwrap();
-            let first=vm.scheduled_step().unwrap();
-            if let Event::Platform { request: PlatformRequest::TextInput { clear:true }, .. } = first {
+            let mut code = vec![0x83, 0, 4, 0, 0, 0, 0, 0x10];
+            code.extend(decode(case["text"].as_str().unwrap()));
+            code.push(0);
+            code.extend([0, 0, 4, 0, 0, 0, 0]);
+            let mut vm = BinaryVm::new("glyphs.scn", code).unwrap();
+            vm.thread_limit = 1;
+            vm.text_style.fullwidth_ascii = false;
+            vm.text_style.character_delay = case["delay"].as_u64().unwrap() as u32;
+            vm.text_style.character_epoch = case["epoch"].as_u64().unwrap() as u32;
+            vm.text_style.skip_mask = case["skip_mask"].as_u64().unwrap() as u32;
+            assert_eq!(vm.scheduled_step().unwrap(), Event::SchedulerPoll);
+            vm.respond(1).unwrap();
+            let first = vm.scheduled_step().unwrap();
+            if let Event::Platform {
+                request: PlatformRequest::TextInput { clear: true },
+                ..
+            } = first
+            {
                 vm.respond(0).unwrap();
-            } else { assert!(matches!(first,Event::BinaryInstruction {opcode:0x83,..})); }
+            } else {
+                assert!(matches!(
+                    first,
+                    Event::BinaryInstruction { opcode: 0x83, .. }
+                ));
+            }
             for tick in case["ticks"].as_array().unwrap() {
-                let expected=tick["events"].as_array().unwrap();
-                let mut index=0;
+                let expected = tick["events"].as_array().unwrap();
+                let mut index = 0;
                 for iteration in 0..100 {
-                    assert!(iteration<99);
-                    let event=vm.scheduled_step().unwrap();
+                    assert!(iteration < 99);
+                    let event = vm.scheduled_step().unwrap();
                     match &event {
                         Event::SchedulerPoll => vm.respond(1).unwrap(),
-                        Event::Platform { request,.. } => {
-                            let entry=&expected[index]; index+=1;
-                            assert_eq!(vm.scheduled_step().unwrap(),event);
-                            let value=match request {
-                                PlatformRequest::TextInput {clear:false} => {
-                                    assert_eq!(entry["event"],"input");entry["value"].as_u64().unwrap() as u32
+                        Event::Platform { request, .. } => {
+                            let entry = &expected[index];
+                            index += 1;
+                            assert_eq!(vm.scheduled_step().unwrap(), event);
+                            let value = match request {
+                                PlatformRequest::TextInput { clear: false } => {
+                                    assert_eq!(entry["event"], "input");
+                                    entry["value"].as_u64().unwrap() as u32
                                 }
                                 PlatformRequest::ClockMilliseconds => {
-                                    assert_eq!(entry["event"],"clock");entry["value"].as_u64().unwrap() as u32
+                                    assert_eq!(entry["event"], "clock");
+                                    entry["value"].as_u64().unwrap() as u32
                                 }
-                                PlatformRequest::DrawGlyph {position,character,..} => {
-                                    assert_eq!(entry["event"],"glyph");
-                                    assert_eq!(serde_json::json!(position.map(|v|v as u32)),entry["position"]);
-                                    assert_eq!(format!("{:02x}",*character as u32),entry["bytes"]);
-                                    let cursor=vm.text_cursor;
+                                PlatformRequest::DrawGlyph {
+                                    position,
+                                    character,
+                                    ..
+                                } => {
+                                    assert_eq!(entry["event"], "glyph");
+                                    assert_eq!(
+                                        serde_json::json!(position.map(|v| v as u32)),
+                                        entry["position"]
+                                    );
+                                    assert_eq!(
+                                        format!("{:02x}", *character as u32),
+                                        entry["bytes"]
+                                    );
+                                    let cursor = vm.text_cursor;
                                     assert!(vm.respond(0).is_err());
-                                    assert_eq!(vm.text_cursor,cursor);
+                                    assert_eq!(vm.text_cursor, cursor);
                                     1
                                 }
-                                other=>panic!("{other:?}"),
+                                other => panic!("{other:?}"),
                             };
                             vm.respond(value).unwrap();
                         }
-                        Event::TextTick {completed,cursor,..} => {
-                            assert_eq!(*completed,tick["status"]==0);
-                            assert_eq!(serde_json::json!(cursor),tick["cursor"]);
-                            assert_eq!(vm.text_style.character_epoch as u64,tick["epoch"].as_u64().unwrap());
-                            assert_eq!(index,expected.len(),"{}",case["name"]);
+                        Event::TextTick {
+                            completed, cursor, ..
+                        } => {
+                            assert_eq!(*completed, tick["status"] == 0);
+                            assert_eq!(serde_json::json!(cursor), tick["cursor"]);
+                            assert_eq!(
+                                vm.text_style.character_epoch as u64,
+                                tick["epoch"].as_u64().unwrap()
+                            );
+                            assert_eq!(index, expected.len(), "{}", case["name"]);
                             break;
                         }
-                        other=>panic!("{other:?}"),
+                        other => panic!("{other:?}"),
                     }
                 }
             }
-            assert_eq!(vm.context_flags & 8,0);
+            assert_eq!(vm.context_flags & 8, 0);
         }
     }
 }

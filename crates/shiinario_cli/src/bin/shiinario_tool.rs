@@ -34,6 +34,15 @@ enum Command {
         /// Milliseconds per host poll; timer retries advance 1 ms. Zero freezes time.
         #[arg(long, default_value_t = 0, requires = "simulate_platform")]
         tick_ms: u32,
+        /// JSON array of timestamped mouse/key snapshots for deterministic replay.
+        #[arg(long, requires = "simulate_platform")]
+        input: Option<PathBuf>,
+        /// Log identified presentation omissions and continue.
+        #[arg(long)]
+        best_effort: bool,
+        /// Print coverage totals instead of every interpreter event.
+        #[arg(long)]
+        summary: bool,
     },
     Extract {
         archive: PathBuf,
@@ -120,19 +129,68 @@ fn main() -> Result<()> {
             max_steps,
             simulate_platform,
             tick_ms,
+            input,
+            best_effort,
+            summary,
         } => {
             let p = shiinario_runtime::open(project_dir)?;
-            shiinario_runtime::trace_with_clock(
+            let input = input
+                .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
+                .transpose()?
+                .unwrap_or_default();
+            let mut instructions = std::collections::BTreeMap::<u16, usize>::new();
+            let mut skips = std::collections::BTreeMap::<u16, usize>::new();
+            let mut glyphs = 0usize;
+            let mut events = 0usize;
+            let result = shiinario_runtime::trace_with_options(
                 &p,
                 &name,
                 max_steps,
-                simulate_platform,
-                tick_ms,
+                shiinario_runtime::TraceOptions {
+                    simulate_platform,
+                    tick_ms,
+                    best_effort,
+                    input,
+                },
                 |event| {
-                    println!("{}", serde_json::to_string(event)?);
+                    use shiinario_scenario::{Event, PlatformRequest};
+                    events += 1;
+                    match event {
+                        Event::BinaryInstruction { opcode, .. } => {
+                            *instructions.entry(*opcode).or_default() += 1
+                        }
+                        Event::CompatibilitySkip {
+                            location,
+                            opcode,
+                            detail,
+                        } => {
+                            *skips.entry(*opcode).or_default() += 1;
+                            eprintln!(
+                                "SKIP {}:{:#x} opcode={opcode:#06x}: {detail}",
+                                location.scenario, location.offset
+                            );
+                        }
+                        Event::Platform {
+                            request: PlatformRequest::DrawGlyph { .. },
+                            ..
+                        } => glyphs += 1,
+                        _ => {}
+                    }
+                    if !summary {
+                        println!("{}", serde_json::to_string(event)?);
+                    }
                     Ok(())
                 },
-            )?;
+            );
+            if summary {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"events":events,"glyphs":glyphs,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))})
+                    )?
+                );
+            }
+            result?;
         }
         Command::List { archive } => println!(
             "{}",

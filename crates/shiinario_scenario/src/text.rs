@@ -175,7 +175,11 @@ impl TextStyle {
                     }
                 }
                 b'c' => {}
-                _ => anyhow::bail!("unsupported text control _{} ({command:#04x}) at byte {}", char::from(command), at - 2),
+                _ => anyhow::bail!(
+                    "unsupported text control _{} ({command:#04x}) at byte {}",
+                    char::from(command),
+                    at - 2
+                ),
             }
             if command != b'c' {
                 continue;

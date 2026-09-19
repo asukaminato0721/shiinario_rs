@@ -164,6 +164,21 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::FinishAudioFade { handle, interval, step, target } = &request {
+                emit(&Event::CompatibilitySkip { location: location.clone(),opcode:0x06ec,
+                    detail:format!("audio fade interval {interval} ms omitted; stream {handle:#x} completes at volume {}",target & 0x7fffffff) })?;
+                if *handle != 0 {
+                    let stream=resources.audio_stream(*handle).context("unknown audio stream in fade")?;
+                    let percent=target & 0x7fffffff;
+                    if stream.volume.percent()!=percent {
+                        stream.volume.set_percent(percent)?;
+                        if *step<=0 && target & 0x80000000 == 0 { host.stop_stream(*handle)?; }
+                    }
+                }
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {value:1,simulated:host.simulated()})?;
+                return Ok(true);
+            }
             if let PlatformRequest::SetAudioStreamVolume { handle, percent } = &request {
                 if *handle != 0 {
                     resources
@@ -322,7 +337,12 @@ impl Session {
             })?;
             if matches!(&request, PlatformRequest::DrawGlyph { surface: 0, .. }) {
                 host.respond(&PlatformRequest::InvalidateRect {
-                    rect: [0,0,project.config.width as i32,project.config.height as i32],
+                    rect: [
+                        0,
+                        0,
+                        project.config.width as i32,
+                        project.config.height as i32,
+                    ],
                 })?;
             }
             if let PlatformRequest::LoadSound { id, .. } = &request {

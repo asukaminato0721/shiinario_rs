@@ -75,7 +75,9 @@ pub enum SoundCommand {
 pub enum PlatformRequest {
     /// Controls plus bit 16 for the WM_CHAR-style latch. A clear only resets
     /// that latch; it does not consume physical button/key state.
-    TextInput { clear: bool },
+    TextInput {
+        clear: bool,
+    },
     DrawGlyph {
         surface: u32,
         position: [i32; 2],
@@ -126,6 +128,8 @@ pub enum PlatformRequest {
         handle: u32,
         percent: u32,
     },
+    GetAudioStreamVolume { handle: u32 },
+    FinishAudioFade { handle: u32, interval: u32, step: i32, target: u32 },
     StopAudioStream {
         handle: u32,
     },
@@ -628,8 +632,14 @@ impl BinaryVm {
             }
             self.select_task(self.scheduler.scan);
             if flags & 8 != 0 {
-                let text = self.async_text.as_mut().context("text task has no text context")?;
-                ensure!(text.owner == self.current_task, "shared concurrent text contexts are unresolved");
+                let text = self
+                    .async_text
+                    .as_mut()
+                    .context("text task has no text context")?;
+                ensure!(
+                    text.owner == self.current_task,
+                    "shared concurrent text contexts are unresolved"
+                );
                 text.ticking = true;
                 text.phase = TextPhase::Begin;
                 return self.text_step();
@@ -1393,7 +1403,10 @@ impl BinaryVm {
         if self.context_flags & 1 == 0 {
             return Ok(Event::End);
         }
-        ensure!(self.context_flags & 8 == 0, "asynchronous text requires scheduled_step");
+        ensure!(
+            self.context_flags & 8 == 0,
+            "asynchronous text requires scheduled_step"
+        );
         match self.execute() {
             Ok(event) => Ok(event),
             Err(error) => {
@@ -1610,6 +1623,20 @@ impl BinaryVm {
                     *value = self.read(&mut cursor)? as u8;
                 }
                 request = Some(PlatformRequest::FillSurface { id, rect, color });
+            }
+            0x06e3 => {
+                let handle = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::GetAudioStreamVolume { handle });
+            }
+            0x06ec => {
+                let handle = self.read(&mut cursor)?;
+                let interval = self.read(&mut cursor)?;
+                let step = self.read(&mut cursor)? as i32;
+                let target = self.read(&mut cursor)?;
+                ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
+                ensure!(self.best_effort, "timed audio fading is unresolved; use best-effort playback");
+                request = Some(PlatformRequest::FinishAudioFade {handle,interval,step,target});
             }
             0x06df => {
                 let handle = self.read(&mut cursor)?;
@@ -1928,13 +1955,19 @@ impl BinaryVm {
             0x00b4 | 0x00b6 => {
                 let values = [self.read(&mut cursor)?, self.read(&mut cursor)?];
                 if opcode == 0x00b4 {
-                    ensure!(values[0] == u32::MAX || self.best_effort,
-                        "text drawing into image frames is unresolved; use best-effort playback to omit it");
+                    ensure!(
+                        values[0] == u32::MAX || self.best_effort,
+                        "text drawing into image frames is unresolved; use best-effort playback to omit it"
+                    );
                     self.text_image = values;
                     if values[0] != u32::MAX {
                         event = Event::CompatibilitySkip {
-                            location: location.clone(), opcode,
-                            detail: format!("text pixels in image {} frame {} omitted; text layout still executes", values[0], values[1]),
+                            location: location.clone(),
+                            opcode,
+                            detail: format!(
+                                "text pixels in image {} frame {} omitted; text layout still executes",
+                                values[0], values[1]
+                            ),
                         };
                     }
                 } else {
@@ -1942,7 +1975,11 @@ impl BinaryVm {
                 }
             }
             0x00b5 | 0x00b7 => {
-                let values = if opcode == 0x00b5 { self.text_image } else { self.text_image_offset };
+                let values = if opcode == 0x00b5 {
+                    self.text_image
+                } else {
+                    self.text_image_offset
+                };
                 for value in values {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
@@ -1966,11 +2003,25 @@ impl BinaryVm {
             0x0083 => {
                 let surface = self.read(&mut cursor)?;
                 let address = self.read(&mut cursor)?;
-                ensure!(surface < 256 || surface == u32::MAX, "text surface out of bounds");
-                ensure!(self.async_text.is_none(), "shared concurrent text contexts are unresolved");
-                ensure!(self.string_bytes(address)?.len() <= 65536, "text exceeds 64 KiB");
+                ensure!(
+                    surface < 256 || surface == u32::MAX,
+                    "text surface out of bounds"
+                );
+                ensure!(
+                    self.async_text.is_none(),
+                    "shared concurrent text contexts are unresolved"
+                );
+                ensure!(
+                    self.string_bytes(address)?.len() <= 65536,
+                    "text exceeds 64 KiB"
+                );
                 self.text_layout.begin(self.text_cursor);
-                self.async_text = Some(AsyncText::new(self.current_task, surface, address, location.clone()));
+                self.async_text = Some(AsyncText::new(
+                    self.current_task,
+                    surface,
+                    address,
+                    location.clone(),
+                ));
                 self.context_flags |= 8;
                 if self.text_style.skip_mask & 8 != 0 {
                     request = Some(PlatformRequest::TextInput { clear: true });
