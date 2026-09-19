@@ -32,6 +32,12 @@ pub fn trace_with_platform(
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut vm = BinaryVm::new(name, data)?;
         vm.set_viewport(project.config.width, project.config.height)?;
+        if let Some(value) = project.config.values.get("background") {
+            let value: i32 = value.parse().context("invalid Background configuration")?;
+            if value != -1 {
+                vm.set_background_mode(value as u32);
+            }
+        }
         let mut platform = TracePlatform::default();
         let mut resources = resources::Resources::default();
         for _ in 0..max_steps {

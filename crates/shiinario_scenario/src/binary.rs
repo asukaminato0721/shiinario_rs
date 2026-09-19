@@ -232,6 +232,7 @@ pub struct BinaryVm {
     pending_bytes: Option<u32>,
     context_flags: u32,
     message_mode: u32,
+    background_mode: u32,
     archive_paths: Vec<String>,
 }
 impl BinaryVm {
@@ -273,6 +274,7 @@ impl BinaryVm {
             pending_bytes: None,
             context_flags: 1,
             message_mode: 0,
+            background_mode: 0,
             archive_paths: Vec::new(),
         })
     }
@@ -285,6 +287,9 @@ impl BinaryVm {
     }
     pub fn mouse_mapping(&self) -> MouseButtonMapping {
         self.mouse_mapping
+    }
+    pub fn set_background_mode(&mut self, value: u32) {
+        self.background_mode = value;
     }
     pub fn set_viewport(&mut self, width: u32, height: u32) -> Result<()> {
         ensure!(width > 0 && height > 0, "empty viewport");
@@ -326,6 +331,16 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        if matches!(
+            &event,
+            Event::Platform {
+                request: PlatformRequest::LoadSound { .. },
+                ..
+            }
+        ) && self.background_mode != 0
+        {
+            self.media_flags |= 0x8000;
+        }
         if matches!(
             event,
             Event::Platform {
@@ -718,6 +733,9 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x07e5 => self.background_mode = 1,
+            0x07e6 => self.background_mode = 0,
+            0x07e8 => writes.push((self.destination(&mut cursor)?, self.background_mode)),
             0x0002 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(
@@ -734,7 +752,7 @@ impl BinaryVm {
                 request = Some(PlatformRequest::LoadSound {
                     id,
                     name,
-                    flags: self.media_flags,
+                    flags: self.media_flags | if self.background_mode != 0 { 0x8000 } else { 0 },
                 });
             }
             0x055a => {
@@ -1308,6 +1326,69 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn cross_scenario_calls_match_original_loader_and_dispatcher() {
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/scenario-call-probe.json"
+        ))
+        .unwrap();
+        let decode = |key: &str| {
+            let text = probe[key].as_str().unwrap();
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        let mut vm = BinaryVm::new("caller.scn", decode("caller")).unwrap();
+        for expected in probe["states"].as_array().unwrap() {
+            if let Event::Platform { request, .. } = vm.step().unwrap() {
+                assert_eq!(
+                    request,
+                    PlatformRequest::LoadScenario {
+                        id: 2,
+                        name: "library.scn".into()
+                    }
+                );
+                assert!(vm.respond(1).is_err());
+                assert!(vm.respond_scenario(Vec::new()).is_err());
+                assert!(vm.scenarios.is_empty());
+                vm.respond_scenario(decode("library")).unwrap();
+            }
+            assert_eq!(
+                serde_json::json!({ "scenario": vm.name, "pc": vm.pc,
+                "sp": vm.sp, "mouse": vm.mouse_mapping.value }),
+                *expected
+            );
+        }
+        assert_eq!(vm.name, "caller.scn");
+        assert_eq!(vm.sp, CELLS);
+        assert_eq!(vm.mouse_mapping.value, b'B' as u32);
+        assert_eq!(vm.data[128], b'Z');
+        assert!(vm.respond_scenario(decode("library")).is_err());
+    }
+
+    #[test]
+    fn invalid_pop_and_return_cleanup_keep_stack_and_location() {
+        let mut code = instruction(0x2f8, &immediate(7));
+        code.extend(instruction(0x2f9, &[0xff]));
+        let mut vm = BinaryVm::new("bad-pop.scn", code).unwrap();
+        vm.step().unwrap();
+        let pc = vm.pc;
+        assert!(vm.step().is_err());
+        assert_eq!((vm.sp, vm.pc), (999, pc));
+        assert_eq!(vm.banks[&8][999], 7);
+
+        let mut code = instruction(0x262, &[0x84, 32, 0, 0, 0]);
+        code.resize(32, 0);
+        code.extend(instruction(0x26d, &immediate(1)));
+        let mut vm = BinaryVm::new("bad-return.scn", code).unwrap();
+        vm.step().unwrap();
+        let stack = vm.banks[&8].clone();
+        assert!(vm.step().is_err());
+        assert_eq!((vm.sp, vm.pc), (998, 32));
+        assert_eq!(vm.banks[&8], stack);
     }
 
     #[test]
