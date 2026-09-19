@@ -432,7 +432,9 @@ pub struct BinaryVm {
     background_mode: u32,
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
-    pending_text_style: Option<crate::text::TextStyle>,
+    /// Line-start X, current X, current Y in the default text context.
+    text_cursor: [u32; 3],
+    pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -485,6 +487,7 @@ impl BinaryVm {
             pending_timer: None,
             task_timers: Default::default(),
             text_style: Default::default(),
+            text_cursor: [0; 3],
             pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
@@ -700,8 +703,11 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
-        if let Some(mut style) = self.pending_text_style.take() {
-            style.character_epoch = value;
+        if let Some((mut style, clock)) = self.pending_text_style.take() {
+            match clock {
+                crate::text::TextClock::Character => style.character_epoch = value,
+                crate::text::TextClock::Wait => style.wait_epoch = value,
+            }
             self.text_style = style;
         }
         let value = match self.pending_timer.take() {
@@ -1828,8 +1834,16 @@ impl BinaryVm {
                     ))
                 })?;
                 bytes.push(0);
-                for (source, length) in [(format_address, format.len() + 1), (arguments, argument_bytes)] {
-                    ensure!(length == 0 || u64::from(destination) + bytes.len() as u64 <= u64::from(source) || u64::from(source) + length as u64 <= u64::from(destination), "overlapping format buffers are unresolved");
+                for (source, length) in [
+                    (format_address, format.len() + 1),
+                    (arguments, argument_bytes),
+                ] {
+                    ensure!(
+                        length == 0
+                            || u64::from(destination) + bytes.len() as u64 <= u64::from(source)
+                            || u64::from(source) + length as u64 <= u64::from(destination),
+                        "overlapping format buffers are unresolved"
+                    );
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
             }
@@ -1871,6 +1885,22 @@ impl BinaryVm {
                 let epoch = *self.task_timers.get(&self.current_task).unwrap_or(&0);
                 request = Some(PlatformRequest::WaitTaskTimer { epoch, duration });
             }
+            0x0078 | 0x007a => {
+                let x = self.read(&mut cursor)?;
+                let y = self.read(&mut cursor)?;
+                let start_x = if opcode == 0x007a {
+                    self.read(&mut cursor)?
+                } else {
+                    x
+                };
+                self.text_cursor = [start_x, x, y];
+            }
+            0x0079 => {
+                let x = self.destination(&mut cursor)?;
+                let y = self.destination(&mut cursor)?;
+                writes.push((x, self.text_cursor[1]));
+                writes.push((y, self.text_cursor[2]));
+            }
             0x0084 => {
                 let surface = self.read(&mut cursor)?;
                 ensure!(
@@ -1879,8 +1909,8 @@ impl BinaryVm {
                 );
                 let controls = self.string_bytes(self.read(&mut cursor)?)?;
                 let (style, clock_read) = self.text_style.configure(&controls)?;
-                if clock_read {
-                    self.pending_text_style = Some(style);
+                if let Some(clock) = clock_read {
+                    self.pending_text_style = Some((style, clock));
                     request = Some(PlatformRequest::ClockMilliseconds);
                 } else {
                     self.text_style = style;
@@ -3774,6 +3804,85 @@ mod tests {
         assert!(vm.step().is_err());
         assert_eq!(vm.pc, 0);
         assert_eq!(vm.text_style, crate::text::TextStyle::default());
+    }
+
+    #[test]
+    fn text_cursor_matches_original_and_rejects_partial_operands() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/text-cursor-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("cursor.scn", code).unwrap();
+            for expected in case["snapshots"].as_array().unwrap() {
+                vm.step().unwrap();
+                assert_eq!(
+                    serde_json::json!({"cursor":vm.text_cursor,
+                    "mouse":vm.mouse_mapping.value,"next_offset":vm.pc}),
+                    *expected
+                );
+            }
+        }
+        for opcode in [0x78, 0x79, 0x7a] {
+            let args = if opcode == 0x79 {
+                vec![12, 0, 0]
+            } else {
+                immediate(40)
+            };
+            let mut vm = BinaryVm::new("bad-cursor.scn", instruction(opcode, &args)).unwrap();
+            vm.text_cursor = [10, 20, 30];
+            assert!(vm.step().is_err());
+            assert_eq!(vm.text_cursor, [10, 20, 30]);
+            assert_eq!(vm.banks[&12][0], 0);
+            assert_eq!(vm.pc, 0);
+        }
+    }
+
+    #[test]
+    fn array_format_matches_original_dispatcher_and_wine_and_validates_memory() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/format-array-probe.json"
+        ))
+        .unwrap();
+        let decode = |value: &serde_json::Value| {
+            let hex = value.as_str().unwrap();
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut vm = BinaryVm::new("format.scn", decode(&case["code"])).unwrap();
+            vm.step().unwrap();
+            assert_eq!(vm.pc as u64, case["next_offset"].as_u64().unwrap());
+            let buffer = decode(&case["buffer"]);
+            assert_eq!(&vm.data[252..252 + buffer.len()], buffer);
+        }
+        for (destination, arguments, format) in [
+            (500, 128, "%99i"),
+            (256, 510, "%i"),
+            (128, 128, "%i"),
+            (256, 128, "%s"),
+        ] {
+            let mut args = vec![0x84];
+            args.extend((destination as u32).to_le_bytes());
+            args.push(0x10);
+            args.extend(format.as_bytes());
+            args.push(0);
+            args.push(0x84);
+            args.extend((arguments as u32).to_le_bytes());
+            let mut code = instruction(0x2da, &args);
+            code.resize(512, 0xa5);
+            let mut vm = BinaryVm::new("bad-format.scn", code.clone()).unwrap();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.data, code);
+            assert_eq!(vm.pc, 0);
+        }
     }
 
     #[test]

@@ -1,6 +1,12 @@
 //! Verified non-drawing subset of the engine's inline text controls.
 use anyhow::{Result, ensure};
 
+#[derive(Debug, Clone, Copy)]
+pub enum TextClock {
+    Character,
+    Wait,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TextStyle {
     pub color: [u8; 3],
@@ -18,6 +24,12 @@ pub struct TextStyle {
     pub fullwidth_spaces: bool,
     pub character_delay: u32,
     pub character_epoch: u32,
+    pub wait_epoch: u32,
+    pub font_face: Vec<u8>,
+    pub skip_mask: u32,
+    pub background_mode: u32,
+    pub outline_rasterizer: bool,
+    pub punctuation: [Vec<u8>; 3],
 }
 impl Default for TextStyle {
     fn default() -> Self {
@@ -37,16 +49,22 @@ impl Default for TextStyle {
             fullwidth_spaces: false,
             character_delay: 0,
             character_epoch: 0,
+            wait_epoch: 0,
+            font_face: b"\x82l\x82r \x83S\x83V\x83b\x83N".to_vec(),
+            skip_mask: 0,
+            background_mode: 1,
+            outline_rasterizer: false,
+            punctuation: Default::default(),
         }
     }
 }
 impl TextStyle {
     /// Validate the complete control stream before changing the retained style.
-    pub fn configure(&self, bytes: &[u8]) -> Result<(Self, bool)> {
+    pub fn configure(&self, bytes: &[u8]) -> Result<(Self, Option<TextClock>)> {
         ensure!(bytes.len() <= 65536, "text controls exceed 64 KiB");
         let mut result = self.clone();
         let mut at = 0;
-        let mut clock_read = false;
+        let mut clock_read = None;
         while at < bytes.len() {
             ensure!(
                 bytes.get(at) == Some(&b'_') && bytes.get(at + 1).is_some(),
@@ -56,13 +74,41 @@ impl TextStyle {
             at += 2;
             match command {
                 b'e' => result.effects = number(bytes, &mut at)?,
-                b'w' => {
+                b'w' | b'W' => {
                     ensure!(
-                        !clock_read,
+                        clock_read.is_none(),
                         "multiple timed text controls in one stream are unresolved"
                     );
-                    result.character_delay = number(bytes, &mut at)?;
-                    clock_read = true;
+                    let delay = number(bytes, &mut at)?;
+                    if command == b'w' {
+                        result.character_delay = delay;
+                        clock_read = Some(TextClock::Character);
+                    } else {
+                        ensure!(delay == 0, "nonzero inline text waits are unresolved");
+                        clock_read = Some(TextClock::Wait);
+                    }
+                }
+                b'F' => result.font_face = string_parameter(bytes, &mut at)?,
+                b's' => result.skip_mask = number(bytes, &mut at)? & 255,
+                b'T' => result.background_mode = 1,
+                b'O' => result.background_mode = 2,
+                b'q' => {
+                    result.outline_rasterizer = match bytes.get(at) {
+                        Some(b'+') => true,
+                        Some(b'-') => false,
+                        _ => anyhow::bail!("numeric font quality control is unresolved"),
+                    };
+                    at += 1;
+                }
+                b'P' => {
+                    result.punctuation[0] = string_parameter(bytes, &mut at)?;
+                    for index in 1..3 {
+                        if bytes.get(at) != Some(&b'/') {
+                            break;
+                        }
+                        at += 1;
+                        result.punctuation[index] = string_parameter(bytes, &mut at)?;
+                    }
                 }
                 b'E' => {
                     for component in &mut result.edge_color {
@@ -116,6 +162,24 @@ impl TextStyle {
     }
 }
 
+fn string_parameter(bytes: &[u8], at: &mut usize) -> Result<Vec<u8>> {
+    let start = *at;
+    while *at < bytes.len() && bytes[*at] != b'/' {
+        ensure!(*at - start < 254, "text-control string exceeds 254 bytes");
+        ensure!(bytes[*at] != 0, "embedded NUL in text controls");
+        *at += 1;
+    }
+    let result = bytes[start..*at].to_vec();
+    ensure!(
+        result.len() < 254 || *at == bytes.len(),
+        "continuation after a 254-byte text-control string is unresolved"
+    );
+    if bytes.get(*at) == Some(&b'/') {
+        *at += 1;
+    }
+    Ok(result)
+}
+
 fn number(bytes: &[u8], at: &mut usize) -> Result<u32> {
     while bytes.get(*at) == Some(&b' ') {
         *at += 1;
@@ -167,6 +231,10 @@ mod tests {
             b"_c{v},2,3",
             b"_ca",
             b"_C1,2,3",
+            b"_W1",
+            b"_q3",
+            b"_w1_W0",
+            b"_Pabc\0",
         ] {
             assert!(style.configure(bytes).is_err());
             assert_eq!(style, TextStyle::default());
