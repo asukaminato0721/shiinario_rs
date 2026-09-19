@@ -183,6 +183,9 @@ pub enum Event {
         name: String,
         sha256: String,
     },
+    AssetSizesReply {
+        sizes: [u32; 2],
+    },
     PointReply {
         point: [i32; 2],
         simulated: bool,

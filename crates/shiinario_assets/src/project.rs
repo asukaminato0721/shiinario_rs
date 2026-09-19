@@ -1,4 +1,4 @@
-use crate::{Archive, compression::MAX_OUTPUT};
+use crate::{Archive, Entry, compression::MAX_OUTPUT};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
@@ -199,6 +199,15 @@ impl Project {
     /// Search WARC basenames in the order registered by the binary scenario.
     /// Missing archives are skipped, as registration itself does not open them.
     pub fn read_with_archives(&self, name: &str, paths: &[String]) -> Result<Vec<u8>> {
+        let (archive, entry) = self.registered_entry(name, paths)?;
+        archive.read(entry)
+    }
+    /// Original WARC index fields, in decoded-size / stored-size order.
+    pub fn sizes_with_archives(&self, name: &str, paths: &[String]) -> Result<[u32; 2]> {
+        let (_, entry) = self.registered_entry(name, paths)?;
+        Ok([entry.unpacked_size, entry.size])
+    }
+    fn registered_entry(&self, name: &str, paths: &[String]) -> Result<(&Archive, &Entry)> {
         let key = normalize(name)?;
         let basename = key.rsplit('/').next().unwrap();
         for path in paths {
@@ -212,7 +221,7 @@ impl Project {
                     .is_some_and(|key| key == archive_key)
             }) && let Some(entry) = archive.find(basename)
             {
-                return archive.read(entry);
+                return Ok((archive, entry));
             }
         }
         bail!("asset not found in registered archives: {name}")
@@ -287,6 +296,72 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_size_queries_preserve_registered_order_and_case_folding() {
+        let root = PathBuf::from("/synthetic");
+        let entry = |unpacked_size, size| Entry {
+            name: "A001.TXT".into(),
+            offset: 4096,
+            size,
+            unpacked_size,
+            filetime: 0,
+            flags: 0,
+        };
+        let project = Project {
+            root: root.clone(),
+            config: Config {
+                source: root.join("game.ini"),
+                version: String::new(),
+                width: 800,
+                height: 600,
+                startup: String::new(),
+                archive: String::new(),
+                values: Default::default(),
+            },
+            archives: vec![
+                Archive {
+                    path: root.join("first.war"),
+                    entries: vec![entry(17, 25)],
+                },
+                Archive {
+                    path: root.join("second.war"),
+                    entries: vec![entry(100, 64)],
+                },
+            ],
+            files: Default::default(),
+        };
+        assert_eq!(
+            project
+                .sizes_with_archives(
+                    "story\\a001.txt",
+                    &[
+                        "MISSING.WAR".into(),
+                        "FIRST.WAR".into(),
+                        "second.war".into()
+                    ]
+                )
+                .unwrap(),
+            [17, 25]
+        );
+        assert_eq!(
+            project
+                .sizes_with_archives("a001.txt", &["second.war".into(), "first.war".into()])
+                .unwrap(),
+            [100, 64]
+        );
+        assert!(project.sizes_with_archives("a001.txt", &[]).is_err());
+        assert!(
+            project
+                .sizes_with_archives("a002.txt", &["first.war".into()])
+                .is_err()
+        );
+        assert!(
+            project
+                .sizes_with_archives("../a001.txt", &["first.war".into()])
+                .is_err()
+        );
+    }
+
     #[test]
     fn windows_paths() {
         assert_eq!(normalize("BG\\Bg01a.S25").unwrap(), "bg/bg01a.s25");

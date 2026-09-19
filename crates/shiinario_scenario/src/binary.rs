@@ -113,6 +113,13 @@ pub enum PlatformRequest {
         address: u32,
         flags: u32,
     },
+    AssetSizes {
+        name: String,
+    },
+    ReadAssetInto {
+        name: String,
+        address: u32,
+    },
     LoadAsset {
         name: String,
     },
@@ -391,6 +398,7 @@ pub struct BinaryVm {
     pending_bytes: Option<u32>,
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
+    pending_sizes: Option<[Destination; 2]>,
     context_flags: u32,
     message_mode: u32,
     background_mode: u32,
@@ -443,6 +451,7 @@ impl BinaryVm {
             pending_bytes: None,
             pending_bounds: None,
             pending_point: None,
+            pending_sizes: None,
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -600,6 +609,10 @@ impl BinaryVm {
     /// response return the same request, without executing the next instruction.
     pub fn respond(&mut self, value: u32) -> Result<()> {
         ensure!(
+            self.pending_sizes.is_none(),
+            "platform request requires asset sizes"
+        );
+        ensure!(
             self.pending_point.is_none(),
             "platform request requires a point reply"
         );
@@ -617,6 +630,7 @@ impl BinaryVm {
                     request,
                     PlatformRequest::LoadScenario { .. }
                         | PlatformRequest::LoadAsset { .. }
+                        | PlatformRequest::ReadAssetInto { .. }
                         | PlatformRequest::SurfacePixels { .. }
                 ),
                 "asset/scenario loading requires a byte-buffer reply"
@@ -916,6 +930,33 @@ impl BinaryVm {
         for (destination, value) in destinations.into_iter().zip(bounds) {
             self.write(destination, value as u32);
         }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn respond_asset_sizes(&mut self, sizes: [u32; 2]) -> Result<()> {
+        let destinations = self
+            .pending_sizes
+            .take()
+            .context("no pending asset sizes query")?;
+        for (destination, value) in destinations.into_iter().zip(sizes) {
+            self.write(destination, value);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn respond_asset_into(&mut self, bytes: &[u8]) -> Result<()> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::ReadAssetInto { address, .. },
+                ..
+            },
+            _,
+        )) = &self.pending
+        else {
+            bail!("no pending asset read into memory");
+        };
+        let range = self.memory_range(*address, bytes.len())?;
+        self.memory_write(range, bytes);
         self.pending = None;
         Ok(())
     }
@@ -1279,6 +1320,7 @@ impl BinaryVm {
         let mut byte_destination = None;
         let mut bounds_destinations = None;
         let mut point_destinations = None;
+        let mut size_destinations = None;
         let mut next_base = self.script_base;
         let mut definition = None;
         let mut rescan = false;
@@ -1536,6 +1578,20 @@ impl BinaryVm {
                 ensure!(id < 256, "image slot {id} out of bounds");
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadImage { id, name });
+            }
+            0x0158 => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                size_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+                request = Some(PlatformRequest::AssetSizes { name });
+            }
+            0x00c8 => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                let address = self.read(&mut cursor)?;
+                self.memory_range(address, 0)?;
+                request = Some(PlatformRequest::ReadAssetInto { name, address });
             }
             0x00c9 => {
                 let name = self.string(self.read(&mut cursor)?)?;
@@ -2323,6 +2379,7 @@ impl BinaryVm {
         self.pc = cursor.pc;
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
+        self.pending_sizes = size_destinations;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
         }
@@ -2376,6 +2433,64 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn file_metadata_and_reads_match_original_and_reject_destination_overflow() {
+        let probe: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/file-read-probe.json"
+        ))
+        .unwrap();
+        let decode = |hex: &str| {
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
+        };
+        for case in probe["cases"].as_array().unwrap() {
+            let mut vm = BinaryVm::new("file.scn", decode(case["code"].as_str().unwrap())).unwrap();
+            vm.allocations.insert(0x20006000, vec![0xa5; 80]);
+            let event = vm.step().unwrap();
+            assert_eq!(vm.step().unwrap(), event);
+            assert!(vm.respond(0).is_err());
+            assert_eq!(vm.step().unwrap(), event);
+            if case["missing"].as_bool().unwrap() {
+                continue;
+            }
+            match event {
+                Event::Platform {
+                    request: PlatformRequest::AssetSizes { name },
+                    ..
+                } => {
+                    assert_eq!(name, "fixture.bin");
+                    assert!(vm.respond_asset_into(&[1]).is_err());
+                    let sizes = [
+                        case["sizes"][0].as_u64().unwrap() as u32,
+                        case["sizes"][1].as_u64().unwrap() as u32,
+                    ];
+                    vm.respond_asset_sizes(sizes).unwrap();
+                    assert_eq!([vm.banks[&12][0], vm.banks[&12][1]], sizes);
+                }
+                Event::Platform {
+                    request: PlatformRequest::ReadAssetInto { name, address },
+                    ..
+                } => {
+                    assert_eq!((name.as_str(), address), ("fixture.bin", 0x20006000));
+                    assert!(vm.respond_asset_sizes([1, 2]).is_err());
+                    assert!(vm.respond_asset_into(&[0; 81]).is_err());
+                    assert_eq!(vm.memory_read(address, 80).unwrap(), vec![0xa5; 80]);
+                    let data: Vec<_> = (0..case["length"].as_u64().unwrap() as u8).collect();
+                    vm.respond_asset_into(&data).unwrap();
+                    assert_eq!(
+                        vm.memory_read(address, 80).unwrap(),
+                        decode(case["destination"].as_str().unwrap())
+                    );
+                }
+                _ => panic!("unexpected file event"),
+            }
+            assert_eq!(vm.pc as u64, case["next_offset"].as_u64().unwrap());
+            assert!(vm.pending.is_none());
+        }
     }
 
     #[test]

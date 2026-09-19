@@ -112,6 +112,9 @@ impl Resources {
         }
         Ok(resources)
     }
+    pub fn asset_sizes(&self, project: &Project, name: &str) -> Result<[u32; 2]> {
+        project.sizes_with_archives(name, &self.archives)
+    }
     pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
         project.read_with_archives(name, &self.archives)
     }

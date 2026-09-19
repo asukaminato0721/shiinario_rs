@@ -237,6 +237,36 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::AssetSizes { name } = &request {
+                let sizes = resources.asset_sizes(project, name).with_context(|| {
+                    format!(
+                        "{}:{:#x}: asset sizes {name}",
+                        location.scenario, location.offset
+                    )
+                })?;
+                vm.respond_asset_sizes(sizes)?;
+                emit(&Event::AssetSizesReply { sizes })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ReadAssetInto { name, .. } = &request {
+                let bytes = resources.read_asset(project, name).with_context(|| {
+                    format!(
+                        "{}:{:#x}: read asset {name}",
+                        location.scenario, location.offset
+                    )
+                })?;
+                vm.respond_asset_into(&bytes).with_context(|| {
+                    format!(
+                        "{}:{:#x}: asset destination",
+                        location.scenario, location.offset
+                    )
+                })?;
+                emit(&Event::PlatformReply {
+                    value: bytes.len() as u32,
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::LoadAsset { name } = &request {
                 let bytes = resources.read_asset(project, name).with_context(|| {
                     format!(
