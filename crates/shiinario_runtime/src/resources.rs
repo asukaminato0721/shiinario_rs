@@ -23,6 +23,7 @@ pub struct Frame {
     pub x: i32,
     pub y: i32,
     pub surface: Surface,
+    methods: Vec<u8>,
 }
 pub struct Sound {
     pub sample_rate: u32,
@@ -241,6 +242,7 @@ impl Resources {
                 Ok(Frame {
                     x: frame.info.x,
                     y: frame.info.y,
+                    methods: frame.methods,
                     surface: Surface {
                         width: frame.info.width,
                         height: frame.info.height,
@@ -248,9 +250,21 @@ impl Resources {
                     },
                 })
             }
-            Image::Mutable { frames, .. } => Ok(Frame {
+            Image::Mutable {
+                frames,
+                bytes_per_pixel,
+            } => Ok(Frame {
                 x: 0,
                 y: 0,
+                methods: vec![
+                    if *bytes_per_pixel == 3 { 2 } else { 4 };
+                    frames
+                        .get(index)
+                        .context("image frame out of bounds")?
+                        .rgba
+                        .len()
+                        / 4
+                ],
                 surface: frames
                     .get(index)
                     .context("image frame out of bounds")?
@@ -340,9 +354,18 @@ impl Resources {
         let mut pixels = destination.pixels.read(0, destination.pixels.len())?;
         for item in ordered {
             ensure!(
-                item.flags == 0x8000_0000 && item.extra[1] == 0,
+                (item.flags == 0x8000_0000 || item.flags & !0x1ff == 0xc000_0000)
+                    && item.extra[1] == 0,
                 "unsupported image drawing flags or extra operands"
             );
+            let weight = if item.flags & 0x4000_0000 != 0 {
+                (item.flags & 0x1ff).min(256) as i32
+            } else {
+                256
+            };
+            if weight == 0 {
+                continue;
+            }
             let exists = match self
                 .images
                 .get(&item.image)
@@ -367,12 +390,22 @@ impl Resources {
                         + (x - left) as usize)
                         * 4;
                     let rgba = &frame.surface.rgba[src..src + 4];
+                    let method = frame.methods[src / 4];
+                    if !matches!(method, 2..=5) {
+                        continue;
+                    }
                     let dst = y as usize * destination.stride + x as usize * 3;
-                    let alpha = i32::from(rgba[3]);
+                    // The original scalar lookup table rounds to nearest,
+                    // with exact halves rounded down (4435a4).
+                    let alpha = (i32::from(rgba[3]) * weight + 127) >> 8;
                     for channel in 0..3 {
                         let source = rgba[2 - channel];
                         let old = pixels[dst + channel];
-                        pixels[dst + channel] = if alpha == 255 {
+                        pixels[dst + channel] = if method <= 3 && weight < 256 {
+                            (((i32::from(source) * weight + 127) >> 8)
+                                + ((i32::from(old) * (256 - weight) + 127) >> 8))
+                                as u8
+                        } else if alpha == 255 && method != 5 {
                             source
                         } else {
                             (i32::from(old) + (((i32::from(source) - i32::from(old)) * alpha) >> 8))
@@ -877,7 +910,7 @@ mod tests {
             let mut vm = BinaryVm::new("draw.scn", decode(&case["code"])).unwrap();
             let mut resources = Resources::default();
             resources.create_surface(3, 8, 4, 0).unwrap();
-            resources.load_image(30, decode(&fixture["s25"])).unwrap();
+            resources.load_image(30, decode(&case["s25"])).unwrap();
             let memory = resources.surface_memory(3).unwrap();
             memory.write(0, &decode(&case["initial"])).unwrap();
             for state in case["states"].as_array().unwrap() {
@@ -914,7 +947,10 @@ mod tests {
                 );
                 assert_eq!(
                     memory.read(0, memory.len()).unwrap(),
-                    decode(&state["pixels"])
+                    decode(&state["pixels"]),
+                    "code {} s25 {}",
+                    case["code"],
+                    case["s25"]
                 );
             }
         }

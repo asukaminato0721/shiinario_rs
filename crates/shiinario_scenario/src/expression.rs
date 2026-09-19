@@ -1,7 +1,11 @@
-//! Verified integer subset of inline expression operands (tag 11).
+//! Verified arithmetic subset shared by inline operands and command 03de.
 use anyhow::{Context, Result, bail, ensure};
 
 pub fn evaluate(bytes: &[u8], variable: impl Fn(&[u8]) -> Result<u32>) -> Result<u32> {
+    Ok(evaluate_real(bytes, variable)? as i64 as u32)
+}
+
+pub fn evaluate_real(bytes: &[u8], variable: impl Fn(&[u8]) -> Result<u32>) -> Result<f64> {
     ensure!(bytes.len() <= 4096, "expression exceeds 4096 bytes");
     let mut parser = Parser {
         bytes,
@@ -15,7 +19,7 @@ pub fn evaluate(bytes: &[u8], variable: impl Fn(&[u8]) -> Result<u32>) -> Result
         "unsupported expression syntax at byte {}",
         parser.at
     );
-    Ok(value as u32)
+    Ok(value)
 }
 struct Parser<'a, F> {
     bytes: &'a [u8],
@@ -32,16 +36,15 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
             self.at += 1;
         }
     }
-    fn checked(value: Option<i64>) -> Result<i64> {
-        let value = value.context("expression integer overflow")?;
-        // These integers are exact in the native parser's double temporaries.
+    fn checked(value: f64) -> Result<f64> {
+        ensure!(value.is_finite(), "nonfinite expression result");
         ensure!(
-            value.unsigned_abs() <= (1u64 << 53),
-            "expression exceeds exact integer range"
+            value.abs() < (1u64 << 53) as f64,
+            "expression exceeds supported numeric range"
         );
         Ok(value)
     }
-    fn sum(&mut self, depth: usize) -> Result<i64> {
+    fn sum(&mut self, depth: usize) -> Result<f64> {
         let mut value = self.product(depth)?;
         loop {
             self.spaces();
@@ -52,24 +55,31 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
             self.at += 1;
             let rhs = self.product(depth)?;
             value = Self::checked(if op == Some(b'+') {
-                value.checked_add(rhs)
+                value + rhs
             } else {
-                value.checked_sub(rhs)
+                value - rhs
             })?;
         }
     }
-    fn product(&mut self, depth: usize) -> Result<i64> {
+    fn product(&mut self, depth: usize) -> Result<f64> {
         let mut value = self.atom(depth)?;
         loop {
             self.spaces();
-            if self.bytes.get(self.at) != Some(&b'*') {
+            let op = self.bytes.get(self.at).copied();
+            if !matches!(op, Some(b'*' | b'/')) {
                 return Ok(value);
             }
             self.at += 1;
-            value = Self::checked(value.checked_mul(self.atom(depth)?))?;
+            let rhs = self.atom(depth)?;
+            value = Self::checked(if op == Some(b'*') {
+                value * rhs
+            } else {
+                ensure!(rhs != 0.0, "expression division by zero");
+                value / rhs
+            })?;
         }
     }
-    fn atom(&mut self, depth: usize) -> Result<i64> {
+    fn atom(&mut self, depth: usize) -> Result<f64> {
         ensure!(depth < 64, "expression nesting exceeds 64");
         self.spaces();
         let byte = *self
@@ -78,7 +88,7 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
             .context("missing expression operand")?;
         self.at += 1;
         match byte {
-            b'-' => Self::checked(self.atom(depth + 1)?.checked_neg()),
+            b'-' => Self::checked(-self.atom(depth + 1)?),
             b'(' => {
                 let value = self.sum(depth + 1)?;
                 self.spaces();
@@ -87,7 +97,12 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
                     "missing expression closing parenthesis"
                 );
                 self.at += 1;
-                Ok(value)
+                if self.bytes.get(self.at) == Some(&b'i') {
+                    self.at += 1;
+                    Ok(f64::from(value as i64 as i32))
+                } else {
+                    Ok(value)
+                }
             }
             b'{' => {
                 let start = self.at;
@@ -106,21 +121,42 @@ impl<F: Fn(&[u8]) -> Result<u32>> Parser<'_, F> {
                 );
                 let name = &self.bytes[start..self.at];
                 self.at += 1;
-                Ok(i64::from((self.variable)(name)?))
+                let value = (self.variable)(name)?;
+                let value = match self.bytes.get(self.at) {
+                    Some(b'i') => {
+                        self.at += 1;
+                        f64::from(value as i32)
+                    }
+                    Some(b'f') => {
+                        self.at += 1;
+                        f64::from(f32::from_bits(value))
+                    }
+                    _ => f64::from(value),
+                };
+                Self::checked(value)
             }
             b'0'..=b'9' => {
-                let mut value = i64::from(byte - b'0');
+                let mut value = f64::from(byte - b'0');
                 loop {
                     self.spaces();
                     let Some(byte @ b'0'..=b'9') = self.bytes.get(self.at) else {
                         break;
                     };
-                    value = Self::checked(
-                        value
-                            .checked_mul(10)
-                            .and_then(|v| v.checked_add(i64::from(*byte - b'0'))),
-                    )?;
+                    value = Self::checked(value * 10.0 + f64::from(*byte - b'0'))?;
                     self.at += 1;
+                }
+                if self.bytes.get(self.at) == Some(&b'.') {
+                    self.at += 1;
+                    let mut place = 0.1;
+                    loop {
+                        self.spaces();
+                        let Some(byte @ b'0'..=b'9') = self.bytes.get(self.at) else {
+                            break;
+                        };
+                        value = Self::checked(value + f64::from(*byte - b'0') * place)?;
+                        place *= 0.1;
+                        self.at += 1;
+                    }
                 }
                 Ok(value)
             }
@@ -136,8 +172,8 @@ mod tests {
     fn rejects_unsupported_syntax_missing_variables_and_unbounded_work() {
         for bytes in [
             b"".as_slice(),
-            b"1/2",
-            b"1.5",
+            b"1/0",
+            b"1%2",
             b"{array[1]}",
             b"{missing}",
             b"1=2",

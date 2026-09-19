@@ -1800,6 +1800,22 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)? as u8;
                 memory_write = Some((self.memory_range(address, 1)?, vec![value]));
             }
+            0x03de => {
+                let expression = self.string_bytes(self.read(&mut cursor)?)?;
+                let value = crate::expression::evaluate_real(&expression, |name| {
+                    let address = self.named_address(name)?;
+                    Ok(u32::from_le_bytes(
+                        self.memory_read(address, 4)?.as_slice().try_into()?,
+                    ))
+                })?;
+                let mode = cursor.byte()?;
+                let value = if mode == 0 {
+                    (value as f32).to_bits()
+                } else {
+                    value as i64 as u32
+                };
+                writes.push((self.destination(&mut cursor)?, value));
+            }
             0x02d0 => {
                 let length = self.string_bytes(self.read(&mut cursor)?)?.len() as u32;
                 writes.push((self.destination(&mut cursor)?, length));
@@ -2229,7 +2245,9 @@ impl BinaryVm {
                         1,
                     )?[0];
                     let right = self.memory_read(
-                        right.checked_add(index).context("string address overflow")?,
+                        right
+                            .checked_add(index)
+                            .context("string address overflow")?,
                         1,
                     )?[0];
                     if left != right {
