@@ -1,0 +1,22 @@
+{
+  "v236": {
+    "sha256": "9e625e66e302ba64356b357db42e2716dfdf4aa2c614cc6887b4a56361676a85",
+    "setter": "0x428d40",
+    "getter": "0x428b00",
+    "observations": [
+      38,
+      39,
+      7,
+      40,
+      39,
+      39,
+      99
+    ],
+    "new_globals": 3
+  },
+  "v247": {
+    "sha256": "76545839bb10de0670063d92aa1797a07957f5f48e6ef2a54784a880c68a823e",
+    "setter": "0x4352c0",
+    "missing_name_result": 0
+  }
+}

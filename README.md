@@ -1,13 +1,14 @@
 # shiinario_rs
 
 An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47.
-**Full-route gameplay is not complete yet.** The Linux winit/wgpu host displays
+
+**Full-route gameplay is not complete yet but is mostly usable**
+The Linux winit/wgpu host displays
 an 800×600 title screen, plays music and effects through CPAL, and enters the story
 with Japanese text and transitions. The title pixels match the original x86 renderer.
 Native and headless hosts share the same interpreter and resources. Native text uses
 Fontconfig and an installed Japanese font; the fallback glyphs differ from Windows.
 MPEG-1/2 movies play with audio, including pause, resume, seek and loop controls.
-Complete menu/choice coverage and compatible saves remain unfinished.
 
 Native playback defaults to best effort: identified optional presentation operations
 print `SKIP` with their scenario location. Currently this approximates image-frame text, omits affine/pixelation filters,

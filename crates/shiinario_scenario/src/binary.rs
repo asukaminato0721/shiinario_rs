@@ -395,6 +395,7 @@ enum Destination {
     Discard,
     Bank(u8, usize),
     Memory(u32, usize),
+    NewGlobal([u8; 32]),
 }
 
 enum MemoryRange {
@@ -567,6 +568,7 @@ pub struct BinaryVm {
     window_callback: Option<(u32, usize, u32)>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
+    global_scope: Option<NamedScope>,
     retired_scopes: std::collections::BTreeSet<u32>,
     parameters: Vec<u32>,
     registry_root: u32,
@@ -648,6 +650,7 @@ impl BinaryVm {
             window_callback: None,
             ended: false,
             named_scopes: Vec::new(),
+            global_scope: None,
             retired_scopes: Default::default(),
             parameters: Vec::new(),
             registry_root: 0,
@@ -1035,7 +1038,7 @@ impl BinaryVm {
             self.ended = true;
         }
         if let Some(destination) = destination {
-            self.write(destination, value);
+            self.write(destination, value)?;
         }
         if let Event::Platform {
             request:
@@ -1095,7 +1098,7 @@ impl BinaryVm {
         };
         // Write while the previous region still exists: the script may have
         // placed the destination inside the region being replaced.
-        self.write(destination, address);
+        self.write(destination, address)?;
         if let Some(old) = old.filter(|old| *old != address) {
             self.shared_regions.remove(&old);
         }
@@ -1154,7 +1157,7 @@ impl BinaryVm {
         );
         let address = self.allocation_address(data.len())?;
         self.allocations.insert(address, data);
-        self.write(destination, address);
+        self.write(destination, address)?;
         self.pending = None;
         Ok(address)
     }
@@ -1274,7 +1277,7 @@ impl BinaryVm {
             .take()
             .context("no pending image bounds query")?;
         for (destination, value) in destinations.into_iter().zip(bounds) {
-            self.write(destination, value as u32);
+            self.write(destination, value as u32)?;
         }
         self.pending = None;
         Ok(())
@@ -1282,7 +1285,7 @@ impl BinaryVm {
     pub fn respond_file_open(&mut self, values: [u32; 4]) -> Result<()> {
         let destinations = self.pending_file.take().context("no pending file open")?;
         for (destination, value) in destinations.into_iter().zip(values) {
-            self.write(destination, value);
+            self.write(destination, value)?;
         }
         self.pending = None;
         Ok(())
@@ -1309,7 +1312,7 @@ impl BinaryVm {
         let range = self.memory_range(*address, bytes.len())?;
         self.memory_write(range, bytes);
         if let Some(destination) = destination {
-            self.write(destination, bytes.len() as u32);
+            self.write(destination, bytes.len() as u32)?;
         }
         self.pending = None;
         Ok(())
@@ -1386,7 +1389,7 @@ impl BinaryVm {
             .take()
             .context("no pending calendar query")?;
         for (destination, value) in destinations.into_iter().zip(values) {
-            self.write(destination, value);
+            self.write(destination, value)?;
         }
         self.pending = None;
         Ok(())
@@ -1417,7 +1420,7 @@ impl BinaryVm {
             .take()
             .context("no pending asset sizes query")?;
         for (destination, value) in destinations.into_iter().zip(sizes) {
-            self.write(destination, value);
+            self.write(destination, value)?;
         }
         self.pending = None;
         Ok(())
@@ -1444,7 +1447,7 @@ impl BinaryVm {
             .take()
             .context("no pending point query")?;
         for (destination, value) in destinations.into_iter().zip(point) {
-            self.write(destination, value as u32);
+            self.write(destination, value as u32)?;
         }
         self.pending = None;
         Ok(())
@@ -1476,6 +1479,17 @@ impl BinaryVm {
             }
             0x12 | 0x13 => {
                 let name = cursor.variable_name()?;
+                // v2.36's scalar setter (428d40) creates a global when no
+                // local or global matches. v2.47's 4352c0 does not. Indirect
+                // destinations still require an existing pointer variable.
+                if tag & 0x7f == 0x12
+                    && self.version == EngineVersion::V2_36
+                    && self.find_named_address(&name).is_none()
+                {
+                    let mut key = [0; 32];
+                    key[..name.len()].copy_from_slice(&name);
+                    return Ok(Destination::NewGlobal(key));
+                }
                 let mut address = self.named_address(&name)?;
                 if tag & 0x7f == 0x13 {
                     address = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
@@ -1668,18 +1682,56 @@ impl BinaryVm {
         ))
     }
     fn named_address(&self, name: &[u8]) -> Result<u32> {
-        for scope in self.named_scopes.iter().rev() {
+        self.find_named_address(name).with_context(|| {
+            format!(
+                "undefined named variable {:?}",
+                String::from_utf8_lossy(name)
+            )
+        })
+    }
+    fn find_named_address(&self, name: &[u8]) -> Option<u32> {
+        for scope in self.named_scopes.iter().rev().chain(&self.global_scope) {
             if let Some(index) = scope.names.iter().position(|n| n == name) {
-                return Ok(scope.allocation + (index as u32 * 40) + 32);
+                return Some(scope.allocation + (index as u32 * 40) + 32);
             }
         }
-        bail!(
-            "undefined named variable {:?}",
-            String::from_utf8_lossy(name)
-        )
+        None
     }
-    fn write(&mut self, destination: Destination, value: u32) {
+    fn write(&mut self, destination: Destination, value: u32) -> Result<()> {
         match destination {
+            Destination::NewGlobal(key) => {
+                if self.global_scope.is_none() {
+                    // A single native-sized table gives globals stable
+                    // addresses shared by every task and scenario.
+                    let allocation = self.allocation_address(CELLS * 40)?;
+                    self.allocations.insert(allocation, vec![0; CELLS * 40]);
+                    self.global_scope = Some(NamedScope {
+                        allocation,
+                        names: Vec::new(),
+                    });
+                }
+                let name = &key[..key.iter().position(|&b| b == 0).unwrap()];
+                let scope = self.global_scope.as_mut().unwrap();
+                // One platform reply can write the same new name more than
+                // once. Resolve it again when committing the write.
+                let index = match scope.names.iter().position(|n| n == name) {
+                    Some(index) => index,
+                    None => {
+                        ensure!(scope.names.len() < CELLS, "global variable table is full");
+                        let index = scope.names.len();
+                        scope.names.push(name.to_vec());
+                        index
+                    }
+                };
+                let bytes = self
+                    .allocations
+                    .get_mut(&scope.allocation)
+                    .context("global variable table was freed")?;
+                let record = &mut bytes[index * 40..(index + 1) * 40];
+                record[..32].copy_from_slice(&key);
+                record[32..36].copy_from_slice(&value.to_le_bytes());
+                record[36..40].copy_from_slice(&1u32.to_le_bytes());
+            }
             Destination::Bank(bank, index) => {
                 self.banks.get_mut(&bank).unwrap()[index] =
                     if bank == 6 { value & 1 } else { value }
@@ -1693,6 +1745,7 @@ impl BinaryVm {
             }
             Destination::Discard => {}
         }
+        Ok(())
     }
     fn bank_index(&self, bank: u8, index: u16) -> Result<usize> {
         let index = usize::from(index) + if bank == 8 { self.sp } else { 0 };
@@ -3480,17 +3533,19 @@ impl BinaryVm {
                 let address = self.operand_address(tag, &mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, address));
             }
-            0x0391 | 0x0392 => {
+            0x0391 | 0x0392 | 0x03a2 => {
                 let saved = cursor.pc;
                 let value = self.read(&mut cursor)?;
                 cursor.pc = saved;
                 let destination = self.destination(&mut cursor)?;
                 writes.push((
                     destination,
-                    if opcode == 0x0391 {
-                        value.wrapping_add(1)
-                    } else {
-                        value.wrapping_sub(1)
+                    match opcode {
+                        0x0391 => value.wrapping_add(1),
+                        0x0392 => value.wrapping_sub(1),
+                        // v2.36 4158e0 and v2.47 41cbe0 take signed abs
+                        // in place; INT_MIN retains its 0x80000000 bits.
+                        _ => (value as i32).wrapping_abs() as u32,
                     },
                 ));
             }
@@ -3646,7 +3701,7 @@ impl BinaryVm {
             }
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
-        self.pc = cursor.pc;
+        let next_pc = cursor.pc;
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
@@ -3664,8 +3719,9 @@ impl BinaryVm {
             self.collect_retired_scopes();
         }
         for (destination, value) in writes {
-            self.write(destination, value);
+            self.write(destination, value)?;
         }
+        self.pc = next_pc;
         if let Some((id, base, pc)) = definition {
             self.define_task(id, base, pc, false);
         }
