@@ -22,6 +22,10 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    LoadScenario {
+        id: u32,
+        name: String,
+    },
     InitializeAudio {
         flags: u32,
     },
@@ -121,6 +125,7 @@ enum Destination {
 
 enum MemoryRange {
     Script(std::ops::Range<usize>),
+    Scenario(u32, std::ops::Range<usize>),
     Bank(u8, std::ops::Range<usize>),
     Heap(u32, std::ops::Range<usize>),
 }
@@ -132,6 +137,10 @@ fn bank_base(tag: u8) -> u32 {
 struct NamedScope {
     allocation: u32,
     names: Vec<Vec<u8>>,
+}
+struct Scenario {
+    name: String,
+    data: Vec<u8>,
 }
 
 struct Cursor<'a> {
@@ -189,6 +198,9 @@ impl Cursor<'_> {
 pub struct BinaryVm {
     name: String,
     data: Vec<u8>,
+    script_base: u32,
+    scenarios: std::collections::BTreeMap<u32, Scenario>,
+    next_scenario_base: u32,
     pc: usize,
     steps: usize,
     mouse_mapping: MouseButtonMapping,
@@ -210,7 +222,7 @@ pub struct BinaryVm {
     next_allocation: u32,
     // Defined but inactive task entry points. Activation/scheduling remains a
     // separate operation; unsupported activation instructions still stop.
-    task_entries: std::collections::BTreeMap<u32, usize>,
+    task_entries: std::collections::BTreeMap<u32, (u32, usize)>,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
@@ -228,6 +240,9 @@ impl BinaryVm {
         Ok(Self {
             name: name.into(),
             data,
+            script_base: SCRIPT_BASE,
+            scenarios: Default::default(),
+            next_scenario_base: 0x4000_0000,
             pc: 0,
             steps: 0,
             mouse_mapping: MouseButtonMapping::default(),
@@ -284,6 +299,10 @@ impl BinaryVm {
             "platform request requires a byte-string reply"
         );
         if let Some((Event::Platform { location, request }, _)) = &self.pending {
+            ensure!(
+                !matches!(request, PlatformRequest::LoadScenario { .. }),
+                "scenario loading requires respond_scenario"
+            );
             if matches!(
                 request,
                 PlatformRequest::CreateSurface { .. }
@@ -321,6 +340,73 @@ impl BinaryVm {
             self.write(destination, value);
         }
         Ok(())
+    }
+    /// Install scenario bytes requested by 0002 without executing its entry.
+    pub fn respond_scenario(&mut self, data: Vec<u8>) -> Result<()> {
+        let Some((
+            Event::Platform {
+                request: PlatformRequest::LoadScenario { id, name },
+                ..
+            },
+            _,
+        )) = &self.pending
+        else {
+            bail!("no pending scenario load");
+        };
+        ensure!(
+            !data.is_empty() && data.len() <= 16 * 1024 * 1024,
+            "invalid scenario size"
+        );
+        let total = self.data.len()
+            + self.scenarios.values().map(|s| s.data.len()).sum::<usize>()
+            + data.len();
+        ensure!(
+            total <= 256 * 1024 * 1024,
+            "scenario memory exceeds 256 MiB"
+        );
+        let base = self.next_scenario_base;
+        let next = base
+            .checked_add((data.len() as u32 + 4095) & !4095)
+            .filter(|&address| address <= 0x7000_0000)
+            .context("scenario address space exhausted")?;
+        self.scenarios.insert(
+            base,
+            Scenario {
+                name: name.clone(),
+                data,
+            },
+        );
+        self.task_entries.insert(*id, (base, 0));
+        self.next_scenario_base = next;
+        self.pending = None;
+        Ok(())
+    }
+    fn scenario_size(&self, base: u32) -> Result<usize> {
+        if base == self.script_base {
+            Ok(self.data.len())
+        } else {
+            Ok(self
+                .scenarios
+                .get(&base)
+                .context("unknown scenario base")?
+                .data
+                .len())
+        }
+    }
+    fn switch_scenario(&mut self, base: u32) {
+        if base == self.script_base {
+            return;
+        }
+        let scenario = self
+            .scenarios
+            .remove(&base)
+            .expect("validated scenario base");
+        let old = Scenario {
+            name: std::mem::replace(&mut self.name, scenario.name),
+            data: std::mem::replace(&mut self.data, scenario.data),
+        };
+        self.scenarios.insert(self.script_base, old);
+        self.script_base = base;
     }
     pub fn respond_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         let address = self
@@ -369,7 +455,7 @@ impl BinaryVm {
                 if tag & 0x7f == 0x13 {
                     address = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
                     if tag & 0x80 != 0 {
-                        address = address.wrapping_add(SCRIPT_BASE);
+                        address = address.wrapping_add(self.script_base);
                     }
                 }
                 self.memory_range(address, 4)?;
@@ -383,7 +469,7 @@ impl BinaryVm {
         let tag = cursor.byte()?;
         if tag & 0x40 != 0 {
             return match tag & 0x3f {
-                4 => Ok(SCRIPT_BASE.wrapping_add(cursor.dword()?)),
+                4 => Ok(self.script_base.wrapping_add(cursor.dword()?)),
                 bank @ (2 | 6 | 8 | 10 | 12 | 14) => {
                     let index = self.bank_index(bank, cursor.word()?)?;
                     Ok(bank_base(bank) + (index * if bank == 6 { 1 } else { 4 }) as u32)
@@ -406,7 +492,7 @@ impl BinaryVm {
                 })?
             }
             0x10 if tag == 0x10 => {
-                let address = SCRIPT_BASE + cursor.pc as u32;
+                let address = self.script_base + cursor.pc as u32;
                 let size = cursor.data[cursor.pc..]
                     .iter()
                     .position(|&b| b == 0)
@@ -427,7 +513,8 @@ impl BinaryVm {
                 let address = self.named_address(&cursor.variable_name()?)?;
                 let value = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
                 if tag & 0x7f == 0x13 {
-                    let address = value.wrapping_add(if tag & 0x80 != 0 { SCRIPT_BASE } else { 0 });
+                    let address =
+                        value.wrapping_add(if tag & 0x80 != 0 { self.script_base } else { 0 });
                     return Ok(u32::from_le_bytes(
                         self.memory_read(address, 4)?.try_into().unwrap(),
                     ));
@@ -437,7 +524,7 @@ impl BinaryVm {
             _ => bail!("unsupported operand tag {tag:#04x} at {start:#x}"),
         };
         Ok(if tag & 0x80 != 0 {
-            value.wrapping_add(SCRIPT_BASE)
+            value.wrapping_add(self.script_base)
         } else {
             value
         })
@@ -507,7 +594,7 @@ impl BinaryVm {
             self.banks[&bank][index]
         };
         Ok((
-            address.wrapping_add(if tag & 0x80 != 0 { SCRIPT_BASE } else { 0 }),
+            address.wrapping_add(if tag & 0x80 != 0 { self.script_base } else { 0 }),
             if base == 7 { 1 } else { 4 },
         ))
     }
@@ -521,8 +608,13 @@ impl BinaryVm {
             let end = start.checked_add(len)?;
             (end <= size).then_some(start..end)
         };
-        if let Some(r) = range(SCRIPT_BASE, self.data.len()) {
+        if let Some(r) = range(self.script_base, self.data.len()) {
             return Ok(MemoryRange::Script(r));
+        }
+        if let Some((&base, scenario)) = self.scenarios.range(..=address).next_back()
+            && let Some(r) = range(base, scenario.data.len())
+        {
+            return Ok(MemoryRange::Scenario(base, r));
         }
         for &bank in self.banks.keys() {
             if let Some(r) = range(bank_base(bank), CELLS * if bank == 6 { 1 } else { 4 }) {
@@ -539,6 +631,7 @@ impl BinaryVm {
     fn memory_read(&self, address: u32, len: usize) -> Result<Vec<u8>> {
         Ok(match self.memory_range(address, len)? {
             MemoryRange::Script(r) => self.data[r].to_vec(),
+            MemoryRange::Scenario(base, r) => self.scenarios[&base].data[r].to_vec(),
             MemoryRange::Heap(base, r) => self.allocations[&base][r].to_vec(),
             MemoryRange::Bank(bank, r) => r
                 .map(|index| {
@@ -554,6 +647,9 @@ impl BinaryVm {
     fn memory_write(&mut self, range: MemoryRange, bytes: &[u8]) {
         match range {
             MemoryRange::Script(r) => self.data[r].copy_from_slice(bytes),
+            MemoryRange::Scenario(base, r) => {
+                self.scenarios.get_mut(&base).unwrap().data[r].copy_from_slice(bytes)
+            }
             MemoryRange::Heap(base, r) => {
                 self.allocations.get_mut(&base).unwrap()[r].copy_from_slice(bytes)
             }
@@ -616,11 +712,21 @@ impl BinaryVm {
         let mut response_destination = None;
         let mut memory_write = None;
         let mut byte_destination = None;
+        let mut next_base = self.script_base;
         let mut event = Event::BinaryInstruction {
             location: location.clone(),
             opcode,
         };
         match opcode {
+            0x0002 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(
+                    id > 0 && id < CELLS as u32,
+                    "unsupported scenario task slot {id}"
+                );
+                let name = self.string(self.read(&mut cursor)?)?;
+                request = Some(PlatformRequest::LoadScenario { id, name });
+            }
             0x06a6 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "sound slot {id} out of bounds");
@@ -842,7 +948,7 @@ impl BinaryVm {
             0x0258 => {
                 let address = self.read(&mut cursor)?;
                 let target = address
-                    .checked_sub(SCRIPT_BASE)
+                    .checked_sub(self.script_base)
                     .context("jump address outside scenario")?
                     as usize;
                 ensure!(
@@ -900,43 +1006,80 @@ impl BinaryVm {
             }
             0x0034 => request = Some(PlatformRequest::PumpMessages),
             0x0a8d => request = Some(PlatformRequest::DisableIme),
-            0x0262 => {
-                let address = self.read(&mut cursor)?;
-                let target = address
-                    .checked_sub(SCRIPT_BASE)
-                    .context("call address outside scenario")?
-                    as usize;
+            0x02f8 => {
+                let value = self.read(&mut cursor)?;
+                ensure!(self.sp > 0, "stack overflow pushing operand");
+                self.sp -= 1;
+                writes.push((Destination::Bank(8, self.sp), value));
+            }
+            0x02f9 => {
+                ensure!(self.sp < CELLS, "stack underflow popping operand");
+                let value = self.banks[&8][self.sp];
+                // Destination operands see the stack after the pop. Restore
+                // the pointer until validation succeeds, including indirects.
+                self.sp += 1;
+                let destination = self.destination(&mut cursor);
+                self.sp -= 1;
+                writes.push((destination?, value));
+                self.sp += 1;
+            }
+            0x0262 | 0x0267 => {
+                let operand = self.read(&mut cursor)?;
+                let (base, target) = if opcode == 0x0267 {
+                    *self
+                        .task_entries
+                        .get(&operand)
+                        .with_context(|| format!("call to undefined task {operand}"))?
+                } else {
+                    (
+                        self.script_base,
+                        operand
+                            .checked_sub(self.script_base)
+                            .context("call address outside scenario")?
+                            as usize,
+                    )
+                };
                 ensure!(
-                    target < self.data.len(),
+                    target < self.scenario_size(base)?,
                     "call target {target:#x} outside scenario"
                 );
                 ensure!(self.sp >= 2, "call stack overflow");
-                writes.push((Destination::Bank(8, self.sp - 1), SCRIPT_BASE));
+                writes.push((Destination::Bank(8, self.sp - 1), self.script_base));
                 writes.push((
                     Destination::Bank(8, self.sp - 2),
-                    SCRIPT_BASE + cursor.pc as u32,
+                    self.script_base + cursor.pc as u32,
                 ));
                 self.sp -= 2;
                 cursor.pc = target;
+                next_base = base;
             }
-            0x026c => {
+            0x026c | 0x026d => {
                 ensure!(self.sp <= CELLS - 2, "return stack underflow");
                 let address = self.banks[&8][self.sp];
                 let base = self.banks[&8][self.sp + 1];
-                ensure!(
-                    base == SCRIPT_BASE,
-                    "return to unsupported script base {base:#x}"
-                );
                 let target = address
-                    .checked_sub(SCRIPT_BASE)
+                    .checked_sub(base)
                     .context("return address outside scenario")?
                     as usize;
                 ensure!(
-                    target < self.data.len(),
+                    target < self.scenario_size(base)?,
                     "return target {target:#x} outside scenario"
                 );
+                let count = if opcode == 0x026d {
+                    self.sp += 2;
+                    let count = self.read(&mut cursor);
+                    self.sp -= 2;
+                    count? as usize
+                } else {
+                    0
+                };
+                let next_sp = (self.sp + 2)
+                    .checked_add(count)
+                    .filter(|&sp| sp <= CELLS)
+                    .context("return argument stack underflow")?;
                 cursor.pc = target;
-                self.sp += 2;
+                self.sp = next_sp;
+                next_base = base;
             }
             0x000c => {
                 let task = self.read(&mut cursor)?;
@@ -946,14 +1089,14 @@ impl BinaryVm {
                 );
                 let address = self.read(&mut cursor)?;
                 let target = address
-                    .checked_sub(SCRIPT_BASE)
+                    .checked_sub(self.script_base)
                     .context("task address outside scenario")?
                     as usize;
                 ensure!(
                     target < self.data.len(),
                     "task target {target:#x} outside scenario"
                 );
-                self.task_entries.insert(task, target);
+                self.task_entries.insert(task, (self.script_base, target));
             }
             0x076c | 0x076d | 0x078a | 0x07e4 => {
                 let task = self.read(&mut cursor)?;
@@ -1124,6 +1267,7 @@ impl BinaryVm {
         for (destination, value) in writes {
             self.write(destination, value);
         }
+        self.switch_scenario(next_base);
         self.steps += 1;
         if let Some(request) = request {
             event = Event::Platform { location, request };

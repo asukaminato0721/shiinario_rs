@@ -45,6 +45,9 @@ pub struct Resources {
     archives: Vec<String>,
 }
 impl Resources {
+    pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
+        project.read_with_archives(name, &self.archives)
+    }
     pub fn register_archive(&mut self, name: &str) {
         if !self
             .archives

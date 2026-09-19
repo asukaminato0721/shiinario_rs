@@ -51,6 +51,20 @@ pub fn trace_with_platform(
                         location.offset
                     );
                 }
+                if let PlatformRequest::LoadScenario { name, .. } = &request {
+                    let bytes = resources.read_asset(project, name).with_context(|| {
+                        format!(
+                            "{}:{:#x}: load scenario {name}",
+                            location.scenario, location.offset
+                        )
+                    })?;
+                    vm.respond_scenario(bytes)?;
+                    emit(&Event::PlatformReply {
+                        value: 1,
+                        simulated: false,
+                    })?;
+                    continue;
+                }
                 if matches!(&request, PlatformRequest::ProjectDirectory)
                     || matches!(&request, PlatformRequest::ReadRegistryString { root: 0x80000001, path, name } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "DataPath")
                 {
