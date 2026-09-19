@@ -22,8 +22,41 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
-    InitializeAudio { flags: u32 },
+    InitializeAudio {
+        flags: u32,
+    },
     InitializeGraphics,
+    ReleaseGraphics,
+    SetFullscreen {
+        enabled: bool,
+    },
+    CreateSurface {
+        id: u32,
+        width: u32,
+        height: u32,
+        flags: u32,
+    },
+    CpuFeatures,
+    LoadImage {
+        id: u32,
+        name: String,
+    },
+    CreateImage {
+        id: u32,
+        width: u32,
+        height: u32,
+        bytes_per_pixel: u32,
+        frames: u32,
+    },
+    FillImage {
+        id: u32,
+        frame: u32,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        color: u32,
+    },
     /// Low 32 bits of the host monotonic clock in milliseconds.
     ClockMilliseconds,
     ReadIniInteger {
@@ -180,6 +213,9 @@ pub struct BinaryVm {
     registry_path: String,
     ini_path: String,
     pending_bytes: Option<u32>,
+    context_flags: u32,
+    message_mode: u32,
+    archive_paths: Vec<String>,
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -215,6 +251,9 @@ impl BinaryVm {
             registry_path: String::new(),
             ini_path: String::new(),
             pending_bytes: None,
+            context_flags: 1,
+            message_mode: 0,
+            archive_paths: Vec::new(),
         })
     }
     pub fn location(&self) -> Location {
@@ -239,6 +278,28 @@ impl BinaryVm {
             self.pending_bytes.is_none(),
             "platform request requires a byte-string reply"
         );
+        if let Some((Event::Platform { location, request }, _)) = &self.pending {
+            if matches!(
+                request,
+                PlatformRequest::CreateSurface { .. }
+                    | PlatformRequest::LoadImage { .. }
+                    | PlatformRequest::CreateImage { .. }
+                    | PlatformRequest::FillImage { .. }
+            ) {
+                ensure!(
+                    value != 0,
+                    "{}:{:#x}: resource operation failed: {request:?}",
+                    location.scenario,
+                    location.offset
+                );
+            }
+            if matches!(
+                request,
+                PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics
+            ) {
+                ensure!(value <= 1, "device initialization requires a Boolean reply");
+            }
+        }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
         if matches!(
             event,
@@ -554,10 +615,113 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x055a => {
+                request = Some(PlatformRequest::CreateImage {
+                    id: self.read(&mut cursor)?,
+                    width: self.read(&mut cursor)?,
+                    height: self.read(&mut cursor)?,
+                    bytes_per_pixel: self.read(&mut cursor)?,
+                    frames: self.read(&mut cursor)?,
+                });
+            }
+            0x055b => {
+                request = Some(PlatformRequest::FillImage {
+                    id: self.read(&mut cursor)?,
+                    frame: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)?,
+                    y: self.read(&mut cursor)?,
+                    width: self.read(&mut cursor)?,
+                    height: self.read(&mut cursor)?,
+                    color: self.read(&mut cursor)?,
+                });
+            }
+            0x04b0 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot {id} out of bounds");
+                let name = self.string(self.read(&mut cursor)?)?;
+                request = Some(PlatformRequest::LoadImage { id, name });
+            }
+            0x00dd => {
+                ensure!(
+                    self.archive_paths.len() < 256,
+                    "archive search list exceeds 256 entries"
+                );
+                let address = self.read(&mut cursor)?;
+                let mut bytes = self.string_bytes(address)?;
+                ensure!(
+                    bytes.is_ascii(),
+                    "non-ASCII archive path case mapping is unresolved"
+                );
+                ensure!(bytes.len() < 260, "archive path exceeds engine buffer");
+                bytes.make_ascii_lowercase();
+                let name = String::from_utf8(bytes.clone())?;
+                bytes.push(0);
+                memory_write = Some((self.memory_range(address, bytes.len())?, bytes));
+                if !self.archive_paths.contains(&name) {
+                    self.archive_paths.push(name.clone());
+                }
+                event = Event::ArchiveSearchPath {
+                    location: location.clone(),
+                    name,
+                };
+            }
+            0x0032 => self.message_mode = 0,
+            0x0a5c => {
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::CpuFeatures);
+            }
+            0x0033 => self.message_mode = 1,
+            0x001e => self.context_flags |= 4,
+            0x001f => self.context_flags &= !4,
+            0x02ee => {
+                let selector = self.read(&mut cursor)?;
+                ensure!(self.sp > 0, "stack overflow saving execution mode");
+                let value = match selector {
+                    0 => self.context_flags & 4,
+                    1 => self.message_mode,
+                    _ => 0,
+                };
+                self.sp -= 1;
+                writes.push((Destination::Bank(8, self.sp), value));
+            }
+            0x02ef => {
+                let selector = self.read(&mut cursor)?;
+                ensure!(self.sp < CELLS, "stack underflow restoring execution mode");
+                let value = self.banks[&8][self.sp];
+                self.sp += 1;
+                match selector {
+                    0 => self.context_flags |= value,
+                    1 => self.message_mode = value,
+                    _ => {}
+                }
+            }
+            0x0776 => {
+                request = Some(PlatformRequest::SetFullscreen {
+                    enabled: self.read(&mut cursor)? != 0,
+                })
+            }
+            0x06c3 => request = Some(PlatformRequest::ReleaseGraphics),
+            0x0546 => {
+                let operand = self.read(&mut cursor)?;
+                let (id, flags) = if operand & 0x8000_0000 != 0 {
+                    (operand & 0x3fff_ffff, operand & 0xc000_0000)
+                } else {
+                    (operand, 0)
+                };
+                ensure!(id < 256, "surface index {id} out of bounds");
+                request = Some(PlatformRequest::CreateSurface {
+                    id,
+                    width: self.viewport[0],
+                    height: self.viewport[1],
+                    flags,
+                });
+            }
             0x06a4 | 0x06c2 => {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(if opcode == 0x06a4 {
-                    PlatformRequest::InitializeAudio { flags: self.media_flags }
+                    PlatformRequest::InitializeAudio {
+                        flags: self.media_flags,
+                    }
                 } else {
                     PlatformRequest::InitializeGraphics
                 });
@@ -1005,6 +1169,7 @@ mod tests {
                     "thread_limit": vm.thread_limit, "override": vm.thread_limit_override,
                     "read_marker": vm.file_read_marker, "write_marker": vm.file_write_marker,
                     "media_flags": vm.media_flags, "save_encoding": vm.save_encoding,
+                    "context_flags": vm.context_flags, "message_mode": vm.message_mode,
                 });
                 assert_eq!(&actual, expected, "{} step {}", vm.name, vm.steps);
             }
@@ -1038,6 +1203,43 @@ mod tests {
         assert!(matches!(vm.step().unwrap(), Event::End));
         assert!(matches!(vm.step().unwrap(), Event::End));
         assert_eq!(vm.steps, 2);
+    }
+
+    #[test]
+    fn device_failure_is_written_but_resource_failure_stops() {
+        for opcode in [0x6a4, 0x6c2] {
+            let mut vm = BinaryVm::new("device.scn", instruction(opcode, &[12, 0, 0])).unwrap();
+            vm.step().unwrap();
+            assert!(vm.respond(2).is_err());
+            vm.respond(0).unwrap();
+            assert_eq!(vm.banks[&12][0], 0);
+        }
+        let mut vm = BinaryVm::new("surface.scn", instruction(0x546, &immediate(2))).unwrap();
+        let event = vm.step().unwrap();
+        assert!(
+            vm.respond(0)
+                .unwrap_err()
+                .to_string()
+                .contains("surface.scn:0x0")
+        );
+        assert_eq!(vm.step().unwrap(), event);
+        vm.respond(1).unwrap();
+    }
+
+    #[test]
+    fn archive_registration_lowercases_in_place_and_deduplicates() {
+        let first = instruction(0xdd, b"\x10DATA.WAR\0");
+        let mut code = first.clone();
+        code.extend(instruction(0xdd, b"\x10data.war\0"));
+        let mut vm = BinaryVm::new("archive.scn", code).unwrap();
+        vm.step().unwrap();
+        assert_eq!(&vm.data[3..first.len()], b"data.war\0");
+        vm.step().unwrap();
+        assert_eq!(vm.archive_paths, ["data.war"]);
+        let mut invalid =
+            BinaryVm::new("archive.scn", instruction(0xdd, b"\x10\x82\xa0\0")).unwrap();
+        assert!(invalid.step().is_err());
+        assert!(invalid.archive_paths.is_empty());
     }
 
     #[test]

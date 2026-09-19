@@ -9,3 +9,6 @@ anyhow.workspace = true
 shiinario_assets.workspace = true
 shiinario_scenario.workspace = true
 serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

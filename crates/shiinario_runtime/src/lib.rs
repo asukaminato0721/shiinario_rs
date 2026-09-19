@@ -1,4 +1,5 @@
 //! Host-independent project startup and deterministic research traces.
+pub mod resources;
 use anyhow::{Result, bail};
 use shiinario_assets::project::Project;
 use shiinario_scenario::{BinaryVm, Event, Input, PlatformRequest, TextScript, TextVm};
@@ -32,9 +33,13 @@ pub fn trace_with_platform(
         let mut vm = BinaryVm::new(name, data)?;
         vm.set_viewport(project.config.width, project.config.height)?;
         let mut platform = TracePlatform::default();
+        let mut resources = resources::Resources::default();
         for _ in 0..max_steps {
             let event = vm.step()?;
             emit(&event)?;
+            if let Event::ArchiveSearchPath { name, .. } = &event {
+                resources.register_archive(name);
+            }
             if matches!(event, Event::End) {
                 return Ok(());
             }
@@ -59,14 +64,17 @@ pub fn trace_with_platform(
                     vm.respond_bytes(&[])?;
                     continue;
                 }
-                let value = if let PlatformRequest::FileExists { path } = &request {
+                let resource_reply = resources.respond(project, &request)?;
+                let value = if let Some(value) = resource_reply {
+                    value
+                } else if let PlatformRequest::FileExists { path } = &request {
                     u32::from(project.loose_path_exists(path)?)
                 } else {
                     platform.respond(&request)?
                 };
                 emit(&Event::PlatformReply {
                     value,
-                    simulated: true,
+                    simulated: resource_reply.is_none(),
                 })?;
                 vm.respond(value)?;
             }
@@ -108,6 +116,9 @@ impl Default for TracePlatform {
 impl TracePlatform {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            // The portable trace reports no x86 rendering acceleration.
+            PlatformRequest::CpuFeatures => Ok(0),
+            PlatformRequest::ReleaseGraphics | PlatformRequest::SetFullscreen { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
             // Frozen until a trace supplies elapsed time explicitly.

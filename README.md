@@ -4,8 +4,9 @@ An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
 **This is not yet a playable port.** Asset decoding is verified against GARbro;
 binary scenario execution, native presentation, menus, choices, movies, and saves
 remain unfinished. Startup execution stops at an unresolved instruction or a platform request that
-has no host. The optional simulated-platform trace executes 88 startup instructions
-with offsets matching captured x86 execution, then stops at the message pump.
+has no host. The optional simulated-platform trace executes 316 startup instructions
+with offsets matching captured x86 execution, then stops at mutable image creation. Drawing buffers and the first S25 image
+are allocated/read by the Rust host; device and window replies remain simulated.
 
 The workspace builds independently of the reference checkouts:
 
@@ -59,9 +60,11 @@ research artifacts outside this repository. No alternative save format is create
 - `shiinario_scenario`: CP932 story parser, command inventory, bytecode research
   dumps, typed presentation events and deterministic input/timing for a limited
   text interpreter and the recovered binary startup subset: operand banks, bounded
-  memory, branches, calls, inactive task definitions, and platform requests.
+  memory, scoped scalar variables, branches, calls, strings, inactive task definitions,
+  and platform requests.
   Unsupported commands produce sticky errors with source context.
-- `shiinario_runtime`: host-independent startup and trace orchestration.
+- `shiinario_runtime`: host-independent startup and trace orchestration, bounded
+  drawing buffers, registered archive lookup and image slots with on-demand frames.
 - `shiinario_cli`: the engine and inspection tools. No native window backend yet.
 
 See [compatibility and validation](docs/COMPATIBILITY.md) for exact coverage and

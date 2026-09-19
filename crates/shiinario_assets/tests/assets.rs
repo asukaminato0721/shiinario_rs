@@ -61,6 +61,21 @@ fn project_lookup_and_cache_budget() {
         b"synthetic asset fixture\n"
     );
     assert!(project.read("..\\fixture.txt").is_err());
+    assert!(project.read_with_archives("fixture.txt", &[]).is_err());
+    assert_eq!(
+        project
+            .read_with_archives(
+                "D\\FIXTURE.TXT",
+                &["missing.war".into(), "FIXTURE.war".into()]
+            )
+            .unwrap(),
+        b"synthetic asset fixture\n"
+    );
+    assert!(
+        project
+            .read_with_archives("GAME.INI", &["fixture.war".into()])
+            .is_err()
+    );
     assert!(!project.loose_path_exists("fixture.txt").unwrap());
     assert!(!project.loose_path_exists("D\\GAME.INI").unwrap());
     assert!(project.loose_path_exists("game.ini").unwrap());

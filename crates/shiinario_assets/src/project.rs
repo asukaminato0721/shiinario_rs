@@ -196,6 +196,27 @@ impl Project {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
     }
+    /// Search WARC basenames in the order registered by the binary scenario.
+    /// Missing archives are skipped, as registration itself does not open them.
+    pub fn read_with_archives(&self, name: &str, paths: &[String]) -> Result<Vec<u8>> {
+        let key = normalize(name)?;
+        let basename = key.rsplit('/').next().unwrap();
+        for path in paths {
+            let archive_key = normalize(path)?;
+            if let Some(archive) = self.archives.iter().find(|archive| {
+                archive
+                    .path
+                    .strip_prefix(&self.root)
+                    .ok()
+                    .and_then(|relative| normalize(&relative.to_string_lossy()).ok())
+                    .is_some_and(|key| key == archive_key)
+            }) && let Some(entry) = archive.find(basename)
+            {
+                return archive.read(entry);
+            }
+        }
+        bail!("asset not found in registered archives: {name}")
+    }
     /// Filesystem-only lookup used by SCN GetFileAttributes checks. Archive
     /// entries and the archive basename fallback do not participate.
     pub fn loose_path_exists(&self, name: &str) -> Result<bool> {

@@ -151,6 +151,10 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
+    ArchiveSearchPath {
+        location: Location,
+        name: String,
+    },
     BinaryInstruction {
         location: Location,
         opcode: u16,
