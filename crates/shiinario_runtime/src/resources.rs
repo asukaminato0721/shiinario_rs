@@ -509,6 +509,13 @@ impl Resources {
         self.resident = resident;
         Ok(())
     }
+    fn release_image(&mut self, id: u32) -> Result<()> {
+        ensure!(id <= 256, "image release slot out of bounds");
+        if let Some(image) = self.images.remove(&id) {
+            self.resident -= image.size();
+        }
+        Ok(())
+    }
     fn load_image(&mut self, id: u32, data: Vec<u8>) -> Result<()> {
         ensure!(id < 256, "image slot out of bounds");
         image::frames(&data)?;
@@ -689,6 +696,7 @@ impl Resources {
                 height,
                 flags,
             } => self.create_surface(*id, *width, *height, *flags)?,
+            PlatformRequest::ReleaseImage { id } => self.release_image(*id)?,
             PlatformRequest::LoadImage { id, name } => {
                 let bytes = project.read_with_archives(name, &self.archives)?;
                 self.load_image(*id, bytes)?;
@@ -702,6 +710,52 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_release_matches_native_and_reclaims_budget() {
+        use shiinario_scenario::{BinaryVm, Event};
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/image-release-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let id = case["slot"].as_u64().unwrap() as u32;
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("release.scn", code).unwrap();
+            let mut resources = Resources::default();
+            resources.create_image(17, 2, 2, 4, 1).unwrap();
+            if id > 256 {
+                assert!(vm.step().is_err());
+                assert!(resources.release_image(id).is_err());
+                assert_eq!(resources.resident, 16);
+                continue;
+            }
+            if case["present"].as_bool().unwrap() {
+                // Insert synthetic storage directly to cover native's inclusive slot 256.
+                resources.images.insert(id, Image::Encoded(vec![0; 32]));
+                resources.resident += 32;
+            }
+            let event = vm.step().unwrap();
+            assert!(
+                matches!(&event, Event::Platform {request:PlatformRequest::ReleaseImage {id:actual},..} if *actual==id)
+            );
+            assert_eq!(vm.step().unwrap(), event);
+            resources.release_image(id).unwrap();
+            vm.respond(1).unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+            assert!(!resources.images.contains_key(&id));
+            assert_eq!(resources.resident, 16);
+            assert!(resources.frame(17, 0).is_ok());
+            resources.release_image(id).unwrap();
+            assert_eq!(resources.resident, 16);
+        }
+    }
     #[test]
     fn hit_testing_matches_original_rle_methods_layers_and_disabled_items() {
         use shiinario_scenario::{BinaryVm, Event};

@@ -130,6 +130,9 @@ pub enum PlatformRequest {
         flags: u32,
     },
     CpuFeatures,
+    ReleaseImage {
+        id: u32,
+    },
     LoadImage {
         id: u32,
         name: String,
@@ -1490,6 +1493,11 @@ impl BinaryVm {
                     items: self.draw_list.clone(),
                 });
             }
+            0x04b1 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id <= 256, "image release slot {id} out of bounds");
+                request = Some(PlatformRequest::ReleaseImage { id });
+            }
             0x04b0 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot {id} out of bounds");
@@ -2281,6 +2289,49 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn sound_commands_match_original_dispatcher() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../docs/validation/sound-probe.json"))
+                .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let hex = case["code"].as_str().unwrap();
+            let code = (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect();
+            let mut vm = BinaryVm::new("sound.scn", code).unwrap();
+            let value = case["value"].as_i64().unwrap() as u32;
+            let command = match case["opcode"].as_u64().unwrap() {
+                0x06a7 => SoundCommand::Play { flags: value },
+                0x06a8 => SoundCommand::Stop,
+                0x06a9 => SoundCommand::Volume {
+                    attenuation: value as i32,
+                },
+                0x06aa => SoundCommand::Pan {
+                    attenuation: value as i32,
+                },
+                0x06ab => SoundCommand::Frequency { hz: value },
+                0x06af => SoundCommand::Status,
+                _ => unreachable!(),
+            };
+            let event = vm.step().unwrap();
+            assert!(
+                matches!(&event, Event::Platform { request: PlatformRequest::Sound {id:23, command: actual},.. } if *actual == command)
+            );
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond(case["result"].as_u64().unwrap_or(1) as u32)
+                .unwrap();
+            assert_eq!(
+                vm.location().offset as u64,
+                case["next_offset"].as_u64().unwrap()
+            );
+            if command == SoundCommand::Status {
+                assert_eq!(vm.banks[&12][0], case["result"].as_u64().unwrap() as u32);
+            }
+        }
     }
 
     #[test]

@@ -114,7 +114,8 @@ impl Mixer {
             }),
         }
     }
-    /// Advance the synthetic host clock without generating discarded PCM.
+    /// Advance a synthetic host using a fixed 48 kHz output clock.
+    /// Do not mix this with rendering at a different output rate.
     pub fn advance_ms(&mut self, ms: u32) {
         let frames = u64::from(ms) * 48;
         for buffer in self.buffers.values_mut() {
@@ -386,6 +387,171 @@ mod tests {
         let handle = resources.create_audio_stream(&data, 0x21).unwrap();
         resources.audio_stream(handle).unwrap().clone()
     }
+    #[test]
+    fn static_buffers_restart_loop_stop_replace_and_mix_with_streams() {
+        let sound = Arc::new(Sound {
+            sample_rate: 1000,
+            channels: 1,
+            samples: vec![8192, 16384, -8192],
+        });
+        let mut mixer = Mixer::default();
+        assert_eq!(
+            mixer.sound_command(23, &SoundCommand::Status).unwrap(),
+            u32::MAX
+        );
+        assert_eq!(
+            mixer
+                .sound_command(23, &SoundCommand::Play { flags: 1 })
+                .unwrap(),
+            1
+        );
+        mixer.install_sound(23, sound.clone()).unwrap();
+        assert_eq!(mixer.sound_command(23, &SoundCommand::Status).unwrap(), 0);
+        mixer
+            .sound_command(23, &SoundCommand::Play { flags: 0 })
+            .unwrap();
+        let mut pcm = [0.0; 4];
+        mixer.render(&mut pcm, 1000, 1).unwrap();
+        assert_eq!(pcm, [0.25, 0.5, -0.25, 0.0]);
+        assert_eq!(mixer.sound_command(23, &SoundCommand::Status).unwrap(), 0);
+        mixer
+            .sound_command(23, &SoundCommand::Play { flags: 1 })
+            .unwrap();
+        mixer.render(&mut pcm, 1000, 1).unwrap();
+        assert_eq!(pcm, [0.25, 0.5, -0.25, 0.25]); // no OGV repeated-prefix quirk
+        assert_eq!(mixer.sound_command(23, &SoundCommand::Status).unwrap(), 5);
+        mixer
+            .sound_command(23, &SoundCommand::Play { flags: 0 })
+            .unwrap();
+        mixer.render(&mut pcm[..1], 1000, 1).unwrap();
+        assert_eq!(pcm[0], 0.25);
+        mixer.sound_command(23, &SoundCommand::Stop).unwrap();
+        assert_eq!(mixer.sound_command(23, &SoundCommand::Status).unwrap(), 0);
+        mixer
+            .sound_command(23, &SoundCommand::Play { flags: 1 })
+            .unwrap();
+        mixer.install_sound(23, sound).unwrap();
+        mixer.render(&mut pcm, 1000, 1).unwrap();
+        assert_eq!(pcm, [0.0; 4]);
+        let stream = Arc::new(AudioStream {
+            sound: Sound {
+                sample_rate: 1000,
+                channels: 1,
+                samples: vec![8192; 4],
+            },
+            loop_start_frame: 0,
+            first_block_frames: 1,
+            volume: StreamVolume::default(),
+        });
+        mixer.play(23, stream, 0).unwrap(); // same numeric handle uses separate channel
+        mixer
+            .sound_command(23, &SoundCommand::Play { flags: 0 })
+            .unwrap();
+        mixer.render(&mut pcm, 1000, 1).unwrap();
+        assert_eq!(pcm, [0.5, 0.75, 0.0, 0.25]);
+    }
+
+    #[test]
+    fn static_buffer_controls_and_headless_clock() {
+        let sound = Arc::new(Sound {
+            sample_rate: 22050,
+            channels: 2,
+            samples: vec![16384; 882],
+        });
+        let make = || {
+            let mut mixer = Mixer::default();
+            mixer.install_sound(1, sound.clone()).unwrap();
+            mixer
+                .sound_command(1, &SoundCommand::Play { flags: 1 })
+                .unwrap();
+            mixer
+        };
+        let mut mixer = make();
+        mixer
+            .sound_command(1, &SoundCommand::Volume { attenuation: -2000 })
+            .unwrap();
+        mixer
+            .sound_command(1, &SoundCommand::Pan { attenuation: 2000 })
+            .unwrap();
+        let mut pcm = [0.0; 2];
+        mixer.render(&mut pcm, 48000, 2).unwrap();
+        assert!((pcm[0] - 0.005).abs() < 1e-6 && (pcm[1] - 0.05).abs() < 1e-6);
+        mixer
+            .sound_command(
+                1,
+                &SoundCommand::Pan {
+                    attenuation: -10000,
+                },
+            )
+            .unwrap();
+        mixer.render(&mut pcm, 48000, 2).unwrap();
+        assert!((pcm[0] - 0.05).abs() < 1e-6 && pcm[1] == 0.0);
+        mixer
+            .sound_command(
+                1,
+                &SoundCommand::Volume {
+                    attenuation: -10000,
+                },
+            )
+            .unwrap();
+        mixer.render(&mut pcm, 48000, 2).unwrap();
+        assert_eq!(pcm, [0.0; 2]);
+        for hz in [100, 44100, 200000, 0] {
+            let mut fast = make();
+            let mut rendered = make();
+            let varying = Arc::new(Sound {
+                sample_rate: 22050,
+                channels: 1,
+                samples: (0..441).map(|i| (i * 73 - 16000) as i16).collect(),
+            });
+            for m in [&mut fast, &mut rendered] {
+                m.install_sound(1, varying.clone()).unwrap();
+                m.sound_command(1, &SoundCommand::Play { flags: 1 })
+                    .unwrap();
+                m.sound_command(1, &SoundCommand::Frequency { hz }).unwrap();
+            }
+            fast.advance_ms(37);
+            rendered
+                .render(&mut vec![0.0; 37 * 48 * 2], 48000, 2)
+                .unwrap();
+            let mut a = [0.0; 40];
+            let mut b = a;
+            fast.render(&mut a, 48000, 2).unwrap();
+            rendered.render(&mut b, 48000, 2).unwrap();
+            assert_eq!(a, b);
+        }
+        mixer
+            .sound_command(1, &SoundCommand::Play { flags: 0 })
+            .unwrap();
+        mixer
+            .sound_command(1, &SoundCommand::Frequency { hz: 44100 })
+            .unwrap();
+        mixer.advance_ms(9);
+        assert_eq!(mixer.sound_command(1, &SoundCommand::Status).unwrap(), 1);
+        mixer.advance_ms(1);
+        assert_eq!(mixer.sound_command(1, &SoundCommand::Status).unwrap(), 0);
+        assert!(
+            mixer
+                .sound_command(1, &SoundCommand::Frequency { hz: 99 })
+                .is_err()
+        );
+        assert!(
+            mixer
+                .sound_command(1, &SoundCommand::Pan { attenuation: 10001 })
+                .is_err()
+        );
+        assert!(
+            mixer
+                .sound_command(1, &SoundCommand::Volume { attenuation: 1 })
+                .is_err()
+        );
+        assert!(
+            mixer
+                .sound_command(1, &SoundCommand::Play { flags: 2 })
+                .is_err()
+        );
+    }
+
     #[test]
     fn matches_original_stream_pcm_including_loop_prefix() {
         let stream = synthetic();
