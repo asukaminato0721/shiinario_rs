@@ -142,6 +142,9 @@ fn main() -> Result<()> {
             let mut skips = std::collections::BTreeMap::<u16, usize>::new();
             let mut glyphs = 0usize;
             let mut events = 0usize;
+            let mut stories = Vec::new();
+            let mut scenarios = std::collections::BTreeSet::new();
+            scenarios.insert(name.clone());
             let result = shiinario_runtime::trace_with_options(
                 &p,
                 &name,
@@ -174,6 +177,23 @@ fn main() -> Result<()> {
                             request: PlatformRequest::DrawGlyph { .. },
                             ..
                         } => glyphs += 1,
+                        Event::Platform {
+                            request: PlatformRequest::LoadScenario { name, .. },
+                            ..
+                        } => {
+                            scenarios.insert(name.clone());
+                        }
+                        Event::Platform {
+                            request:
+                                PlatformRequest::LoadAsset { name }
+                                | PlatformRequest::ReadAssetInto { name, .. },
+                            ..
+                        } if name.to_ascii_lowercase().ends_with(".txt") => {
+                            if summary {
+                                eprintln!("STORY {name}");
+                            }
+                            stories.push(name.clone());
+                        }
                         _ => {}
                     }
                     if !summary {
@@ -186,7 +206,7 @@ fn main() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"events":events,"glyphs":glyphs,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))})
+                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))})
                     )?
                 );
             }

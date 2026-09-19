@@ -2,8 +2,8 @@
 use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::{
-    ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCopy,
-    SurfaceStretch,
+    ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCapture,
+    SurfaceCopy, SurfaceStretch,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -620,6 +620,49 @@ impl Resources {
         }
         Ok(())
     }
+    fn capture_surface(&mut self, capture: &SurfaceCapture) -> Result<()> {
+        let [width, height] = capture.size.map(i64::from);
+        ensure!(
+            [width, height].iter().all(|v| (0..=16384).contains(v)),
+            "invalid capture dimensions"
+        );
+        let src = self
+            .surfaces
+            .get(&capture.source.id)
+            .context("missing capture source")?;
+        let Some(Image::Mutable { frames, .. }) = self.images.get_mut(&capture.image) else {
+            anyhow::bail!("capture destination must be a mutable image");
+        };
+        let dst = frames
+            .get_mut(capture.frame as usize)
+            .context("missing capture frame")?;
+        let source = src.pixels.read(0, src.pixels.len())?;
+        let [dx, dy] = capture.destination.map(i64::from);
+        let sx = i64::from(capture.source.x);
+        let sy = i64::from(capture.source.y);
+        for y in 0.max(-dy).max(-sy)
+            ..height
+                .min(i64::from(dst.height) - dy)
+                .min(i64::from(src.height) - sy)
+        {
+            for x in 0.max(-dx).max(-sx)
+                ..width
+                    .min(i64::from(dst.width) - dx)
+                    .min(i64::from(src.width) - sx)
+            {
+                let read = (sy + y) as usize * src.stride + (sx + x) as usize * 3;
+                let write = ((dy + y) as usize * dst.width as usize + (dx + x) as usize) * 4;
+                dst.rgba[write..write + 4].copy_from_slice(&[
+                    source[read + 2],
+                    source[read + 1],
+                    source[read],
+                    255,
+                ]);
+            }
+        }
+        Ok(())
+    }
+
     fn stretch_surface(&mut self, stretch: &SurfaceStretch) -> Result<()> {
         ensure!(
             stretch.mode == 0xcc0020 || stretch.mode & 0x80000000 != 0,
@@ -893,6 +936,7 @@ impl Resources {
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
             PlatformRequest::StretchSurface(stretch) => self.stretch_surface(stretch)?,
+            PlatformRequest::CaptureSurface(capture) => self.capture_surface(capture)?,
             PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
@@ -938,6 +982,23 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn capture_clips_both_rectangles_and_converts_padded_bgr_to_rgba() {
+        use shiinario_scenario::SurfacePoint;
+        let mut resources = Resources::default();
+        resources.create_surface(2, 2, 2, 0).unwrap();
+        resources.surfaces[&2].pixels.write(0, &[1, 2, 3, 4, 5, 6, 99, 99, 7, 8, 9, 10, 11, 12, 99, 99]).unwrap();
+        resources.create_image(30, 2, 2, 4, 1).unwrap();
+        let operation = SurfaceCapture {
+            image: 30, frame: 0, destination: [-1, 0], size: [3, 3],
+            source: SurfacePoint { id: 2, x: 0, y: -1 },
+        };
+        resources.capture_surface(&operation).unwrap();
+        let Image::Mutable { frames, .. } = &resources.images[&30] else { panic!() };
+        assert_eq!(&frames[0].rgba[8..12], &[6, 5, 4, 255]);
+        assert_eq!(&frames[0].rgba[..8], &[0; 8]);
+        assert_eq!(&frames[0].rgba[12..], &[0; 4]);
+    }
     #[test]
     fn stretch_clips_destination_and_preserves_padding_and_failed_draws() {
         use shiinario_scenario::SurfacePoint;

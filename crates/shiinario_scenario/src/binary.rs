@@ -42,6 +42,14 @@ pub struct SurfaceCopy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceCapture {
+    pub image: u32,
+    pub frame: u32,
+    pub destination: [i32; 2],
+    pub size: [i32; 2],
+    pub source: SurfacePoint,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SurfaceStretch {
     pub destination: SurfacePoint,
     pub destination_size: [i32; 2],
@@ -125,6 +133,7 @@ pub enum PlatformRequest {
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
     StretchSurface(SurfaceStretch),
+    CaptureSurface(SurfaceCapture),
     MaskTransition(MaskTransition),
     SurfacePixels {
         id: u32,
@@ -1571,6 +1580,30 @@ impl BinaryVm {
                     second: (second != u32::MAX).then_some(second),
                     mask,
                     flags,
+                }));
+            }
+            0x055e => {
+                let image = self.read(&mut cursor)?;
+                let frame = self.read(&mut cursor)?;
+                let destination = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let source = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                request = Some(PlatformRequest::CaptureSurface(SurfaceCapture {
+                    image,
+                    frame,
+                    destination,
+                    size,
+                    source,
                 }));
             }
             0x051e => {

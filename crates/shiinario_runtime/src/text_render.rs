@@ -179,11 +179,11 @@ fn draw_mask(
             return;
         }
         let offset = y as usize * target.stride + x as usize * 3;
-        let alpha = ((u32::from(coverage) * 255 >> 6) * opacity >> 8) as i32;
+        let alpha = ((((u32::from(coverage) * 255) >> 6) * opacity) >> 8) as i32;
         for channel in 0..3 {
             let old = i32::from(pixels[offset + channel]);
             pixels[offset + channel] =
-                (old + ((i32::from(color[2 - channel]) - old) * alpha >> 8)) as u8;
+                (old + (((i32::from(color[2 - channel]) - old) * alpha) >> 8)) as u8;
         }
     };
     let mut stamp = |dx: i32, dy: i32, color: [u8; 3]| {
