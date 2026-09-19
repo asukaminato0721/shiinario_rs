@@ -406,6 +406,9 @@ pub struct BinaryVm {
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
     pending_sizes: Option<[Destination; 2]>,
+    // Some(true) resets this task's epoch; Some(false) reads elapsed time.
+    pending_timer: Option<bool>,
+    task_timers: std::collections::BTreeMap<u32, u32>,
     context_flags: u32,
     message_mode: u32,
     background_mode: u32,
@@ -459,6 +462,8 @@ impl BinaryVm {
             pending_bounds: None,
             pending_point: None,
             pending_sizes: None,
+            pending_timer: None,
+            task_timers: Default::default(),
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -666,6 +671,16 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        let value = match self.pending_timer.take() {
+            Some(true) => {
+                self.task_timers.insert(self.current_task, value);
+                value
+            }
+            Some(false) => {
+                value.wrapping_sub(*self.task_timers.get(&self.current_task).unwrap_or(&0))
+            }
+            None => value,
+        };
         if let Event::Platform {
             request: PlatformRequest::CreateAudioStream { address, .. },
             ..
@@ -1328,6 +1343,7 @@ impl BinaryVm {
         let mut bounds_destinations = None;
         let mut point_destinations = None;
         let mut size_destinations = None;
+        let mut timer_reply = None;
         let mut next_base = self.script_base;
         let mut definition = None;
         let mut rescan = false;
@@ -1753,8 +1769,15 @@ impl BinaryVm {
                     default,
                 });
             }
-            0x03bd => {
-                response_destination = Some(self.destination(&mut cursor)?);
+            0x03bb..=0x03bd => {
+                if opcode != 0x03bb {
+                    response_destination = Some(self.destination(&mut cursor)?);
+                }
+                timer_reply = match opcode {
+                    0x03bb => Some(true),
+                    0x03bc => Some(false),
+                    _ => None,
+                };
                 request = Some(PlatformRequest::ClockMilliseconds);
             }
             0x010e => {
@@ -2464,6 +2487,7 @@ impl BinaryVm {
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
+        self.pending_timer = timer_reply;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
         }
@@ -3170,18 +3194,31 @@ mod tests {
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
             let mut vm = BinaryVm::new(case["name"].as_str().unwrap(), code).unwrap();
-            for expected in case["states"].as_array().unwrap() {
-                if let Event::Platform {
-                    request: PlatformRequest::LoadAsset { .. },
-                    ..
-                } = vm.step().unwrap()
-                {
-                    let hex = case["asset"].as_str().unwrap();
-                    let data = (0..hex.len())
-                        .step_by(2)
-                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-                        .collect();
-                    vm.respond_asset(data).unwrap();
+            let mut clocks = case["clocks"].as_array().into_iter().flatten();
+            for (step, expected) in case["states"].as_array().unwrap().iter().enumerate() {
+                if let Some(task) = case["tasks"].get(step) {
+                    vm.current_task = task.as_u64().unwrap() as u32;
+                }
+                match vm.step().unwrap() {
+                    Event::Platform {
+                        request: PlatformRequest::ClockMilliseconds,
+                        ..
+                    } => {
+                        vm.respond(clocks.next().unwrap().as_u64().unwrap() as u32)
+                            .unwrap();
+                    }
+                    Event::Platform {
+                        request: PlatformRequest::LoadAsset { .. },
+                        ..
+                    } => {
+                        let hex = case["asset"].as_str().unwrap();
+                        let data = (0..hex.len())
+                            .step_by(2)
+                            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                            .collect();
+                        vm.respond_asset(data).unwrap();
+                    }
+                    _ => {}
                 }
                 let actual = serde_json::json!({
                     "pc": vm.pc, "mouse": vm.mouse_mapping.value, "sp": vm.sp,
