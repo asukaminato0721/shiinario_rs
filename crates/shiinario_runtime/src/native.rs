@@ -19,9 +19,11 @@ use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
     event::{ElementState, MouseButton, WindowEvent},
-    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop, run_on_demand::EventLoopExtRunOnDemand},
+    icon::RgbaIcon,
     keyboard::{KeyCode, PhysicalKey},
-    window::{Fullscreen, Window, WindowId},
+    monitor::Fullscreen,
+    window::{ImeRequest, Window, WindowAttributes, WindowId},
 };
 
 #[derive(Default)]
@@ -54,6 +56,7 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
     };
     let mut session = Session::new(project, &project.config.startup)?;
     session.set_best_effort(!options.strict);
+    let mut event_loop = EventLoop::new()?;
     let mut app = App {
         project,
         session,
@@ -64,7 +67,10 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
         instructions: 0,
         presented: 0,
     };
-    EventLoop::new()?.run_app(&mut app)?;
+    let result = event_loop.run_app_on_demand(&mut app);
+    // GPU surfaces and windows must be dropped before their display connection.
+    app.presentation = None;
+    result?;
     eprintln!(
         "Native run: {} instructions, {} presented frames; {}:{:#x}",
         app.instructions,
@@ -94,7 +100,7 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
     Ok(())
 }
 struct NativeHost {
-    window: Arc<Window>,
+    window: Arc<dyn Window>,
     started: Instant,
     controls: ControlState,
     async_keys: AsyncKeys,
@@ -102,7 +108,6 @@ struct NativeHost {
     mapping: MouseButtonMapping,
     cursor: [i32; 2],
     transform: ViewportTransform,
-    adjust_cursor: bool,
     class_style: u32,
     dirty: bool,
     audio: Option<AudioOutput>,
@@ -163,14 +168,13 @@ impl Host for NativeHost {
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
-            PlatformRequest::CursorPosition => {
-                if self.adjust_cursor {
-                    self.transform.to_logical(self.cursor)
-                } else {
-                    Ok(self.cursor)
-                }
+            PlatformRequest::MouseButtons => {
+                let buttons = self.mapping.map_buttons(self.mouse);
+                Ok([i32::from(buttons & 1 != 0), i32::from(buttons & 2 != 0)])
             }
-            PlatformRequest::MapCursor { point } => self.transform.to_logical(*point),
+            PlatformRequest::CursorPosition | PlatformRequest::MapCursor { .. } => {
+                self.transform.cursor_reply(request, self.cursor)
+            }
             _ => bail!("unsupported point request: {request:?}"),
         }
     }
@@ -256,7 +260,7 @@ impl Host for NativeHost {
                 index: 12,
             } => Ok(32),
             PlatformRequest::DisableIme => {
-                self.window.set_ime_allowed(false);
+                self.window.request_ime_update(ImeRequest::Disable)?;
                 Ok(0)
             }
             PlatformRequest::GetClassLong {
@@ -291,7 +295,7 @@ struct App<'a> {
     presented: usize,
 }
 impl App<'_> {
-    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+    fn fail(&mut self, event_loop: &dyn ActiveEventLoop, error: anyhow::Error) {
         self.error = Some(error.context(format!(
             "{}:{:#x}",
             self.session.location().scenario,
@@ -299,32 +303,25 @@ impl App<'_> {
         )));
         event_loop.exit();
     }
-    fn initialize(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+    fn initialize(&mut self, event_loop: &dyn ActiveEventLoop) -> Result<()> {
         let logical = [self.project.config.width, self.project.config.height];
-        let window = Arc::new(
+        let icon = match shiinario_assets::icon::from_game(&self.project.root) {
+            Ok(Some(icon)) => Some(RgbaIcon::new(icon.rgba, icon.width, icon.height)?.into()),
+            Ok(None) => None,
+            Err(error) => {
+                eprintln!("Game icon unavailable: {error:#}");
+                None
+            }
+        };
+        let window: Arc<dyn Window> = Arc::from(
             event_loop.create_window(
-                Window::default_attributes()
+                WindowAttributes::default()
                     .with_title("Shiina Rio")
-                    .with_inner_size(PhysicalSize::new(logical[0], logical[1])),
+                    .with_window_icon(icon)
+                    .with_surface_size(PhysicalSize::new(logical[0], logical[1])),
             )?,
         );
         let presentation = pollster::block_on(Presentation::new(window.clone(), logical))?;
-        let flag = |name: &str| -> Result<Option<bool>> {
-            self.project
-                .config
-                .values
-                .get(name)
-                .map(|value| {
-                    value
-                        .parse::<i32>()
-                        .map(|n| n != 0)
-                        .with_context(|| format!("invalid {name} configuration"))
-                })
-                .transpose()
-        };
-        let adjust_cursor = flag("adjustmousepos")?
-            .or(flag("emulatefullscreen")?)
-            .unwrap_or(false);
         self.host = Some(NativeHost {
             controls: ControlState {
                 focused: window.has_focus(),
@@ -337,7 +334,6 @@ impl App<'_> {
             mapping: Default::default(),
             cursor: [0; 2],
             transform: presentation.transform()?,
-            adjust_cursor,
             class_style: 0xb,
             dirty: true,
             audio: None,
@@ -350,19 +346,24 @@ impl App<'_> {
     }
 }
 impl ApplicationHandler for App<'_> {
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn destroy_surfaces(&mut self, _event_loop: &dyn ActiveEventLoop) {
         // EGL surface destruction still needs the Wayland display connection.
         // Release GPU presentation before run_app tears down the event loop.
         self.presentation = None;
     }
-    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.host.is_none()
             && let Err(error) = self.initialize(event_loop)
         {
             self.fail(event_loop, error);
         }
     }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        _id: WindowId,
+        event: WindowEvent,
+    ) {
         let Some(host) = &mut self.host else {
             return;
         };
@@ -371,7 +372,7 @@ impl ApplicationHandler for App<'_> {
         };
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(size) => {
+            WindowEvent::SurfaceResized(size) => {
                 presentation.resize(size);
                 match presentation.transform() {
                     Ok(transform) => host.transform = transform,
@@ -395,9 +396,11 @@ impl ApplicationHandler for App<'_> {
                     host.mouse = 0;
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                host.cursor = [position.x as i32, position.y as i32]
-            }
+            WindowEvent::PointerMoved {
+                position,
+                primary: true,
+                ..
+            } => host.cursor = [position.x as i32, position.y as i32],
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed
                     && event.text.as_ref().is_some_and(|s| !s.is_empty())
@@ -408,7 +411,17 @@ impl ApplicationHandler for App<'_> {
                     host.keyboard(key, event.state == ElementState::Pressed);
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::PointerButton {
+                state,
+                button,
+                position,
+                primary: true,
+                ..
+            } => {
+                host.cursor = [position.x as i32, position.y as i32];
+                let Some(button) = button.mouse_button() else {
+                    return;
+                };
                 if let Some((bit, vk)) = match button {
                     MouseButton::Left => Some((1, 1)),
                     MouseButton::Right => Some((2, 2)),
@@ -444,7 +457,7 @@ impl ApplicationHandler for App<'_> {
             _ => {}
         }
     }
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         if event_loop.exiting() {
             return;
         }

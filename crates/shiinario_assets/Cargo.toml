@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+shiinario_core.workspace = true
 anyhow.workspace = true
 encoding_rs.workspace = true
 flate2.workspace = true
@@ -12,3 +13,5 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 lewton = "0.10"
+image = { version = "0.25.10", default-features = false, features = ["ico"] }
+object = { version = "0.37.3", default-features = false, features = ["read", "pe", "std"] }

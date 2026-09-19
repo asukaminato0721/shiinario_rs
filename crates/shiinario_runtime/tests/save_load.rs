@@ -34,6 +34,115 @@ impl Drop for Game {
 }
 
 #[test]
+fn asset_reads_reload_saves_and_respect_file_precedence() {
+    let game = Game::new();
+    let project = game.project();
+    let mut resources = Resources::default();
+    // Archive registration still controls fallback; Project's global index
+    // must not make unregistered archive entries visible.
+    assert!(resources.read_asset(&project, "fixture.txt").is_err());
+    resources.register_archive("fixture.war");
+    assert_eq!(
+        resources.read_asset(&project, "fixture.txt").unwrap(),
+        b"synthetic asset fixture\n"
+    );
+    project.write_file("fixture.txt", b"disk override").unwrap();
+    assert_eq!(
+        resources.read_asset(&project, "FIXTURE.TXT").unwrap(),
+        b"disk override"
+    );
+    resources
+        .write_file(&project, "fixture.txt", b"replay override".to_vec(), true)
+        .unwrap();
+    assert_eq!(
+        resources.read_asset(&project, "Fixture.txt").unwrap(),
+        b"replay override"
+    );
+    assert_eq!(project.read("fixture.txt").unwrap(), b"disk override");
+
+    resources.create_directory(&project, "Save", false).unwrap();
+    let save: Vec<u8> = (0..8192).map(|i| (i * 37) as u8).collect();
+    resources
+        .write_file(&project, "save/System.bin", save.clone(), false)
+        .unwrap();
+    // The file was created after opening the project and must be visible now
+    // as well as after restarting the runtime.
+    assert_eq!(
+        resources.read_asset(&project, "SAVE\\system.BIN").unwrap(),
+        save
+    );
+    let reopened = game.project();
+    let mut restarted = Resources::default();
+    assert_eq!(
+        restarted.read_asset(&reopened, "save\\system.bin").unwrap(),
+        save
+    );
+    restarted
+        .write_file(&reopened, "SAVE/system.bin", vec![7; 12], true)
+        .unwrap();
+    assert_eq!(
+        restarted.asset_sizes(&reopened, "save/system.bin").unwrap(),
+        [0, 12]
+    );
+    assert_eq!(
+        restarted.read_asset(&reopened, "save/system.bin").unwrap(),
+        [7; 12]
+    );
+    assert_eq!(project.read("save/system.bin").unwrap(), save);
+    assert!(restarted.read_asset(&reopened, "save/missing.bin").is_err());
+    assert!(restarted.read_asset(&reopened, "../system.bin").is_err());
+}
+
+#[test]
+fn directory_creation_matches_native_and_simulated_results() {
+    for simulated in [false, true] {
+        let game = Game::new();
+        let project = game.project();
+        let mut resources = Resources::default();
+        assert!(
+            !resources
+                .create_directory(&project, "missing/child", simulated)
+                .unwrap()
+        );
+        assert!(
+            resources
+                .create_directory(&project, "Save", simulated)
+                .unwrap()
+        );
+        assert!(
+            !resources
+                .create_directory(&project, "SAVE", simulated)
+                .unwrap()
+        );
+        assert!(resources.file_exists(&project, "save").unwrap());
+        assert!(
+            resources
+                .create_directory(&project, "SAVE/slots", simulated)
+                .unwrap()
+        );
+        assert_eq!(project.directory_exists("save/slots").unwrap(), !simulated);
+        assert!(
+            !resources
+                .create_directory(&project, "fixture.war", simulated)
+                .unwrap()
+        );
+        assert!(
+            resources
+                .create_directory(&project, "../escape", simulated)
+                .is_err()
+        );
+        resources
+            .write_file(&project, "save/slots/slot.dat", vec![1, 2], simulated)
+            .unwrap();
+        assert!(
+            resources
+                .file_exists(&project, "SAVE/SLOTS/SLOT.DAT")
+                .unwrap()
+        );
+    }
+}
+
+#[test]
 fn native_slots_survive_restart_and_case_insensitive_overwrite() {
     let game = Game::new();
     let project = game.project();

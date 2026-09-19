@@ -31,6 +31,39 @@ impl Drop for Temp {
 }
 const FIXTURE: &[u8] = include_bytes!("fixtures/minimal.war");
 #[test]
+fn configuration_versions_and_wana_catalog_mapping() {
+    use shiinario_assets::{profile::Catalog, project::Config};
+    use shiinario_core::EngineVersion;
+    for (version, expected) in [
+        ("2.36", EngineVersion::V2_36),
+        ("2.47", EngineVersion::V2_47),
+    ] {
+        let text = format!(
+            "[椎名里緒 v{version}]\r\nWindowWidth=800\r\nWindowHeight=600\r\nArc=fixture.war\r\nScn=start.scn\r\n"
+        );
+        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&text);
+        let config = Config::parse("game.ini".into(), &bytes).unwrap();
+        assert_eq!(config.version, expected);
+    }
+    assert!(EngineVersion::from_config("椎名里緒 v2.35").is_none());
+    assert!(EngineVersion::from_scheme(2350).is_none());
+    let t = Temp::new();
+    std::fs::rename(t.0.join("RANDL_.exe"), t.0.join("WANA.EXE")).unwrap();
+    let catalog = Catalog::builtin().unwrap();
+    std::fs::write(t.0.join("SETUP.EXE"), b"not the game").unwrap();
+    assert_eq!(
+        catalog.game_executables(&t.0).unwrap(),
+        [t.0.join("WANA.EXE")]
+    );
+    assert!(Arc::ptr_eq(
+        &catalog.for_directory(&t.0).unwrap(),
+        &catalog
+            .profile("Wana ~Hakudaku Mamire no Houkago~")
+            .unwrap()
+    ));
+}
+
+#[test]
 fn reference_archive_and_malformed_headers() {
     let t = Temp::new();
     let p = t.0.join("fixture.war");

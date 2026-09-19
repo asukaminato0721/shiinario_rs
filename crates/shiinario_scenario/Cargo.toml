@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+shiinario_core.workspace = true
 anyhow.workspace = true
 encoding_rs.workspace = true
 serde.workspace = true

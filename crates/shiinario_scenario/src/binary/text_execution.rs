@@ -195,7 +195,8 @@ impl BinaryVm {
                                     if forced { 3 } else { 2 };
                                 continue;
                             }
-                            let (style, clock, consumed) = self.text_style.prefix(&bytes)?;
+                            let (style, clock, consumed) =
+                                self.text_style.prefix(&bytes, self.version)?;
                             self.async_text.as_mut().unwrap().offset += consumed;
                             if let Some(clock) = clock {
                                 self.pending_text_style = Some((style, clock));

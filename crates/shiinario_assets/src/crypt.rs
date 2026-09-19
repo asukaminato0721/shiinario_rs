@@ -1,7 +1,7 @@
 // Ported from GARbro WarcEncryption.cs, Copyright (C) 2015-2017 morkt (MIT).
 use crate::profile::Profile;
+use shiinario_core::EngineVersion;
 use std::f64::consts::PI;
-pub const MAX_INDEX: usize = (32 + 24) * 16384;
 struct Random(u32);
 impl Random {
     fn next(&mut self) -> u32 {
@@ -231,7 +231,11 @@ fn helper4(profile: &Profile, data: &mut [u8]) {
         flags |= 0x98000000;
     }
     key[9] = ((key[2] as i32 as i64 * key[3] as i32 as i64) >> 8) as u32;
-    key[6] = region_crc(&profile.region, flags, buf[1] >> 8).wrapping_add(key[9]);
+    let crc = region_crc(&profile.region, flags, buf[1] >> 8);
+    key[6] = match profile.version {
+        EngineVersion::V2_36 => crc,
+        EngineVersion::V2_47 => crc.wrapping_add(key[9]),
+    };
     for (chunk, k) in data[..40].as_chunks_mut::<4>().0.iter_mut().zip(key) {
         for (d, b) in chunk.iter_mut().zip(k.to_le_bytes()) {
             *d ^= b;
@@ -249,7 +253,7 @@ pub fn decrypt(profile: &Profile, data: &mut [u8]) {
     let b = (data[1] as i8 ^ (len / 2) as i8) as i32;
     let mut rng = Random(len as u32);
     let mut fac = 0;
-    if len != MAX_INDEX {
+    if len != profile.max_index() {
         let idx = (rng.next() as f64 * (profile.image.len() as f64 / 4294967296.0)) as usize;
         fac = helper3(rng.0.wrapping_add(profile.image[idx] as u32)) & 0xfffffff;
         if effective > 128 {

@@ -37,7 +37,7 @@ impl Session {
         self.vm.set_best_effort(enabled);
     }
     pub fn new(project: &Project, name: &str) -> Result<Self> {
-        let mut vm = BinaryVm::new(name, project.read(name)?)?;
+        let mut vm = BinaryVm::with_version(name, project.read(name)?, project.config.version)?;
         vm.set_viewport(project.config.width, project.config.height)?;
         if let Some(value) = project.config.values.get("background") {
             let value: i32 = value.parse().context("invalid Background configuration")?;
@@ -135,7 +135,9 @@ impl Session {
             }
             if matches!(
                 request,
-                PlatformRequest::CursorPosition | PlatformRequest::MapCursor { .. }
+                PlatformRequest::CursorPosition
+                    | PlatformRequest::MapCursor { .. }
+                    | PlatformRequest::MouseButtons
             ) {
                 let point = host.point(&request)?;
                 vm.respond_point(point)?;
@@ -465,6 +467,19 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::FindMedia { name } = &request {
+                let bytes = if project.loose_path_exists(name)? {
+                    b".\\".as_slice()
+                } else {
+                    &[]
+                };
+                vm.respond_bytes(bytes)?;
+                emit(&Event::PlatformBytesReply {
+                    bytes: bytes.to_vec(),
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
             if matches!(
                 &request,
                 PlatformRequest::ProjectDirectory | PlatformRequest::ReadRegistryString { .. }
@@ -553,6 +568,8 @@ impl Session {
                 value
             } else if let PlatformRequest::FileExists { path } = &request {
                 u32::from(resources.file_exists(project, path)?)
+            } else if let PlatformRequest::CreateDirectory { path } = &request {
+                u32::from(resources.create_directory(project, path, host.simulated())?)
             } else {
                 host.respond(&request)?
             };

@@ -1,6 +1,6 @@
 # shiinario_rs
 
-An in-progress Rust compatibility runtime for  (Shiina Rio v2.47).
+An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47.
 **Full-route gameplay is not complete yet.** The Linux winit/wgpu host displays
 an 800×600 title screen, plays music and effects through CPAL, and enters the story
 with Japanese text and transitions. The title pixels match the original x86 renderer.
@@ -20,10 +20,22 @@ Other unknown commands still stop with context because their operands and contro
 effects are not known. Headless traces require explicit `--best-effort` for these omissions.
 Assets are verified against GARbro and original game files remain unchanged.
 
+Wana (`wana.EXE`, v2.36) is recognized using its bundled GARbro scheme. A shared
+`EngineVersion` enum dispatches archive cryptography, program information, and
+version-dependent SCN operands. Its archives decode, the title accepts Start,
+and the first story runs in deterministic replay. Full-route coverage is unverified.
+
 The workspace embeds a pinned upstream [GARbro format catalog](crates/shiinario_assets/data/garbro/README.md)
 and reads it directly in Rust. Builds need no external database or reference
-checkout; running the engine only requires the original game directory. On Linux, CPAL
-requires ALSA development headers and pkg-config:
+checkout; running the engine only requires the original game directory.
+
+The native window uses the original game EXE's icon (read as PE resources, never
+executed). Winit is pinned to `0.31.0-beta.3` for Wayland's
+`xdg_toplevel_icon_v1` support. Compositors without that protocol keep their default
+icon. X11 uses the same extracted pixels. Pointer coordinates follow the scaled,
+letterboxed canvas regardless of the legacy Windows mouse-adjustment settings.
+
+On Linux, CPAL requires ALSA development headers and pkg-config:
 
 ```sh
 cargo build --workspace --release --locked
@@ -62,6 +74,8 @@ the game directory. Run these commands from that directory:
 
 # Inspect CP932 configuration and list the original archive entries.
 ./shiinario_tool inspect
+# Export the original EXE icon; the output file must be new.
+./shiinario_tool icon /tmp/game-icon.png
 ./shiinario_tool list RAN_T0.WAR
 
 # Decode every entry; --media additionally decodes all S25 frames and Vorbis packets.

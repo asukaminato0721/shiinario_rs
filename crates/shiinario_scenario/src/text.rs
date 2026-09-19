@@ -1,5 +1,6 @@
 //! Verified non-drawing subset of the engine's inline text controls.
 use anyhow::{Result, ensure};
+use shiinario_core::EngineVersion;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TextClock {
@@ -67,15 +68,32 @@ impl Default for TextStyle {
 impl TextStyle {
     /// Validate the complete control stream before changing the retained style.
     pub fn configure(&self, bytes: &[u8]) -> Result<(Self, Option<TextClock>)> {
-        let (style, clock, _) = self.parse(bytes, false)?;
+        self.configure_for_version(bytes, EngineVersion::default())
+    }
+
+    pub(crate) fn configure_for_version(
+        &self,
+        bytes: &[u8],
+        version: EngineVersion,
+    ) -> Result<(Self, Option<TextClock>)> {
+        let (style, clock, _) = self.parse(bytes, false, version)?;
         Ok((style, clock))
     }
 
-    pub(crate) fn prefix(&self, bytes: &[u8]) -> Result<(Self, Option<TextClock>, usize)> {
-        self.parse(bytes, true)
+    pub(crate) fn prefix(
+        &self,
+        bytes: &[u8],
+        version: EngineVersion,
+    ) -> Result<(Self, Option<TextClock>, usize)> {
+        self.parse(bytes, true, version)
     }
 
-    fn parse(&self, bytes: &[u8], one: bool) -> Result<(Self, Option<TextClock>, usize)> {
+    fn parse(
+        &self,
+        bytes: &[u8],
+        one: bool,
+        version: EngineVersion,
+    ) -> Result<(Self, Option<TextClock>, usize)> {
         ensure!(bytes.len() <= 65536, "text controls exceed 64 KiB");
         let mut result = self.clone();
         let mut at = 0;
@@ -91,6 +109,10 @@ impl TextStyle {
             let command = bytes[at + 1];
             at += 2;
             match command {
+                // v2.36's 425fc0 dispatches 'n' to the plain return at 42697b:
+                // only the command byte is consumed. v2.47 uses it to switch
+                // text contexts (432466), which is still unresolved.
+                b'n' if version == EngineVersion::V2_36 => {}
                 b'e' => result.effects = number(bytes, &mut at)?,
                 b'w' | b'W' => {
                     ensure!(

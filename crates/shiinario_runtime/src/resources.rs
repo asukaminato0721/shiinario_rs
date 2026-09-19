@@ -103,6 +103,7 @@ pub struct Resources {
     resident: usize,
     archives: Vec<String>,
     transient_files: BTreeMap<String, Vec<u8>>,
+    transient_directories: std::collections::BTreeSet<String>,
     files: BTreeMap<u32, OpenFile>,
 }
 impl Resources {
@@ -178,6 +179,17 @@ impl Resources {
         project.sizes_with_archives(name, &self.archives)
     }
     pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
+        // SCN asset reads also load saves. Match asset_sizes: simulated writes
+        // override disk files, which take precedence over registered archives.
+        if let Some(bytes) = self
+            .transient_files
+            .get(&shiinario_assets::project::normalize(name)?)
+        {
+            return Ok(bytes.clone());
+        }
+        if let Some(bytes) = project.read_loose(name)? {
+            return Ok(bytes);
+        }
         project.read_with_archives(name, &self.archives)
     }
     pub fn read_file_contents(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
@@ -298,7 +310,35 @@ impl Resources {
         Ok(self
             .transient_files
             .contains_key(&shiinario_assets::project::normalize(name)?)
+            || self
+                .transient_directories
+                .contains(&shiinario_assets::project::normalize(name)?)
             || project.loose_path_exists(name)?)
+    }
+    pub fn create_directory(
+        &mut self,
+        project: &Project,
+        name: &str,
+        simulated: bool,
+    ) -> Result<bool> {
+        if !simulated {
+            return project.create_directory(name);
+        }
+        let key = shiinario_assets::project::normalize(name)?;
+        if self.file_exists(project, &key)? {
+            return Ok(false);
+        }
+        if let Some((parent, _)) = key.rsplit_once('/')
+            && !self.transient_directories.contains(parent)
+            && !project.directory_exists(parent)?
+        {
+            return Ok(false);
+        }
+        ensure!(
+            self.transient_directories.len() < 256,
+            "too many transient directories"
+        );
+        Ok(self.transient_directories.insert(key))
     }
     pub fn write_file(
         &mut self,
@@ -985,10 +1025,10 @@ impl Resources {
     }
     fn load_sound(&mut self, id: u32, data: &[u8], flags: u32) -> Result<()> {
         ensure!(id < 256, "sound slot out of bounds");
-        // The traced game requests software mixing (DSBCAPS_LOCSOFTWARE).
-        // Other device capability flags need separate host semantics.
+        // Both foreground-only (Wana) and global-focus buffers use the same
+        // decoded PCM. Background input/audio policy belongs to the host.
         ensure!(
-            flags == 0x8000,
+            matches!(flags, 0 | 0x8000),
             "unresolved sound creation flags {flags:#x}"
         );
         let old = self
@@ -1694,8 +1734,11 @@ mod tests {
         let size = samples.len() * 2;
         assert_eq!(resources.resident_bytes(), size);
         assert!(resources.load_sound(20, b"OGV\0", 0x8000).is_err());
-        assert!(resources.load_sound(20, ogg, 0).is_err());
+        assert!(resources.load_sound(20, ogg, 1).is_err());
         assert!(resources.load_sound(256, ogg, 0x8000).is_err());
+        assert_eq!(resources.sound(20).unwrap().samples, samples);
+        assert_eq!(resources.resident_bytes(), size);
+        resources.load_sound(20, ogg, 0).unwrap();
         assert_eq!(resources.sound(20).unwrap().samples, samples);
         assert_eq!(resources.resident_bytes(), size);
         resources.load_sound(20, ogg, 0x8000).unwrap();

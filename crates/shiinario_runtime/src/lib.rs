@@ -204,6 +204,7 @@ impl Host for TracePlatform {
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
+            PlatformRequest::MouseButtons => Ok(self.replay.mouse_buttons()),
             PlatformRequest::CursorPosition => Ok(self.replay.cursor),
             PlatformRequest::MapCursor { point } => {
                 viewport::ViewportTransform::default().to_logical(*point)

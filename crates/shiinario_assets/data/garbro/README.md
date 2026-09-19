@@ -18,11 +18,16 @@ The game directory is identified from its original `.exe` and `.war` filenames
 using `GameMap`, without reading or executing the EXEs. Direct archive access
 checks the archive filename first, then EXEs beside it, as GARbro does. Matching
 is case-insensitive. Missing or ambiguous matches produce an error. Keep the
-original filenames; there is no hardcoded fallback game.
+original filenames; there is no fallback game. One explicit mapping correction
+connects `wana.exe` to the existing `Wana ~Hakudaku Mamire no Houkago~` scheme,
+which the pinned catalog contains without a corresponding `GameMap` entry.
+The serialized upstream catalog remains unchanged.
 
 The full upstream catalog does not imply complete support for other games. The
-reader currently accepts v2.47 schemes with 32-byte entry names and no extra crypt
-stage, and validates table sizes. Unsupported mapped schemes report their name
+reader currently accepts v2.36/v2.47 schemes with 16- or 32-byte entry names and no
+extra crypt stage, and validates table sizes. An enum selects the version-specific
+helper transform; index size follows the scheme's entry-name size.
+Unsupported mapped schemes report their name
 and validation error. Interpreter compatibility is a separate constraint.
 
 To update, copy the original file from an explicitly selected upstream revision,

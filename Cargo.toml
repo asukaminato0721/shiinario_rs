@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/na_mpeg2_decoder", "crates/shiinario_assets", "crates/shiinario_scenario", "crates/shiinario_runtime", "crates/shiinario_cli"]
+members = ["crates/na_mpeg2_decoder", "crates/shiinario_core", "crates/shiinario_assets", "crates/shiinario_scenario", "crates/shiinario_runtime", "crates/shiinario_cli"]
 resolver = "2"
 
 [workspace.package]
@@ -16,5 +16,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 shiinario_assets = { path = "crates/shiinario_assets" }
+shiinario_core = { path = "crates/shiinario_core" }
 shiinario_scenario = { path = "crates/shiinario_scenario" }
 shiinario_runtime = { path = "crates/shiinario_runtime" }

@@ -1,6 +1,7 @@
 //! Bounded, read-only access to 's original WARC 1.7 assets.
 mod compression;
 mod crypt;
+pub mod icon;
 mod nrbf;
 pub mod profile;
 use anyhow::{Context, Result, ensure};
@@ -53,18 +54,24 @@ impl Archive {
             offset >= 12 && offset as u64 + 8 < len,
             "invalid index offset"
         );
-        let n = (len - offset as u64).min(crypt::MAX_INDEX as u64) as usize;
-        let mut index = vec![0; crypt::MAX_INDEX];
+        let max_index = profile.max_index();
+        let n = (len - offset as u64).min(max_index as u64) as usize;
+        let mut index = vec![0; max_index];
         file.seek(SeekFrom::Start(offset as u64))?;
         file.read_exact(&mut index[..n])?;
         crypt::decrypt_index(&profile, offset, &mut index);
-        let index = compression::zlib(&index[8..n], crypt::MAX_INDEX)
-            .context("decoding WARC index ( profile)")?;
-        ensure!(index.len() % 56 == 0, "partial WARC index record");
+        let index =
+            compression::zlib(&index[8..n], max_index).context("decoding WARC index ( profile)")?;
+        let name_size = profile.entry_name_size;
+        let record_size = name_size + 24;
+        ensure!(index.len() % record_size == 0, "partial WARC index record");
         let mut entries = Vec::new();
         let mut names = BTreeSet::new();
-        for record in index.as_chunks::<56>().0 {
-            let end = record[..32].iter().position(|&b| b == 0).unwrap_or(32);
+        for record in index.chunks_exact(record_size) {
+            let end = record[..name_size]
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(name_size);
             if end == 0 || record[0] >= 0x80 {
                 continue;
             }
@@ -72,11 +79,13 @@ impl Archive {
             ensure!(!bad, "invalid CP932 entry name");
             let e = Entry {
                 name: name.into_owned(),
-                offset: u32le(&record[32..]),
-                size: u32le(&record[36..]),
-                unpacked_size: u32le(&record[40..]),
-                filetime: u64::from_le_bytes(record[44..52].try_into().unwrap()),
-                flags: u32le(&record[52..]),
+                offset: u32le(&record[name_size..]),
+                size: u32le(&record[name_size + 4..]),
+                unpacked_size: u32le(&record[name_size + 8..]),
+                filetime: u64::from_le_bytes(
+                    record[name_size + 12..name_size + 20].try_into().unwrap(),
+                ),
+                flags: u32le(&record[name_size + 20..]),
             };
             ensure!(
                 e.offset >= 12 && e.offset as u64 + e.size as u64 <= offset as u64,

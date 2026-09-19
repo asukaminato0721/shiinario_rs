@@ -5,6 +5,7 @@ use crate::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
+use shiinario_core::EngineVersion;
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -13,7 +14,7 @@ use std::{
 #[derive(Debug, Clone, Serialize)]
 pub struct Config {
     pub source: PathBuf,
-    pub version: String,
+    pub version: EngineVersion,
     pub width: u32,
     pub height: u32,
     pub startup: String,
@@ -37,10 +38,8 @@ impl Config {
                 values.insert(key.trim().to_lowercase(), value.trim().to_owned());
             }
         }
-        ensure!(
-            version == "椎名里緒 v2.47",
-            "unsupported configuration section {version:?}"
-        );
+        let version = EngineVersion::from_config(&version)
+            .with_context(|| format!("unsupported configuration section {version:?}"))?;
         let get = |key: &str| {
             values
                 .get(key)
@@ -117,10 +116,11 @@ impl Project {
         }
         let config = configs
             .first()
-            .context("no Shiina Rio v2.47 configuration found")?
+            .context("no supported Shiina Rio v2.36/v2.47 configuration found")?
             .clone();
         ensure!(
-            configs.iter().all(|c| c.width == config.width
+            configs.iter().all(|c| c.version == config.version
+                && c.width == config.width
                 && c.height == config.height
                 && c.startup.eq_ignore_ascii_case(&config.startup)
                 && c.archive.eq_ignore_ascii_case(&config.archive)),
@@ -247,6 +247,31 @@ impl Project {
     /// entries and the archive basename fallback do not participate.
     pub fn loose_path_exists(&self, name: &str) -> Result<bool> {
         Ok(self.loose_path(name, false)?.is_some())
+    }
+    pub fn directory_exists(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .loose_path(name, false)?
+            .is_some_and(|path| path.is_dir()))
+    }
+    /// Create one game-relative directory with Windows-style case lookup.
+    pub fn create_directory(&self, name: &str) -> Result<bool> {
+        let Some(path) = self.loose_path(name, true)? else {
+            return Ok(false);
+        };
+        match std::fs::create_dir(path) {
+            Ok(()) => Ok(true),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::AlreadyExists
+                        | std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(error.into()),
+        }
     }
     /// Resolve on each access: scripts can create files after Project::open.
     /// Reject links and ambiguous case aliases, including at the write target.
@@ -389,7 +414,7 @@ mod tests {
             root: root.clone(),
             config: Config {
                 source: root.join("game.ini"),
-                version: String::new(),
+                version: EngineVersion::V2_47,
                 width: 800,
                 height: 600,
                 startup: String::new(),

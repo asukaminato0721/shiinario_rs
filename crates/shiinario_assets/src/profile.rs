@@ -5,6 +5,7 @@ use crate::{
     nrbf::{self, Document, Value},
 };
 use anyhow::{Context, Result, ensure};
+use shiinario_core::EngineVersion;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
@@ -16,10 +17,12 @@ use std::{
 const MAX_DATABASE: usize = 16 * 1024 * 1024;
 const BUNDLED_DATABASE: &[u8] = include_bytes!("../data/garbro/Formats.dat");
 
-/// Validated WARC v2.47 decryption data read from a GARbro catalog.
+/// Validated WARC v2.36/v2.47 decryption data read from a GARbro catalog.
 /// Loading does not execute .NET code. Other scheme versions are unsupported.
 #[derive(Debug)]
 pub struct Profile {
+    pub(crate) version: EngineVersion,
+    pub(crate) entry_name_size: usize,
     pub(crate) key: Vec<u8>,
     pub(crate) image: Vec<u8>,
     pub(crate) region: Vec<u8>,
@@ -113,6 +116,14 @@ impl Catalog {
                 }
             }
         }
+        // The pinned catalog includes Wana's scheme but omits its executable
+        // from GameMap. Keep this correction separate from the upstream data.
+        let wana = "Wana ~Hakudaku Mamire no Houkago~";
+        if profiles.contains_key(wana) {
+            games
+                .entry("wana.exe".into())
+                .or_insert_with(|| wana.into());
+        }
         Ok(Self { profiles, games })
     }
 
@@ -150,6 +161,33 @@ impl Catalog {
     /// Matches archive and executable filenames without reading or executing EXEs.
     pub fn for_directory(&self, directory: impl AsRef<Path>) -> Result<Arc<Profile>> {
         self.detect(directory.as_ref(), true)
+    }
+
+    /// Original game executables matching the selected catalog scheme. This
+    /// excludes setup/uninstall programs when looking up the game's icon.
+    pub fn game_executables(&self, directory: &Path) -> Result<Vec<std::path::PathBuf>> {
+        let selected = self.for_directory(directory)?;
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let path = entry?.path();
+            if !path.is_file()
+                || !path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+            {
+                continue;
+            }
+            if let Some(name) = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| self.mapped_name(n))
+                && Arc::ptr_eq(&selected, &self.profile(name)?)
+            {
+                paths.push(path);
+            }
+        }
+        paths.sort();
+        Ok(paths)
     }
 
     fn detect(&self, directory: &Path, archives: bool) -> Result<Arc<Profile>> {
@@ -191,12 +229,13 @@ impl Catalog {
 impl Profile {
     fn from_record(doc: &Document<'_>, scheme: &Value<'_>) -> Result<Self> {
         doc.class(scheme, "GameRes.Formats.ShiinaRio.EncryptionScheme")?;
+        let version = doc.number(doc.field(scheme, "<Version>k__BackingField")?)?;
+        let version = EngineVersion::from_scheme(version).with_context(|| {
+            format!("unsupported scheme version {version} (only v2.36/v2.47 are implemented)")
+        })?;
+        let entry_name_size = doc.number(doc.field(scheme, "EntryNameSize")?)?;
         ensure!(
-            doc.number(doc.field(scheme, "<Version>k__BackingField")?)? == 2470,
-            "unsupported scheme version (only v2.47 is implemented)"
-        );
-        ensure!(
-            doc.number(doc.field(scheme, "EntryNameSize")?)? == 32,
+            matches!(entry_name_size, 16 | 32),
             "unsupported selected scheme entry name size"
         );
         ensure!(
@@ -243,12 +282,18 @@ impl Profile {
         let mut image = common[..length].to_vec();
         image.extend_from_slice(extra);
         Ok(Self {
+            version,
+            entry_name_size: entry_name_size as usize,
             key: key.to_vec(),
             image,
             region: region.to_vec(),
             decode: decode.to_vec(),
             helper_key,
         })
+    }
+
+    pub(crate) fn max_index(&self) -> usize {
+        (self.entry_name_size + 24) * 16384
     }
 }
 

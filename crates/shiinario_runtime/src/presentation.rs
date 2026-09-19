@@ -16,8 +16,8 @@ pub struct Presentation {
     size: PhysicalSize<u32>,
 }
 impl Presentation {
-    pub async fn new(window: Arc<Window>, logical: [u32; 2]) -> Result<Self> {
-        let size = window.inner_size();
+    pub async fn new(window: Arc<dyn Window>, logical: [u32; 2]) -> Result<Self> {
+        let size = window.surface_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::util::backend_bits_from_env().unwrap_or_default(),
             ..Default::default()

@@ -1,5 +1,6 @@
 //! Logical/window coordinate conversion with the original f32 scale factors.
 use anyhow::{Result, ensure};
+use shiinario_scenario::PlatformRequest;
 #[derive(Clone, Copy)]
 pub struct ViewportTransform {
     scale: [f32; 2],
@@ -14,6 +15,17 @@ impl Default for ViewportTransform {
     }
 }
 impl ViewportTransform {
+    /// Native SCN client coordinates belong to the logical canvas. Window
+    /// resizing is presentation-only, regardless of the original Windows INI
+    /// flags. Scripts may explicitly map a queried client point with 0492;
+    /// that point is already logical and must not be scaled a second time.
+    pub fn cursor_reply(self, request: &PlatformRequest, physical: [i32; 2]) -> Result<[i32; 2]> {
+        match request {
+            PlatformRequest::CursorPosition => self.to_logical(physical),
+            PlatformRequest::MapCursor { point } => Ok(*point),
+            _ => anyhow::bail!("unsupported cursor request: {request:?}"),
+        }
+    }
     /// Center a logical canvas inside a nonempty physical window.
     pub fn fit(logical: [u32; 2], physical: [u32; 2]) -> Result<Self> {
         ensure!(

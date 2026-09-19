@@ -1,6 +1,7 @@
 //! Verified subset of the supplied v2.47 engine. See docs/SCN_RESEARCH.md.
 use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
+use shiinario_core::EngineVersion;
 mod native_helper;
 mod text_execution;
 use text_execution::{AsyncText, TextPhase};
@@ -337,6 +338,13 @@ pub enum PlatformRequest {
     FileExists {
         path: String,
     },
+    CreateDirectory {
+        path: String,
+    },
+    FindMedia {
+        name: String,
+    },
+    MouseButtons,
     ReadRegistryValue {
         root: u32,
         path: String,
@@ -511,6 +519,7 @@ impl Cursor<'_> {
 }
 
 pub struct BinaryVm {
+    version: EngineVersion,
     name: String,
     data: Vec<u8>,
     script_base: u32,
@@ -530,6 +539,10 @@ pub struct BinaryVm {
     file_write_marker: u32,
     input_latches: [u32; 2],
     save_encoding: u32,
+    // The seed query retains the last explicit seed, independently of rand's
+    // evolving CRT state. Script tasks share one generator.
+    random_seed: u32,
+    random_state: u32,
     media_flags: u32,
     viewport: [u32; 2],
     pending: Option<(Event, Option<Destination>)>,
@@ -579,8 +592,16 @@ pub struct BinaryVm {
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
+        Self::with_version(name, data, EngineVersion::V2_47)
+    }
+    pub fn with_version(
+        name: impl Into<String>,
+        data: Vec<u8>,
+        version: EngineVersion,
+    ) -> Result<Self> {
         ensure!(data.len() <= 16 * 1024 * 1024, "scenario exceeds size cap");
         Ok(Self {
+            version,
             name: name.into(),
             data,
             script_base: SCRIPT_BASE,
@@ -602,6 +623,8 @@ impl BinaryVm {
             file_write_marker: 0,
             input_latches: [0; 2],
             save_encoding: 1,
+            random_seed: 0,
+            random_state: 1,
             media_flags: 0,
             viewport: [800, 600],
             pending: None,
@@ -1523,8 +1546,7 @@ impl BinaryVm {
                 });
             }
             0x12 | 0x13 => {
-                let address = self.named_address(&cursor.variable_name()?)?;
-                let value = u32::from_le_bytes(self.memory_read(address, 4)?.try_into().unwrap());
+                let value = self.named_value(&cursor.variable_name()?)?;
                 if tag & 0x7f == 0x13 {
                     let address =
                         value.wrapping_add(if tag & 0x80 != 0 { self.script_base } else { 0 });
@@ -1564,12 +1586,7 @@ impl BinaryVm {
     }
     fn expression_variable(&self, variable: crate::expression::Variable<'_>) -> Result<u32> {
         match variable {
-            crate::expression::Variable::Named(name) => {
-                let address = self.named_address(name)?;
-                Ok(u32::from_le_bytes(
-                    self.memory_read(address, 4)?.as_slice().try_into()?,
-                ))
-            }
+            crate::expression::Variable::Named(name) => self.named_value(name),
             crate::expression::Variable::Bank { bank, index } => {
                 Ok(self.banks[&bank][self.bank_index(bank, index)?])
             }
@@ -1623,6 +1640,21 @@ impl BinaryVm {
                 false
             }
         });
+    }
+    fn named_value(&self, name: &[u8]) -> Result<u32> {
+        // Local declarations shadow the engine's global built-ins.
+        if name == b"__LOCAL__"
+            && !self
+                .named_scopes
+                .iter()
+                .any(|scope| scope.names.iter().any(|n| n == name))
+        {
+            return Ok(self.named_scopes.len() as u32);
+        }
+        let address = self.named_address(name)?;
+        Ok(u32::from_le_bytes(
+            self.memory_read(address, 4)?.as_slice().try_into()?,
+        ))
     }
     fn named_address(&self, name: &[u8]) -> Result<u32> {
         for scope in self.named_scopes.iter().rev() {
@@ -1842,6 +1874,31 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x01a4 => {
+                // v2.36: 416580 calls 416490 with convention/module/symbol,
+                // a FF-terminated argument list, then reads the result target.
+                let convention = self.read(&mut cursor)?;
+                let module = self.string(self.read(&mut cursor)?)?;
+                let symbol = self.string(self.read(&mut cursor)?)?;
+                let mut arguments = Vec::new();
+                while cursor.data.get(cursor.pc) != Some(&0xff) {
+                    ensure!(arguments.len() < 256, "DLL argument count exceeds limit");
+                    arguments.push(self.read(&mut cursor)?);
+                }
+                cursor.byte()?;
+                let destination = self.destination(&mut cursor)?;
+                ensure!(
+                    convention == 1
+                        && module.eq_ignore_ascii_case("kernel32.dll")
+                        && symbol == "CreateDirectoryA"
+                        && arguments.len() == 2
+                        && arguments[1] == 0,
+                    "unsupported DLL call {module}!{symbol} (convention {convention})"
+                );
+                let path = self.string(arguments[0])?;
+                response_destination = Some(destination);
+                request = Some(PlatformRequest::CreateDirectory { path });
+            }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
                 let code = self.memory_read(address, native_helper::THUMBNAIL_CODE_SIZE)?;
@@ -1939,7 +1996,9 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::DirectShowAvailable);
             }
-            0x0028 => {
+            // 07bf uses MsgWaitForMultipleObjects in v2.36 (4183d0).
+            // The native host keeps servicing events during this cooperative wait.
+            0x0028 | 0x07bf => {
                 delay = Some(self.read(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
             }
@@ -1972,7 +2031,7 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadKeyState { key });
             }
-            0x0456 | 0x0492 => {
+            0x0456 | 0x0458 | 0x0492 => {
                 let begin = cursor.pc;
                 request = Some(if opcode == 0x0492 {
                     let point = [
@@ -1981,6 +2040,8 @@ impl BinaryVm {
                     ];
                     cursor.pc = begin;
                     PlatformRequest::MapCursor { point }
+                } else if opcode == 0x0458 {
+                    PlatformRequest::MouseButtons
                 } else {
                     PlatformRequest::CursorPosition
                 });
@@ -2316,15 +2377,31 @@ impl BinaryVm {
                     self.draw_list.len() < 1024,
                     "draw list exceeds 1024 entries"
                 );
-                let item = ImageDraw {
+                let mut item = ImageDraw {
                     image: self.read(&mut cursor)?,
                     frame: self.read(&mut cursor)?,
                     flags: self.read(&mut cursor)?,
                     layer: self.read(&mut cursor)?,
                     x: self.read(&mut cursor)? as i32,
                     y: self.read(&mut cursor)? as i32,
-                    extra: [self.read(&mut cursor)?, self.read(&mut cursor)?],
+                    extra: [self.read(&mut cursor)?, 0],
                 };
+                match self.version {
+                    EngineVersion::V2_36 => {
+                        // Original 4110d0 reads seven base operands, followed
+                        // by optional flag bits and RGB values.
+                        if item.flags & 0x6000_0000 != 0 {
+                            item.flags |= self.read(&mut cursor)?;
+                        }
+                        if item.flags & 0x2000_0000 != 0 {
+                            let red = self.read(&mut cursor)? & 255;
+                            let green = self.read(&mut cursor)? & 255;
+                            let blue = self.read(&mut cursor)? & 255;
+                            item.extra[1] = red | green << 8 | blue << 16;
+                        }
+                    }
+                    EngineVersion::V2_47 => item.extra[1] = self.read(&mut cursor)?,
+                }
                 self.draw_list.push(item);
             }
             0x04c4 => {
@@ -2691,7 +2768,9 @@ impl BinaryVm {
                     "text drawing to surfaces is unresolved"
                 );
                 let controls = self.string_bytes(self.read(&mut cursor)?)?;
-                let (style, clock_read) = self.text_style.configure(&controls)?;
+                let (style, clock_read) = self
+                    .text_style
+                    .configure_for_version(&controls, self.version)?;
                 if let Some(clock) = clock_read {
                     self.pending_text_style = Some((style, clock));
                     request = Some(PlatformRequest::ClockMilliseconds);
@@ -2741,6 +2820,23 @@ impl BinaryVm {
                 self.memory_range(address, 256)?;
                 byte_destination = Some(address);
                 request = Some(PlatformRequest::ProjectDirectory);
+            }
+            0x0a30 => {
+                // v2.36 418d60 searches CD drives for a named file and writes
+                // a root string, or an empty string when no disc contains it.
+                let name = self.string(self.read(&mut cursor)?)?;
+                let address = self.read(&mut cursor)?;
+                self.memory_range(address, 4)?;
+                byte_destination = Some(address);
+                request = Some(PlatformRequest::FindMedia { name });
+            }
+            0x0a31 => {
+                // The portable host uses the supplied game directory as media.
+                let root = self.string(self.read(&mut cursor)?)?;
+                ensure!(
+                    matches!(root.as_str(), ".\\" | "./" | ""),
+                    "unsupported media root {root:?}"
+                );
             }
             0x0303 | 0x0309 => {
                 let base = self.read(&mut cursor)?;
@@ -3405,6 +3501,28 @@ impl BinaryVm {
                 };
                 writes.push((destination, value));
             }
+            0x03ac => {
+                let bound = self.read(&mut cursor)?;
+                let destination = self.destination(&mut cursor)?;
+                // v2.36 415a20 and v2.47 41cca0 use unsigned rand() % bound.
+                // A zero bound writes zero without advancing the generator.
+                let value = if bound == 0 {
+                    0
+                } else {
+                    self.random_state =
+                        self.random_state.wrapping_mul(214013).wrapping_add(2531011);
+                    ((self.random_state >> 16) & 0x7fff) % bound
+                };
+                writes.push((destination, value));
+            }
+            0x03ad => {
+                writes.push((self.destination(&mut cursor)?, self.random_seed));
+            }
+            0x03ae => {
+                let seed = self.read(&mut cursor)?;
+                self.random_seed = seed;
+                self.random_state = seed;
+            }
             0x03a0 => {
                 let divisor = self.read(&mut cursor)?;
                 ensure!(divisor != 0, "unsigned division by zero");
@@ -3471,7 +3589,7 @@ impl BinaryVm {
             }
             0x03c0 | 0x09f6 => {
                 let values = if opcode == 0x03c0 {
-                    [247, 0x01328e21]
+                    self.version.program_info()
                 } else {
                     self.viewport
                 };

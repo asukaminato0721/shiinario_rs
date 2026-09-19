@@ -54,6 +54,10 @@ enum Command {
         media: bool,
     },
     Inspect,
+    /// Extract the detected game's original EXE icon to a new PNG file.
+    Icon {
+        output: PathBuf,
+    },
     Image {
         archive: PathBuf,
         name: String,
@@ -271,6 +275,16 @@ fn main() -> Result<()> {
         Command::Inspect => {
             let p = shiinario_assets::project::Project::open(".")?;
             println!("{}", serde_json::to_string_pretty(&p.config)?);
+        }
+        Command::Icon { output } => {
+            let icon = shiinario_assets::icon::from_game(std::path::Path::new("."))?
+                .context("game executable has no icon")?;
+            let file = std::fs::File::create_new(output)?;
+            let mut encoder = png::Encoder::new(file, icon.width, icon.height);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.write_header()?.write_image_data(&icon.rgba)?;
+            println!("{}x{} original EXE icon", icon.width, icon.height);
         }
         Command::Image {
             archive,

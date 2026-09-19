@@ -91,6 +91,10 @@ impl Replay {
         .mask()
             | self.control_mask
     }
+    pub fn mouse_buttons(&self) -> [i32; 2] {
+        let buttons = self.mapping.map_buttons(self.mouse);
+        [i32::from(buttons & 1 != 0), i32::from(buttons & 2 != 0)]
+    }
 }
 
 #[cfg(test)]
