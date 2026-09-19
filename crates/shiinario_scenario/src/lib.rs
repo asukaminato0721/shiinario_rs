@@ -5,6 +5,7 @@ mod expression;
 mod format;
 mod memory;
 mod text;
+pub mod text_layout;
 pub use binary::{
     BinaryVm, ImageDraw, MaskTransition, MouseButtonMapping, PlatformRequest, SoundCommand,
     SurfaceBlend, SurfaceCopy, SurfacePoint, boot_binary,
