@@ -1,4 +1,8 @@
-use crate::{Archive, Entry, compression::MAX_OUTPUT, profile::Profile};
+use crate::{
+    Archive, Entry,
+    compression::MAX_OUTPUT,
+    profile::{Catalog, Profile},
+};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
@@ -93,7 +97,7 @@ pub fn normalize(name: &str) -> Result<String> {
 impl Project {
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
-        let profile = Profile::builtin()?;
+        let profile = Catalog::builtin()?.for_directory(root)?;
         Self::open_with_profile(root, profile)
     }
     pub fn open_with_profile(root: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
@@ -327,16 +331,18 @@ mod tests {
                 Archive {
                     path: root.join("first.war"),
                     entries: vec![entry(17, 25)],
-                    profile: Arc::new(
-                        Profile::from_bytes(&crate::test_support::database()).unwrap(),
-                    ),
+                    profile: Catalog::from_bytes(&crate::test_support::database())
+                        .unwrap()
+                        .profile("Ran→Sem")
+                        .unwrap(),
                 },
                 Archive {
                     path: root.join("second.war"),
                     entries: vec![entry(100, 64)],
-                    profile: Arc::new(
-                        Profile::from_bytes(&crate::test_support::database()).unwrap(),
-                    ),
+                    profile: Catalog::from_bytes(&crate::test_support::database())
+                        .unwrap()
+                        .profile("Ran→Sem")
+                        .unwrap(),
                 },
             ],
             files: Default::default(),

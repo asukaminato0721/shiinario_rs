@@ -4,7 +4,7 @@ mod crypt;
 mod nrbf;
 pub mod profile;
 use anyhow::{Context, Result, ensure};
-use profile::Profile;
+use profile::{Catalog, Profile};
 use serde::Serialize;
 use std::sync::Arc;
 use std::{
@@ -34,7 +34,7 @@ fn u32le(b: &[u8]) -> u32 {
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let profile = Profile::builtin()?;
+        let profile = Catalog::builtin()?.for_archive(path)?;
         Self::open_with_profile(path, profile)
     }
     pub fn open_with_profile(path: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {

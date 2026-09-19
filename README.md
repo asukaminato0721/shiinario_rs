@@ -37,7 +37,9 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 Copy `target/release/shiinario_engine` into the game directory, open a terminal there, and
 run `./shiinario_engine`. The current working directory is the game root. Registry string
 queries use that root for every key; integer queries return zero. No system
-registry is accessed.
+registry is accessed. Keep the original EXE filenames: the engine uses GARbro
+`GameMap` to select decryption data from filenames in this directory. It does not
+execute the EXEs. Unknown or ambiguous matches produce an error.
 
 For the research commands below, also copy `target/release/shiinario_tool` into
 the game directory. Run these commands from that directory:
@@ -111,8 +113,8 @@ research artifacts outside this repository. No alternative save format is create
 - `shiinario_cli`: the native engine and inspection tools.
 
 See [compatibility and validation](docs/COMPATIBILITY.md) for exact coverage and
-remaining work, [profile documentation](crates/shiinario_assets/profiles/ransem-v1/README.md)
-for catalog provenance and profile validation, and [third-party notices](THIRD_PARTY_NOTICES.md).
+remaining work, [catalog documentation](crates/shiinario_assets/data/garbro/README.md)
+for provenance and profile validation, and [third-party notices](THIRD_PARTY_NOTICES.md).
 
 See [SCN reverse-engineering notes](docs/SCN_RESEARCH.md) for the captured engine,
 Ghidra workflow and original-machine-code verification of opcode `0x049d`.

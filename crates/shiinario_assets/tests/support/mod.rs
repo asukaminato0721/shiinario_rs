@@ -68,7 +68,7 @@ pub fn stream() -> Vec<u8> {
     w.object(
         1,
         "GameRes.SchemeDataBase",
-        &[("Version", Some(8)), ("SchemeMap", None)],
+        &[("Version", Some(8)), ("SchemeMap", None), ("GameMap", None)],
     );
     w.int(148);
     w.object(
@@ -90,6 +90,7 @@ pub fn stream() -> Vec<u8> {
     );
     // Forward reference, as in the real catalog.
     w.reference(7);
+    w.reference(20);
     w.array(7, 2);
     w.object(
         8,
@@ -149,6 +150,26 @@ pub fn stream() -> Vec<u8> {
     w.reference(18);
     w.bytes(17, &[0x11, 0xfe]);
     w.bytes(18, &[0x22, 0x33]);
+    w.object(
+        20,
+        "System.Collections.Generic.Dictionary`2",
+        &[("KeyValuePairs", None)],
+    );
+    w.array(21, 4);
+    for (id, filename, title) in [
+        (22, "GAME.EXE", "Ran→Sem"),
+        (25, "OTHER.EXE", "Unrelated"),
+        (28, "MAPPED.WAR", "Ran→Sem"),
+        (31, "NONWARC.EXE", "Unknown format"),
+    ] {
+        w.object(
+            id,
+            "System.Collections.Generic.KeyValuePair`2",
+            &[("key", None), ("value", None)],
+        );
+        w.text(id + 1, filename);
+        w.text(id + 2, title);
+    }
     w.0.push(11);
     w.0
 }

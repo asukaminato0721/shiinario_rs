@@ -19,6 +19,8 @@ impl Temp {
             ID.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir(&p).unwrap();
+        // Filename-only catalog detection does not execute or inspect this file.
+        std::fs::write(p.join("RANDL_.exe"), []).unwrap();
         Self(p)
     }
 }

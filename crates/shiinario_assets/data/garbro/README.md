@@ -9,18 +9,26 @@
 - License: MIT; see [third-party notices](../../../../THIRD_PARTY_NOTICES.md).
 
 The Rust build embeds this file. On first use, the Rust reader decompresses its
-NRBF records and selects the  v2.47 scheme. It reads data only and does not
-instantiate .NET classes. The validated profile is shared between archives; the
-other catalog records are discarded. No external catalog, Python, .NET runtime,
+NRBF records and loads the WARC schemes and `GameMap` filename mappings. It reads
+data only and does not instantiate .NET classes. Validated profiles are cached
+and shared between archives; other formats are discarded. No external catalog, Python, .NET runtime,
 or GARbro installation is required to build or run the engine.
 
-The full upstream catalog does not imply support for other games. The reader
-validates the selected scheme version, entry name size and supported crypt stages.
+The game directory is identified from its original `.exe` and `.war` filenames
+using `GameMap`, without reading or executing the EXEs. Direct archive access
+checks the archive filename first, then EXEs beside it, as GARbro does. Matching
+is case-insensitive. Missing or ambiguous matches produce an error. Keep the
+original filenames; there is no hardcoded fallback game.
+
+The full upstream catalog does not imply complete support for other games. The
+reader currently accepts v2.47 schemes with 32-byte entry names and no extra crypt
+stage, and validates table sizes. Unsupported mapped schemes report their name
+and validation error. Interpreter compatibility is a separate constraint.
 
 To update, copy the original file from an explicitly selected upstream revision,
-record its revision/version/hash here and in
-[`profile.json`](../../profiles/ransem-v1/profile.json), and independently compare
-the selected table hashes with GARbro before updating the recorded expectations.
+record its revision/version/hash here, and independently compare the selected
+table hashes with GARbro before updating the expectations in
+[`profile.rs`](../../src/profile.rs).
 Run the workspace tests and the original-game reference comparison described in
 [`COMPATIBILITY.md`](../../../../docs/COMPATIBILITY.md). Do not regenerate or edit
 the serialized database locally.
