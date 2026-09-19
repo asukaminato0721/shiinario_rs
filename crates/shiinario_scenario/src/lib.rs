@@ -1,5 +1,8 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
 //! are distinct formats; unknown instructions are never treated as no-ops.
+mod binary;
+pub use binary::{BinaryVm, MouseButtonMapping, boot_binary};
+
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -147,6 +150,10 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
+    MouseButtonMapping {
+        location: Location,
+        value: u32,
+    },
     Dialogue {
         location: Location,
         text: String,
@@ -387,19 +394,6 @@ impl TextVm {
             _ => bail!("unsupported executable command ${name} with arguments {args:?}"),
         })
     }
-}
-/// The bytecode entry point fails at the exact first unresolved instruction.
-/// There is deliberately no search-ahead or recovery mode for execution.
-pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
-    let opcode = u16::from_le_bytes(
-        data.get(..2)
-            .context("truncated SCN opcode at 0x0")?
-            .try_into()?,
-    );
-    bail!(
-        "{name}:0x0: unsupported binary SCN opcode 0x{opcode:04x}; call_depth=0, clock_ms=0, next_bytes={:02x?}",
-        &data[..data.len().min(24)]
-    )
 }
 #[cfg(test)]
 mod tests {

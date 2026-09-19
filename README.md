@@ -20,7 +20,7 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 ## Commands
 
 ```sh
-# Read original configuration and attempt the real startup (currently fails at 0x049d).
+# Read original configuration and attempt the real startup (executes 0x049d; stops at 0x000a, byte 7).
 target/release/shiinario_engine --project-dir /path/to/game
 
 # Inspect CP932 configuration and list the original archive entries.
@@ -40,7 +40,8 @@ target/release/shiinario_tool dump --project-dir /path/to/game A001.TXT
 target/release/shiinario_tool dump --project-dir /path/to/game START.SCN
 target/release/shiinario_tool inventory --project-dir /path/to/game
 
-# Research trace for the supported story-text subset. Unsupported commands stop execution.
+# Research traces for the verified SCN/TXT subsets. Unknown operations stop execution.
+target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-steps 10000
 target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
 ```
 
@@ -54,10 +55,14 @@ research artifacts outside this repository. No alternative save format is create
   OGV/Vorbis, project configuration, Windows-style path lookup, bounded byte cache.
 - `shiinario_scenario`: CP932 story parser, command inventory, bytecode research
   dumps, typed presentation events and deterministic input/timing for a limited
-  text interpreter. Unsupported commands produce sticky errors with source context.
+  text interpreter and the verified binary mouse-button mapping opcode. Unsupported
+  commands produce sticky errors with source context.
 - `shiinario_runtime`: host-independent startup and trace orchestration.
 - `shiinario_cli`: the engine and inspection tools. No native window backend yet.
 
 See [compatibility and validation](docs/COMPATIBILITY.md) for exact coverage and
 remaining work, [profile documentation](crates/shiinario_assets/profiles/ransem-v1/README.md)
 for reproducible profile export, and [third-party notices](THIRD_PARTY_NOTICES.md).
+
+See [SCN reverse-engineering notes](docs/SCN_RESEARCH.md) for the captured engine,
+Ghidra workflow and original-machine-code verification of opcode `0x049d`.
