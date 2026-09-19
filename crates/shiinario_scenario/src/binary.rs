@@ -123,6 +123,12 @@ pub enum MovieCommand {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    PostWindowMessage {
+        window: u32,
+        message: u32,
+        wparam: u32,
+        lparam: u32,
+    },
     Movie {
         id: u32,
         command: MovieCommand,
@@ -202,7 +208,7 @@ pub enum PlatformRequest {
     GetAudioStreamVolume {
         handle: u32,
     },
-    FinishAudioFade {
+    FadeAudioStream {
         handle: u32,
         interval: u32,
         step: i32,
@@ -558,7 +564,7 @@ pub struct BinaryVm {
     dispatch_quantum: u32,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
     window_messages: std::collections::VecDeque<[u32; 4]>,
-    window_callback: Option<(u32, usize)>,
+    window_callback: Option<(u32, usize, u32)>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
     retired_scopes: std::collections::BTreeSet<u32>,
@@ -744,7 +750,7 @@ impl BinaryVm {
     /// Original 4355b0 pushes hwnd/message/wparam/lparam; 42bf60 runs the
     /// registered entry synchronously. Queue it until any pending reply is done.
     pub fn window_message(&mut self, message: u32, wparam: u32, lparam: u32) {
-        if self.callback_tasks.contains_key(&0x07e4) {
+        if message == 0x10 || self.callback_tasks.contains_key(&0x07e4) {
             self.window_messages.push_back([0, message, wparam, lparam]);
         }
     }
@@ -757,7 +763,7 @@ impl BinaryVm {
         if self.async_text.as_ref().is_some_and(|text| text.ticking) {
             return self.text_step();
         }
-        if let Some((previous, sp)) = self.window_callback
+        if let Some((previous, sp, _)) = self.window_callback
             && self.context_flags & 1 == 0
         {
             self.sp = sp;
@@ -766,17 +772,22 @@ impl BinaryVm {
         }
         if self.window_callback.is_none() {
             while let Some(arguments) = self.window_messages.pop_front() {
-                let Some(&id) = self.callback_tasks.get(&0x07e4) else {
-                    continue;
-                };
-                let Some(&(base, pc)) = self.task_entries.get(&id) else {
+                let callback = self
+                    .callback_tasks
+                    .get(&0x07e4)
+                    .and_then(|&id| self.task_entries.get(&id).map(|&(base, pc)| (id, base, pc)));
+                let Some((id, base, pc)) = callback else {
+                    if arguments[1] == 0x10 {
+                        self.ended = true;
+                        return Ok(Event::End);
+                    }
                     continue;
                 };
                 ensure!(id != self.current_task, "recursive window callback");
                 let previous = self.current_task;
                 self.select_task(id);
                 ensure!(self.sp >= 4, "window callback stack overflow");
-                self.window_callback = Some((previous, self.sp));
+                self.window_callback = Some((previous, self.sp, arguments[1]));
                 self.sp -= 4;
                 self.banks.get_mut(&8).unwrap()[self.sp..self.sp + 4].copy_from_slice(&arguments);
                 self.switch_scenario(base);
@@ -2063,7 +2074,11 @@ impl BinaryVm {
                 rescan = true;
                 // A window procedure's nonzero return consumes the message;
                 // it is not a request to terminate the scenario session.
-                if result != 0 && self.window_callback.is_none() {
+                let close = result == 0
+                    && self
+                        .window_callback
+                        .is_some_and(|(_, _, message)| message == 0x10);
+                if close || (result != 0 && self.window_callback.is_none()) {
                     self.ended = true;
                 }
             }
@@ -2269,11 +2284,7 @@ impl BinaryVm {
                 let step = self.read(&mut cursor)? as i32;
                 let target = self.read(&mut cursor)?;
                 ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
-                ensure!(
-                    self.best_effort,
-                    "timed audio fading is unresolved; use best-effort playback"
-                );
-                request = Some(PlatformRequest::FinishAudioFade {
+                request = Some(PlatformRequest::FadeAudioStream {
                     handle,
                     interval,
                     step,
@@ -3610,6 +3621,16 @@ impl BinaryVm {
                         index,
                         value,
                     }
+                });
+            }
+            // PostMessageA: v2.36 4182b0, v2.47 41fde0. Window zero
+            // selects the engine's main window; all four arguments are read.
+            0x07bc => {
+                request = Some(PlatformRequest::PostWindowMessage {
+                    window: self.read(&mut cursor)?,
+                    message: self.read(&mut cursor)?,
+                    wparam: self.read(&mut cursor)?,
+                    lparam: self.read(&mut cursor)?,
                 });
             }
             0x07b2 => {

@@ -21,8 +21,44 @@ struct Voice {
     looping: bool,
     volume: u32,
     gain: f32,
+    fade: Option<Fade>,
+}
+struct Fade {
+    period_ms: u64,
+    elapsed: u64,
+    step: i32,
+    target: u32,
+    stop: bool,
 }
 impl Voice {
+    /// Advance on the output clock, independently of SCN scheduling. Returns
+    /// true when the fade has stopped this voice.
+    fn advance_fade(&mut self, frames: u64, rate: u32) -> bool {
+        let Some(fade) = &mut self.fade else {
+            return false;
+        };
+        fade.elapsed += frames * 1000;
+        let period = fade.period_ms * u64::from(rate);
+        while fade.elapsed >= period {
+            fade.elapsed -= period;
+            let next = i64::from(self.stream.volume.percent() as i32) + i64::from(fade.step);
+            let done = if fade.step > 0 {
+                next >= i64::from(fade.target)
+            } else {
+                next <= i64::from(fade.target)
+            };
+            if done {
+                let stop = fade.step < 0 && fade.stop;
+                self.stream
+                    .volume
+                    .set_fade_percent(if stop { next as u32 } else { fade.target });
+                self.fade = None;
+                return stop;
+            }
+            self.stream.volume.set_fade_percent(next as u32);
+        }
+        false
+    }
     fn frame_at(&self, frame: u64) -> Option<[f32; 2]> {
         let sound = &self.stream.sound;
         let channels = usize::from(sound.channels);
@@ -58,7 +94,7 @@ impl Voice {
         let a = self.frame_at(self.frame)?;
         let b = self.frame_at(self.frame + 1).unwrap_or(a);
         let fraction = self.fraction as f32 / rate as f32;
-        let volume = self.stream.volume.percent();
+        let volume = (self.stream.volume.percent() as i32).clamp(0, 100) as u32;
         if volume != self.volume {
             self.volume = volume;
             // DirectSound attenuation is in hundredths of a decibel.
@@ -121,13 +157,50 @@ impl Mixer {
         for buffer in self.buffers.values_mut() {
             buffer.advance(frames, 48000);
         }
-        for voice in self.voices.values_mut() {
+        self.voices.retain(|_, voice| {
+            if voice.frame_at(voice.frame).is_none() {
+                return false;
+            }
+            let frames = if voice.looping {
+                frames
+            } else {
+                let count =
+                    voice.stream.sound.samples.len() / usize::from(voice.stream.sound.channels);
+                let remaining = ((count as u64 - voice.frame) * 48000 - voice.fraction)
+                    .div_ceil(u64::from(voice.stream.sound.sample_rate));
+                frames.min(remaining)
+            };
+            if voice.advance_fade(frames, 48000) {
+                return false;
+            }
             let total = u128::from(voice.fraction)
                 + u128::from(frames) * u128::from(voice.stream.sound.sample_rate);
             voice.frame =
                 (u128::from(voice.frame) + total / 48000).min(u128::from(u64::MAX)) as u64;
             voice.fraction = (total % 48000) as u64;
+            voice.frame_at(voice.frame).is_some()
+        });
+    }
+    /// Original 2.36/2.47 workers sleep 5 ms and compare the counter before
+    /// incrementing it: interval 30 means one volume step every 35 ms.
+    pub fn fade(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
+        ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
+        if let Some(voice) = self.voices.get_mut(&handle) {
+            // Replacing a fade cancels the old worker even at the endpoint.
+            voice.fade = None;
+            if voice.frame_at(voice.frame).is_some()
+                && voice.stream.volume.percent() != target & 0x7fffffff
+            {
+                voice.fade = Some(Fade {
+                    period_ms: (u64::from(interval / 5).max(1) + 1) * 5,
+                    elapsed: 0,
+                    step: if step == 0 { -1 } else { step },
+                    target: target & 0x7fffffff,
+                    stop: target & 0x80000000 == 0,
+                });
+            }
         }
+        Ok(())
     }
     pub fn play(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()> {
         ensure!(
@@ -168,6 +241,7 @@ impl Mixer {
                 looping: flags & 2 != 0,
                 volume: u32::MAX,
                 gain: 1.0,
+                fade: None,
             },
         );
         Ok(())
@@ -186,7 +260,7 @@ impl Mixer {
             if let Some(frame) = voice.next(rate) {
                 sum[0] += frame[0];
                 sum[1] += frame[1];
-                true
+                !voice.advance_fade(1, rate)
             } else {
                 false
             }
@@ -229,6 +303,13 @@ pub struct AudioOutput {
     frames: Arc<AtomicU64>,
 }
 impl AudioOutput {
+    pub fn fade(&self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
+        self.check()?;
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .fade(handle, interval, step, target)
+    }
     pub fn install_sound(&self, id: u32, sound: Arc<Sound>) -> Result<()> {
         self.check()?;
         self.mixer

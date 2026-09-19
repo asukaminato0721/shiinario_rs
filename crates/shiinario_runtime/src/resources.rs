@@ -48,6 +48,11 @@ impl Default for StreamVolume {
     }
 }
 impl StreamVolume {
+    // The original fade worker retains the signed overshoot when it stops
+    // playback. Keep that value observable through opcode 06e3.
+    pub(crate) fn set_fade_percent(&self, percent: u32) {
+        self.0.store(percent, Ordering::Relaxed);
+    }
     pub fn percent(&self) -> u32 {
         self.0.load(Ordering::Relaxed)
     }

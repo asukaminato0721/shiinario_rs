@@ -1,6 +1,6 @@
 //! Shared scenario execution and resource handling for traces and native hosts.
 use crate::resources::{AudioStream, Resources, Sound, Surface};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
 use shiinario_scenario::{BinaryVm, Event, MovieCommand, PlatformRequest, SoundCommand};
@@ -24,6 +24,7 @@ pub trait Host {
     fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()>;
     fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32>;
     fn stop_stream(&mut self, handle: u32) -> Result<()>;
+    fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()>;
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()>;
 }
 
@@ -133,6 +134,27 @@ impl Session {
                     location.offset
                 );
             }
+            if let PlatformRequest::PostWindowMessage {
+                window,
+                message,
+                wparam,
+                lparam,
+            } = &request
+            {
+                ensure!(
+                    *window == 0 && *message == 0x10,
+                    "unsupported posted window message: {request:?}"
+                );
+                // Queue WM_CLOSE so a registered window procedure can consume
+                // it. An unhandled close ends the session via its normal path.
+                vm.window_message(*message, *wparam, *lparam);
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
             if matches!(
                 request,
                 PlatformRequest::CursorPosition
@@ -230,32 +252,18 @@ impl Session {
                 })?;
                 return Ok(true);
             }
-            if let PlatformRequest::FinishAudioFade {
+            if let PlatformRequest::FadeAudioStream {
                 handle,
                 interval,
                 step,
                 target,
             } = &request
             {
-                emit(&Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode: 0x06ec,
-                    detail: format!(
-                        "audio fade interval {interval} ms omitted; stream {handle:#x} completes at volume {}",
-                        target & 0x7fffffff
-                    ),
-                })?;
                 if *handle != 0 {
-                    let stream = resources
+                    resources
                         .audio_stream(*handle)
                         .context("unknown audio stream in fade")?;
-                    let percent = target & 0x7fffffff;
-                    if stream.volume.percent() != percent {
-                        stream.volume.set_percent(percent)?;
-                        if *step <= 0 && target & 0x80000000 == 0 {
-                            host.stop_stream(*handle)?;
-                        }
-                    }
+                    host.fade_stream(*handle, *interval, *step, *target)?;
                 }
                 vm.respond(1)?;
                 emit(&Event::PlatformReply {

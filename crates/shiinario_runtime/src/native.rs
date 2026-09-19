@@ -190,6 +190,12 @@ impl Host for NativeHost {
             .context("audio has not been initialized")?
             .sound_command(id, command)
     }
+    fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
+        if let Some(audio) = &self.audio {
+            audio.fade(handle, interval, step, target)?;
+        }
+        Ok(())
+    }
     fn stop_stream(&mut self, handle: u32) -> Result<()> {
         self.audio
             .as_ref()

@@ -222,6 +222,9 @@ impl Host for TracePlatform {
     ) -> Result<u32> {
         self.mixer.sound_command(id, command)
     }
+    fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
+        self.mixer.fade(handle, interval, step, target)
+    }
     fn stop_stream(&mut self, handle: u32) -> Result<()> {
         self.mixer.stop(handle);
         Ok(())
