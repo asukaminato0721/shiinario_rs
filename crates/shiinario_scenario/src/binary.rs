@@ -47,6 +47,11 @@ pub struct ImageDraw {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    ReadControls,
+    CursorPosition,
+    MapCursor {
+        point: [i32; 2],
+    },
     HitTestImages {
         x: i32,
         y: i32,
@@ -360,6 +365,7 @@ pub struct BinaryVm {
     ini_path: String,
     pending_bytes: Option<u32>,
     pending_bounds: Option<[Destination; 4]>,
+    pending_point: Option<[Destination; 2]>,
     context_flags: u32,
     message_mode: u32,
     background_mode: u32,
@@ -412,6 +418,7 @@ impl BinaryVm {
             ini_path: String::new(),
             pending_bytes: None,
             pending_bounds: None,
+            pending_point: None,
             context_flags: 1,
             message_mode: 0,
             background_mode: 0,
@@ -545,6 +552,14 @@ impl BinaryVm {
             line: None,
         }
     }
+    /// Read-only scenario memory for inspection after self-modifying scripts.
+    pub fn scenario_buffers(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        std::iter::once((self.name.as_str(), self.data.as_slice())).chain(
+            self.scenarios
+                .values()
+                .map(|s| (s.name.as_str(), s.data.as_slice())),
+        )
+    }
     pub fn mouse_mapping(&self) -> MouseButtonMapping {
         self.mouse_mapping
     }
@@ -559,6 +574,10 @@ impl BinaryVm {
     /// Complete the outstanding platform request. Repeated step calls before a
     /// response return the same request, without executing the next instruction.
     pub fn respond(&mut self, value: u32) -> Result<()> {
+        ensure!(
+            self.pending_point.is_none(),
+            "platform request requires a point reply"
+        );
         ensure!(
             self.pending_bounds.is_none(),
             "platform request requires image bounds"
@@ -828,6 +847,17 @@ impl BinaryVm {
             .take()
             .context("no pending image bounds query")?;
         for (destination, value) in destinations.into_iter().zip(bounds) {
+            self.write(destination, value as u32);
+        }
+        self.pending = None;
+        Ok(())
+    }
+    pub fn respond_point(&mut self, point: [i32; 2]) -> Result<()> {
+        let destinations = self
+            .pending_point
+            .take()
+            .context("no pending point query")?;
+        for (destination, value) in destinations.into_iter().zip(point) {
             self.write(destination, value as u32);
         }
         self.pending = None;
@@ -1181,6 +1211,7 @@ impl BinaryVm {
         let mut memory_write = None;
         let mut byte_destination = None;
         let mut bounds_destinations = None;
+        let mut point_destinations = None;
         let mut next_base = self.script_base;
         let mut definition = None;
         let mut rescan = false;
@@ -1189,6 +1220,27 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x0456 | 0x0492 => {
+                let begin = cursor.pc;
+                request = Some(if opcode == 0x0492 {
+                    let point = [
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                    ];
+                    cursor.pc = begin;
+                    PlatformRequest::MapCursor { point }
+                } else {
+                    PlatformRequest::CursorPosition
+                });
+                point_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+            }
+            0x03e9 => {
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadControls);
+            }
             0x07e5 => self.background_mode = 1,
             0x07e6 => self.background_mode = 0,
             0x07e8 => writes.push((self.destination(&mut cursor)?, self.background_mode)),
@@ -2120,6 +2172,7 @@ impl BinaryVm {
         }
         self.pc = cursor.pc;
         self.pending_bounds = bounds_destinations;
+        self.pending_point = point_destinations;
         if let Some((range, bytes)) = memory_write {
             self.memory_write(range, &bytes);
         }

@@ -4,11 +4,20 @@ An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
 **This is not yet a playable port.** Asset decoding is verified against GARbro;
 binary scenario execution, native presentation, menus, choices, movies, and saves
 remain unfinished. Startup execution stops at an unresolved instruction or a platform request that
-has no host. The optional simulated-platform trace executes 316 startup instructions
-with offsets matching captured x86 execution, then stops at mutable image creation. Drawing buffers and the first S25 image
-are allocated/read by the Rust host; device and window replies remain simulated.
+has no host. The optional simulated-platform trace now reaches the title input
+routine after 15,541 instructions, stopping at `_SPRIT\title.SCN:0x2784`, opcode
+`0x03e9`. Instruction/poll order, final SCN memory and three title-buffer hashes
+match captured x86 execution with the same synthetic services. It supports the title redraw request, explicit synthetic clock progression,
+S25 drawing and hit testing, frame bounds, parameterized calls and case lists.
+Window input and timer/transition scheduling remain unfinished.
+The Rust host allocates drawing buffers and mutable images, loads the initial and title S25 images,
+and decodes seven sound slots plus the title music stream. Device/window replies
+remain simulated in traces. A separate CPAL audio host passes a live-device
+synthetic-tone test; it is not yet connected to a native game window. No game
+presentation or playable menu is available.
 
-The workspace builds independently of the reference checkouts:
+The workspace builds independently of the reference checkouts. On Linux, CPAL
+requires ALSA development headers and pkg-config:
 
 ```sh
 cargo build --workspace --release --locked
@@ -45,7 +54,7 @@ target/release/shiinario_tool inventory --project-dir /path/to/game
 # Research traces for the verified SCN/TXT subsets. Unknown operations stop execution.
 target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --max-steps 10000
 # Explicit simulated Windows replies, logged in the output; this does not display a game window.
-target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --max-steps 10000
+target/release/shiinario_tool trace --project-dir /path/to/game START.SCN --simulate-platform --tick-ms 16 --max-steps 40000
 target/release/shiinario_tool trace --project-dir /path/to/game A001.TXT --max-steps 10000
 ```
 
@@ -60,7 +69,7 @@ research artifacts outside this repository. No alternative save format is create
 - `shiinario_scenario`: CP932 story parser, command inventory, bytecode research
   dumps, typed presentation events and deterministic input/timing for a limited
   text interpreter and the recovered binary startup subset: operand banks, bounded
-  memory, scoped scalar variables, branches, calls, strings, inactive task definitions,
+  memory, task-local scopes and stacks, branches, calls, strings, cooperative scheduling,
   and platform requests.
   Unsupported commands produce sticky errors with source context.
 - `shiinario_runtime`: host-independent startup and trace orchestration, bounded

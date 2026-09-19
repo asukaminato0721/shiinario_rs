@@ -113,6 +113,9 @@ pub fn hit_test(data: &[u8], index: usize, x: u32, y: u32) -> Result<bool> {
         return Ok(false);
     }
     let pos = word(data, frame.offset + 20 + y as usize * 4)? as usize;
+    if pos == 0 {
+        return Ok(false);
+    }
     let len = u16::from_le_bytes(bytes(data, pos, 2)?.try_into()?) as usize;
     let skip = pos & 1;
     ensure!(len >= skip, "S25 invalid row length");
@@ -203,6 +206,22 @@ fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hit_test_checks_row_bounds_and_rejects_zero_runs() {
+        let mut data = b"S25\0".to_vec();
+        for word in [1u32, 12, 1, 1, 0, 0, 0, 36] {
+            data.extend(word.to_le_bytes());
+        }
+        data.extend([2, 0, 0, 0]);
+        assert!(hit_test(&data, 0, 0, 0).is_err());
+        assert!(!hit_test(&data, 0, 1, 0).unwrap());
+        data[38..40].copy_from_slice(&[1, 0x80]);
+        assert!(hit_test(&data, 0, 0, 0).is_err());
+        data[32..36].fill(0);
+        assert!(!hit_test(&data, 0, 0, 0).unwrap());
+        data[32..36].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(hit_test(&data, 0, 0, 0).is_err());
+    }
     #[test]
     fn colors_transparency_and_repeats() {
         let mut row = vec![2, 0x60, 1, 2, 3, 0, 1, 0xa0, 128, 4, 5, 6, 1, 0x20];

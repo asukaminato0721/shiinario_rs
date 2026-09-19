@@ -179,6 +179,14 @@ pub enum Event {
         id: u32,
         bgr_sha256: String,
     },
+    ScenarioDigest {
+        name: String,
+        sha256: String,
+    },
+    PointReply {
+        point: [i32; 2],
+        simulated: bool,
+    },
     ImageBoundsReply {
         bounds: [i32; 4],
     },

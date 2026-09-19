@@ -1,6 +1,8 @@
 //! Host-independent project startup and deterministic research traces.
 pub mod audio;
+pub mod input;
 pub mod resources;
+pub mod viewport;
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
@@ -69,7 +71,18 @@ pub fn trace_with_clock(
         let mut resources = resources::Resources::for_project(project)?;
         let mut audio = audio::Mixer::default();
         for _ in 0..max_steps {
-            let event = vm.scheduled_step()?;
+            let event = match vm.scheduled_step() {
+                Ok(event) => event,
+                Err(error) => {
+                    for (name, data) in vm.scenario_buffers() {
+                        emit(&Event::ScenarioDigest {
+                            name: name.to_owned(),
+                            sha256: format!("{:x}", Sha256::digest(data)),
+                        })?;
+                    }
+                    return Err(error);
+                }
+            };
             emit(&event)?;
             if event == Event::SchedulerPoll {
                 if !simulate_platform {
@@ -98,6 +111,24 @@ pub fn trace_with_clock(
                         location.scenario,
                         location.offset
                     );
+                }
+                if matches!(
+                    request,
+                    PlatformRequest::CursorPosition | PlatformRequest::MapCursor { .. }
+                ) {
+                    let point = match request {
+                        PlatformRequest::CursorPosition => [0, 0],
+                        PlatformRequest::MapCursor { point } => {
+                            viewport::ViewportTransform::default().to_logical(point)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    vm.respond_point(point)?;
+                    emit(&Event::PointReply {
+                        point,
+                        simulated: true,
+                    })?;
+                    continue;
                 }
                 if let PlatformRequest::ImageBounds { id, frame } = &request {
                     let bounds = resources.image_bounds(*id, *frame).with_context(|| {
@@ -287,6 +318,7 @@ impl TracePlatform {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::ReadControls => Ok(input::ControlState::default().mask()),
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
             PlatformRequest::ReleaseGraphics | PlatformRequest::SetFullscreen { .. } => Ok(1),
