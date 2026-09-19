@@ -3,6 +3,7 @@ use anyhow::{Context, Result, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::{
     ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCopy,
+    SurfaceStretch,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -619,6 +620,51 @@ impl Resources {
         }
         Ok(())
     }
+    fn stretch_surface(&mut self, stretch: &SurfaceStretch) -> Result<()> {
+        ensure!(
+            stretch.mode == 0xcc0020 || stretch.mode & 0x80000000 != 0,
+            "unsupported stretch raster operation {:#x}",
+            stretch.mode
+        );
+        let [dw, dh] = stretch.destination_size.map(i64::from);
+        let [sw, sh] = stretch.source_size.map(i64::from);
+        ensure!(
+            [dw, dh, sw, sh].iter().all(|v| (0..=16384).contains(v)),
+            "mirrored or oversized stretch rectangle"
+        );
+        if dw == 0 || dh == 0 || sw == 0 || sh == 0 {
+            return Ok(());
+        }
+        let dst = self
+            .surfaces
+            .get(&stretch.destination.id)
+            .context("missing stretch destination")?;
+        let src = self
+            .surfaces
+            .get(&stretch.source.id)
+            .context("missing stretch source")?;
+        let source = src.pixels.read(0, src.pixels.len())?;
+        let mut pixels = dst.pixels.read(0, dst.pixels.len())?;
+        let dx = i64::from(stretch.destination.x);
+        let dy = i64::from(stretch.destination.y);
+        for y in dy.max(0)..(dy + dh).min(i64::from(dst.height)) {
+            let sy = i64::from(stretch.source.y) + (y - dy) * sh / dh;
+            if sy < 0 || sy >= i64::from(src.height) {
+                continue;
+            }
+            for x in dx.max(0)..(dx + dw).min(i64::from(dst.width)) {
+                let sx = i64::from(stretch.source.x) + (x - dx) * sw / dw;
+                if sx < 0 || sx >= i64::from(src.width) {
+                    continue;
+                }
+                let read = sy as usize * src.stride + sx as usize * 3;
+                let write = y as usize * dst.stride + x as usize * 3;
+                pixels[write..write + 3].copy_from_slice(&source[read..read + 3]);
+            }
+        }
+        dst.pixels.write(0, &pixels)
+    }
+
     fn create_surface(&mut self, id: u32, width: u32, height: u32, flags: u32) -> Result<()> {
         ensure!(
             id < 256 && width > 0 && height > 0 && width <= 16384 && height <= 16384,
@@ -808,8 +854,14 @@ impl Resources {
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         if let PlatformRequest::GetAudioStreamVolume { handle } = request {
-            return Ok(Some(if *handle == 0 { u32::MAX } else {
-                self.streams.get(handle).context("unknown audio stream in volume query")?.volume.percent()
+            return Ok(Some(if *handle == 0 {
+                u32::MAX
+            } else {
+                self.streams
+                    .get(handle)
+                    .context("unknown audio stream in volume query")?
+                    .volume
+                    .percent()
             }));
         }
         match request {
@@ -840,6 +892,7 @@ impl Resources {
             PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::StretchSurface(stretch) => self.stretch_surface(stretch)?,
             PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
@@ -885,6 +938,30 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stretch_clips_destination_and_preserves_padding_and_failed_draws() {
+        use shiinario_scenario::SurfacePoint;
+        let mut resources = Resources::default();
+        resources.create_surface(1, 2, 1, 0).unwrap();
+        resources.create_surface(0, 3, 2, 0).unwrap();
+        resources.surfaces[&1]
+            .pixels
+            .write(0, &[1, 2, 3, 4, 5, 6, 99, 99])
+            .unwrap();
+        let mut operation = SurfaceStretch {
+            destination: SurfacePoint { id: 0, x: -1, y: 0 },
+            destination_size: [4, 2],
+            source: SurfacePoint { id: 1, x: 0, y: 0 },
+            source_size: [2, 1],
+            mode: 0xcc0020,
+        };
+        resources.stretch_surface(&operation).unwrap();
+        let expected = [1, 2, 3, 4, 5, 6, 4, 5, 6, 0, 0, 0].repeat(2);
+        assert_eq!(resources.surfaces[&0].pixels.read(0, 24).unwrap(), expected);
+        operation.mode = 0;
+        assert!(resources.stretch_surface(&operation).is_err());
+        assert_eq!(resources.surfaces[&0].pixels.read(0, 24).unwrap(), expected);
+    }
     #[test]
     fn surface_release_matches_original_and_reclaims_budget() {
         use shiinario_scenario::{BinaryVm, Event};

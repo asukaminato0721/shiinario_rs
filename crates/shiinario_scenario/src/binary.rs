@@ -40,6 +40,15 @@ pub struct SurfaceCopy {
     pub source: SurfacePoint,
     pub size: [i32; 2],
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceStretch {
+    pub destination: SurfacePoint,
+    pub destination_size: [i32; 2],
+    pub source: SurfacePoint,
+    pub source_size: [i32; 2],
+    pub mode: u32,
+}
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct MaskTransition {
     pub destination: u32,
@@ -115,6 +124,7 @@ pub enum PlatformRequest {
     },
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
+    StretchSurface(SurfaceStretch),
     MaskTransition(MaskTransition),
     SurfacePixels {
         id: u32,
@@ -128,8 +138,15 @@ pub enum PlatformRequest {
         handle: u32,
         percent: u32,
     },
-    GetAudioStreamVolume { handle: u32 },
-    FinishAudioFade { handle: u32, interval: u32, step: i32, target: u32 },
+    GetAudioStreamVolume {
+        handle: u32,
+    },
+    FinishAudioFade {
+        handle: u32,
+        interval: u32,
+        step: i32,
+        target: u32,
+    },
     StopAudioStream {
         handle: u32,
     },
@@ -1556,6 +1573,34 @@ impl BinaryVm {
                     flags,
                 }));
             }
+            0x051e => {
+                let destination = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                let destination_size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let source = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                let source_size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let mode = self.read(&mut cursor)?;
+                request = Some(PlatformRequest::StretchSurface(SurfaceStretch {
+                    destination,
+                    destination_size,
+                    source,
+                    source_size,
+                    mode,
+                }));
+            }
             0x04e2 => {
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
@@ -1635,8 +1680,16 @@ impl BinaryVm {
                 let step = self.read(&mut cursor)? as i32;
                 let target = self.read(&mut cursor)?;
                 ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
-                ensure!(self.best_effort, "timed audio fading is unresolved; use best-effort playback");
-                request = Some(PlatformRequest::FinishAudioFade {handle,interval,step,target});
+                ensure!(
+                    self.best_effort,
+                    "timed audio fading is unresolved; use best-effort playback"
+                );
+                request = Some(PlatformRequest::FinishAudioFade {
+                    handle,
+                    interval,
+                    step,
+                    target,
+                });
             }
             0x06df => {
                 let handle = self.read(&mut cursor)?;
@@ -2329,6 +2382,31 @@ impl BinaryVm {
                 writes.push((destination?, value));
                 self.sp += 1;
             }
+            0x0212 => {
+                let end = cursor.dword()?;
+                let counter = end
+                    .checked_sub(8)
+                    .context("loop counter address underflow")?;
+                let value = self.read(&mut cursor)?;
+                let address = self
+                    .script_base
+                    .checked_add(counter)
+                    .context("loop counter address overflow")?;
+                memory_write = Some((self.memory_range(address, 4)?, value.to_le_bytes().to_vec()));
+            }
+            0x0213 => {
+                let counter = cursor.pc;
+                let value = cursor.dword()?.wrapping_sub(1);
+                let target = cursor.dword()? as usize;
+                if value != 0 {
+                    ensure!(target < self.data.len(), "loop target outside scenario");
+                    cursor.pc = target;
+                }
+                memory_write = Some((
+                    self.memory_range(self.script_base + counter as u32, 4)?,
+                    value.to_le_bytes().to_vec(),
+                ));
+            }
             0x0280 => {
                 let count = cursor.word()? as usize;
                 let argc = *self
@@ -2345,14 +2423,27 @@ impl BinaryVm {
             0x0281 | 0x0283 => {
                 let tag = cursor.byte()?;
                 let destination = self.operand_address(tag, &mut cursor)?;
-                if destination != 0 { self.memory_range(destination, 4)?; }
+                if destination != 0 {
+                    self.memory_range(destination, 4)?;
+                }
                 let operand = self.read(&mut cursor)?;
-                let (base,target) = if opcode==0x0283 {
-                    *self.task_entries.get(&operand).with_context(||format!("parameterized call to undefined task {operand}"))?
+                let (base, target) = if opcode == 0x0283 {
+                    *self.task_entries.get(&operand).with_context(|| {
+                        format!("parameterized call to undefined task {operand}")
+                    })?
                 } else {
-                    (self.script_base,operand.checked_sub(self.script_base).context("function address outside scenario")? as usize)
+                    (
+                        self.script_base,
+                        operand
+                            .checked_sub(self.script_base)
+                            .context("function address outside scenario")?
+                            as usize,
+                    )
                 };
-                ensure!(target < self.scenario_size(base)?, "function target outside scenario");
+                ensure!(
+                    target < self.scenario_size(base)?,
+                    "function target outside scenario"
+                );
                 let count = cursor.word()? as usize;
                 ensure!(
                     self.parameters.len() + count + 2 <= CELLS,
@@ -2386,7 +2477,11 @@ impl BinaryVm {
                     .checked_sub(count + 2)
                     .context("invalid function parameter frame")?;
                 let destination = self.parameters[start];
-                let range = if destination == 0 { None } else { Some(self.memory_range(destination, 4)?) };
+                let range = if destination == 0 {
+                    None
+                } else {
+                    Some(self.memory_range(destination, 4)?)
+                };
                 let value = self.read(&mut cursor)?;
                 ensure!(self.sp <= CELLS - 2, "return stack underflow");
                 // Native writes the return value before popping the saved PC.
@@ -2409,7 +2504,7 @@ impl BinaryVm {
                     target < self.scenario_size(base)?,
                     "return target outside scenario"
                 );
-                memory_write = range.map(|range|(range, value.to_le_bytes().to_vec()));
+                memory_write = range.map(|range| (range, value.to_le_bytes().to_vec()));
                 self.parameters.truncate(start);
                 self.sp += 2;
                 cursor.pc = target;
@@ -2855,23 +2950,61 @@ mod tests {
 
     #[test]
     fn parameterized_library_call_preserves_caller_and_optional_result() {
-        for discard in [false,true] {
-            let mut args=if discard { immediate(0) } else { vec![12,1,0] };
-            args.extend(immediate(77));args.extend(2u16.to_le_bytes());
-            args.extend(immediate(11));args.extend(immediate(22));
-            let mut code=instruction(0x283,&args);let return_pc=code.len();
-            code.extend(instruction(0,&immediate(0)));
-            let mut vm=BinaryVm::new("caller.scn",code).unwrap();
-            let mut callee=instruction(0x280,&[2,0,12,3,0,12,4,0]);
-            callee.extend(instruction(0x285,&[12,4,0]));
-            vm.scenarios.insert(0x40000000,Scenario {name:"library.scn".into(),data:callee});
-            vm.define_task(77,0x40000000,0,false);vm.banks.get_mut(&12).unwrap()[1]=99;
-            vm.step().unwrap();assert_eq!(vm.name,"library.scn");assert_eq!(vm.sp,998);
-            vm.step().unwrap();assert_eq!(vm.banks[&12][3..5],[11,22]);
-            vm.step().unwrap();assert_eq!(vm.name,"caller.scn");assert_eq!(vm.pc,return_pc);
-            assert_eq!(vm.banks[&12][1],if discard {99} else {22});
-            assert_eq!(vm.sp,1000);assert!(vm.parameters.is_empty());
+        for discard in [false, true] {
+            let mut args = if discard {
+                immediate(0)
+            } else {
+                vec![12, 1, 0]
+            };
+            args.extend(immediate(77));
+            args.extend(2u16.to_le_bytes());
+            args.extend(immediate(11));
+            args.extend(immediate(22));
+            let mut code = instruction(0x283, &args);
+            let return_pc = code.len();
+            code.extend(instruction(0, &immediate(0)));
+            let mut vm = BinaryVm::new("caller.scn", code).unwrap();
+            let mut callee = instruction(0x280, &[2, 0, 12, 3, 0, 12, 4, 0]);
+            callee.extend(instruction(0x285, &[12, 4, 0]));
+            vm.scenarios.insert(
+                0x40000000,
+                Scenario {
+                    name: "library.scn".into(),
+                    data: callee,
+                },
+            );
+            vm.define_task(77, 0x40000000, 0, false);
+            vm.banks.get_mut(&12).unwrap()[1] = 99;
+            vm.step().unwrap();
+            assert_eq!(vm.name, "library.scn");
+            assert_eq!(vm.sp, 998);
+            vm.step().unwrap();
+            assert_eq!(vm.banks[&12][3..5], [11, 22]);
+            vm.step().unwrap();
+            assert_eq!(vm.name, "caller.scn");
+            assert_eq!(vm.pc, return_pc);
+            assert_eq!(vm.banks[&12][1], if discard { 99 } else { 22 });
+            assert_eq!(vm.sp, 1000);
+            assert!(vm.parameters.is_empty());
         }
+    }
+
+    #[test]
+    fn counted_loop_writes_its_counter_and_exits_at_zero() {
+        let mut args = 28u32.to_le_bytes().to_vec();
+        args.extend(immediate(2));
+        let mut code = instruction(0x212, &args);
+        code.extend(instruction(0x2f8, &immediate(7)));
+        code.extend(instruction(0x213, &[0, 0, 0, 0, 11, 0, 0, 0]));
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("loop.scn", code).unwrap();
+        for _ in 0..5 {
+            vm.step().unwrap();
+        }
+        assert_eq!(vm.pc, 28);
+        assert_eq!(vm.sp, 998);
+        assert_eq!(vm.banks[&8][998..1000], [7, 7]);
+        assert_eq!(&vm.data[20..24], &[0; 4]);
     }
 
     #[test]

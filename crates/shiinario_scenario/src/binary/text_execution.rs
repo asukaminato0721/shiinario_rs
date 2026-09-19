@@ -303,31 +303,60 @@ mod tests {
     use super::*;
     #[test]
     fn best_effort_image_text_is_logged_and_surface_drawing_resumes() {
-        let mut code=Vec::new();
-        let immediate=|value:u32| { let mut out=vec![4];out.extend(value.to_le_bytes());out };
-        for (target,text) in [(17,b"_AA".as_slice()),(u32::MAX,b"B")] {
-            code.extend(0xb4u16.to_le_bytes());code.extend(immediate(target));code.extend(immediate(0));
-            code.extend(0x83u16.to_le_bytes());code.extend(immediate(0));code.push(0x10);code.extend(text);code.push(0);
+        let mut code = Vec::new();
+        let immediate = |value: u32| {
+            let mut out = vec![4];
+            out.extend(value.to_le_bytes());
+            out
+        };
+        for (target, text) in [(17, b"_AA".as_slice()), (u32::MAX, b"B")] {
+            code.extend(0xb4u16.to_le_bytes());
+            code.extend(immediate(target));
+            code.extend(immediate(0));
+            code.extend(0x83u16.to_le_bytes());
+            code.extend(immediate(0));
+            code.push(0x10);
+            code.extend(text);
+            code.push(0);
         }
-        code.extend(0u16.to_le_bytes());code.extend(immediate(0));
-        let mut strict=BinaryVm::new("image-text.scn",code.clone()).unwrap();
-        assert!(strict.step().unwrap_err().to_string().contains("image frames"));
-        let mut vm=BinaryVm::new("image-text.scn",code).unwrap();vm.set_best_effort(true);
-        let mut skipped=0;let mut drawn=Vec::new();
+        code.extend(0u16.to_le_bytes());
+        code.extend(immediate(0));
+        let mut strict = BinaryVm::new("image-text.scn", code.clone()).unwrap();
+        assert!(
+            strict
+                .step()
+                .unwrap_err()
+                .to_string()
+                .contains("image frames")
+        );
+        let mut vm = BinaryVm::new("image-text.scn", code).unwrap();
+        vm.set_best_effort(true);
+        let mut skipped = 0;
+        let mut drawn = Vec::new();
         for step in 0..100 {
-            assert!(step<99);
+            assert!(step < 99);
             match vm.scheduled_step().unwrap() {
-                Event::End=>break,
-                Event::CompatibilitySkip {opcode:0xb4,..}=>skipped+=1,
-                Event::SchedulerPoll=>vm.respond(1).unwrap(),
-                Event::Platform {request:PlatformRequest::DrawGlyph {character,position,..},..}=> {
-                    drawn.push((character,position));vm.respond(1).unwrap();
+                Event::End => break,
+                Event::CompatibilitySkip { opcode: 0xb4, .. } => skipped += 1,
+                Event::SchedulerPoll => vm.respond(1).unwrap(),
+                Event::Platform {
+                    request:
+                        PlatformRequest::DrawGlyph {
+                            character,
+                            position,
+                            ..
+                        },
+                    ..
+                } => {
+                    drawn.push((character, position));
+                    vm.respond(1).unwrap();
                 }
-                Event::BinaryInstruction {..}|Event::TextTick {..}=>{},
-                event=>panic!("{event:?}"),
+                Event::BinaryInstruction { .. } | Event::TextTick { .. } => {}
+                event => panic!("{event:?}"),
             }
         }
-        assert_eq!(skipped,1);assert_eq!(drawn,vec![('B',[8,0])]);
+        assert_eq!(skipped, 1);
+        assert_eq!(drawn, vec![('B', [8, 0])]);
     }
     fn decode(hex: &str) -> Vec<u8> {
         (0..hex.len())

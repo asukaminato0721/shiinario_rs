@@ -8,7 +8,7 @@ mod text;
 pub mod text_layout;
 pub use binary::{
     BinaryVm, ImageDraw, MaskTransition, MouseButtonMapping, PlatformRequest, SoundCommand,
-    SurfaceBlend, SurfaceCopy, SurfacePoint, boot_binary,
+    SurfaceBlend, SurfaceCopy, SurfacePoint, SurfaceStretch, boot_binary,
 };
 pub use memory::SharedMemory;
 pub use text::TextStyle;

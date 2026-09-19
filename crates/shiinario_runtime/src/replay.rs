@@ -65,7 +65,8 @@ impl Replay {
             mouse_buttons: self.mapping.map_buttons(self.mouse),
             ..Default::default()
         }
-        .mask() | self.control_mask
+        .mask()
+            | self.control_mask
     }
 }
 
