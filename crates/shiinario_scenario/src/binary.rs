@@ -155,14 +155,25 @@ struct TaskState {
 }
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
-        Self { base, pc, sp: CELLS, flags: 0,
-            stack: vec![0; CELLS], locals: vec![0; CELLS], scopes: Vec::new() }
+        Self {
+            base,
+            pc,
+            sp: CELLS,
+            flags: 0,
+            stack: vec![0; CELLS],
+            locals: vec![0; CELLS],
+            scopes: Vec::new(),
+        }
     }
     fn bank(&self, tag: u8) -> &[u32] {
         if tag == 8 { &self.stack } else { &self.locals }
     }
     fn bank_mut(&mut self, tag: u8) -> &mut [u32] {
-        if tag == 8 { &mut self.stack } else { &mut self.locals }
+        if tag == 8 {
+            &mut self.stack
+        } else {
+            &mut self.locals
+        }
     }
 }
 
@@ -336,17 +347,26 @@ impl BinaryVm {
         Ok(())
     }
     fn task_flags(&self, id: u32) -> u32 {
-        if id == self.current_task { self.context_flags }
-        else { self.tasks.get(&id).map_or(0, |t| t.flags) }
+        if id == self.current_task {
+            self.context_flags
+        } else {
+            self.tasks.get(&id).map_or(0, |t| t.flags)
+        }
     }
     fn rescan_tasks(&mut self) {
         if self.thread_limit_override == 0 {
-            self.thread_limit = (0..CELLS as u32).rev()
-                .find(|&id| self.task_flags(id) & 1 != 0).unwrap_or(0) + 1;
+            self.thread_limit = (0..CELLS as u32)
+                .rev()
+                .find(|&id| self.task_flags(id) & 1 != 0)
+                .unwrap_or(0)
+                + 1;
         }
     }
     fn define_task(&mut self, id: u32, base: u32, pc: usize, activate: bool) {
-        let task = self.tasks.entry(id).or_insert_with(|| TaskState::new(base, pc));
+        let task = self
+            .tasks
+            .entry(id)
+            .or_insert_with(|| TaskState::new(base, pc));
         task.base = base;
         task.pc = pc;
         task.sp = CELLS;
@@ -354,10 +374,15 @@ impl BinaryVm {
         self.task_entries.insert(id, (base, pc));
     }
     fn select_task(&mut self, id: u32) {
-        if id == self.current_task { return; }
+        if id == self.current_task {
+            return;
+        }
         let task = self.tasks.remove(&id).expect("defined runnable task");
         let old = TaskState {
-            base: self.script_base, pc: self.pc, sp: self.sp, flags: self.context_flags,
+            base: self.script_base,
+            pc: self.pc,
+            sp: self.sp,
+            flags: self.context_flags,
             stack: std::mem::replace(self.banks.get_mut(&8).unwrap(), task.stack),
             locals: std::mem::replace(self.banks.get_mut(&12).unwrap(), task.locals),
             scopes: std::mem::replace(&mut self.named_scopes, task.scopes),
@@ -403,8 +428,11 @@ impl BinaryVm {
                 return Ok(self.scheduler_poll());
             }
             let flags = self.task_flags(self.scheduler.scan);
-            ensure!(flags & (2 | 8) == 0,
-                "task {}: unsupported timer/transition flags {flags:#x}", self.scheduler.scan);
+            ensure!(
+                flags & (2 | 8) == 0,
+                "task {}: unsupported timer/transition flags {flags:#x}",
+                self.scheduler.scan
+            );
             if flags & 1 == 0 {
                 self.scheduler.scan += 1;
                 continue;
@@ -417,8 +445,15 @@ impl BinaryVm {
         let event = self.step()?;
         self.scheduler.used += 1;
         self.scheduler.yielded = self.scheduler.used >= self.dispatch_quantum
-            || self.message_mode != 0 || self.context_flags == 0
-            || matches!(&event, Event::Platform { request: PlatformRequest::PumpMessages, .. });
+            || self.message_mode != 0
+            || self.context_flags == 0
+            || matches!(
+                &event,
+                Event::Platform {
+                    request: PlatformRequest::PumpMessages,
+                    ..
+                }
+            );
         Ok(event)
     }
     pub fn location(&self) -> Location {
@@ -486,10 +521,11 @@ impl BinaryVm {
         }
         if matches!(
             event,
-            Event::SchedulerPoll | Event::Platform {
-                request: PlatformRequest::PumpMessages,
-                ..
-            }
+            Event::SchedulerPoll
+                | Event::Platform {
+                    request: PlatformRequest::PumpMessages,
+                    ..
+                }
         ) && value == 0
         {
             self.ended = true;
@@ -536,7 +572,9 @@ impl BinaryVm {
         );
         let (id, activate) = (*id, *activate);
         self.define_task(id, base, 0, activate);
-        if activate { self.rescan_tasks(); }
+        if activate {
+            self.rescan_tasks();
+        }
         self.next_scenario_base = next;
         self.pending = None;
         Ok(())
@@ -635,7 +673,8 @@ impl BinaryVm {
                     // Taking the address of the empty stack's end is valid;
                     // dereferencing it still requires an in-bounds memory range.
                     ensure!(index <= CELLS, "bank address index {index} out of bounds");
-                    Ok(task_bank_base(self.current_task, bank) + (index * if bank == 6 { 1 } else { 4 }) as u32)
+                    Ok(task_bank_base(self.current_task, bank)
+                        + (index * if bank == 6 { 1 } else { 4 }) as u32)
                 }
                 0x12 => self.named_address(&cursor.variable_name()?),
                 _ => bail!("unsupported address operand tag {tag:#04x} at {start:#x}"),
@@ -780,7 +819,10 @@ impl BinaryVm {
             return Ok(MemoryRange::Scenario(base, r));
         }
         for &bank in self.banks.keys() {
-            if let Some(r) = range(task_bank_base(self.current_task, bank), CELLS * if bank == 6 { 1 } else { 4 }) {
+            if let Some(r) = range(
+                task_bank_base(self.current_task, bank),
+                CELLS * if bank == 6 { 1 } else { 4 },
+            ) {
                 return Ok(MemoryRange::Bank(bank, r));
             }
         }
@@ -803,8 +845,9 @@ impl BinaryVm {
             MemoryRange::Script(r) => self.data[r].to_vec(),
             MemoryRange::Scenario(base, r) => self.scenarios[&base].data[r].to_vec(),
             MemoryRange::Heap(base, r) => self.allocations[&base][r].to_vec(),
-            MemoryRange::TaskBank(id, tag, r) => r.map(|index|
-                self.tasks[&id].bank(tag)[index / 4].to_le_bytes()[index % 4]).collect(),
+            MemoryRange::TaskBank(id, tag, r) => r
+                .map(|index| self.tasks[&id].bank(tag)[index / 4].to_le_bytes()[index % 4])
+                .collect(),
             MemoryRange::Bank(bank, r) => r
                 .map(|index| {
                     if bank == 6 {
@@ -857,7 +900,9 @@ impl BinaryVm {
         if let Some((event, _)) = &self.pending {
             return Ok(event.clone());
         }
-        if self.context_flags & 1 == 0 { return Ok(Event::End); }
+        if self.context_flags & 1 == 0 {
+            return Ok(Event::End);
+        }
         match self.execute() {
             Ok(event) => Ok(event),
             Err(error) => {
@@ -909,7 +954,9 @@ impl BinaryVm {
                 let result = self.read(&mut cursor)?;
                 self.context_flags = 0;
                 rescan = true;
-                if result != 0 { self.ended = true; }
+                if result != 0 {
+                    self.ended = true;
+                }
             }
             0x0001 | 0x0002 => {
                 let id = self.read(&mut cursor)?;
@@ -918,7 +965,11 @@ impl BinaryVm {
                     "unsupported scenario task slot {id}"
                 );
                 let name = self.string(self.read(&mut cursor)?)?;
-                request = Some(PlatformRequest::LoadScenario { id, name, activate: opcode == 1 });
+                request = Some(PlatformRequest::LoadScenario {
+                    id,
+                    name,
+                    activate: opcode == 1,
+                });
             }
             0x06a6 => {
                 let id = self.read(&mut cursor)?;
@@ -1121,6 +1172,25 @@ impl BinaryVm {
                 byte_destination = Some(address);
                 request = Some(PlatformRequest::ProjectDirectory);
             }
+            0x0309 => {
+                let base = self.read(&mut cursor)?;
+                let offset = self.read(&mut cursor)?;
+                let value = self.read(&mut cursor)?;
+                memory_write = Some((
+                    self.memory_range(base.wrapping_add(offset), 4)?,
+                    value.to_le_bytes().to_vec(),
+                ));
+            }
+            0x0308 => {
+                let base = self.read(&mut cursor)?;
+                let offset = self.read(&mut cursor)?;
+                let value = u32::from_le_bytes(
+                    self.memory_read(base.wrapping_add(offset), 4)?
+                        .as_slice()
+                        .try_into()?,
+                );
+                writes.push((self.destination(&mut cursor)?, value));
+            }
             0x0304 => {
                 let address = self.read(&mut cursor)?;
                 let value = u32::from(self.memory_read(address, 1)?[0]);
@@ -1141,16 +1211,26 @@ impl BinaryVm {
             0x0259 => {
                 let table_end = cursor.dword()? as usize;
                 let selector = self.read(&mut cursor)?;
-                ensure!(table_end >= cursor.pc && table_end <= self.data.len(),
-                    "indexed jump table end {table_end:#x} outside scenario");
+                ensure!(
+                    table_end >= cursor.pc && table_end <= self.data.len(),
+                    "indexed jump table end {table_end:#x} outside scenario"
+                );
                 let mut index = 0;
                 while cursor.pc < table_end {
                     let address = self.read(&mut cursor)?;
-                    ensure!(cursor.pc <= table_end, "operand crosses indexed jump table end");
+                    ensure!(
+                        cursor.pc <= table_end,
+                        "operand crosses indexed jump table end"
+                    );
                     if index == selector {
-                        let target = address.checked_sub(self.script_base)
-                            .context("indexed jump address outside scenario")? as usize;
-                        ensure!(target < self.data.len(), "indexed jump target outside scenario");
+                        let target = address
+                            .checked_sub(self.script_base)
+                            .context("indexed jump address outside scenario")?
+                            as usize;
+                        ensure!(
+                            target < self.data.len(),
+                            "indexed jump target outside scenario"
+                        );
                         cursor.pc = target;
                         break;
                     }
@@ -1376,6 +1456,19 @@ impl BinaryVm {
             0x0136 => self.save_encoding = self.read(&mut cursor)?,
             0x06ba => self.media_flags = self.read(&mut cursor)?,
             0x06bb => writes.push((self.destination(&mut cursor)?, self.media_flags)),
+            0x02d5 => {
+                let value = self.read(&mut cursor)?;
+                let tag = *cursor
+                    .data
+                    .get(cursor.pc)
+                    .context("truncated pointer destination")?;
+                let value = if tag & 0x80 != 0 {
+                    value.wrapping_sub(self.script_base)
+                } else {
+                    value
+                };
+                writes.push((self.destination(&mut cursor)?, value));
+            }
             0x038e => {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
@@ -1479,8 +1572,12 @@ impl BinaryVm {
         for (destination, value) in writes {
             self.write(destination, value);
         }
-        if let Some((id, base, pc)) = definition { self.define_task(id, base, pc, false); }
-        if rescan { self.rescan_tasks(); }
+        if let Some((id, base, pc)) = definition {
+            self.define_task(id, base, pc, false);
+        }
+        if rescan {
+            self.rescan_tasks();
+        }
         self.switch_scenario(next_base);
         self.steps += 1;
         if let Some(request) = request {
@@ -1527,28 +1624,53 @@ mod tests {
     #[test]
     fn scheduler_matches_original_instruction_order_polls_and_task_memory() {
         let probe: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../docs/validation/scheduler-probe.json")).unwrap();
+            "../../../docs/validation/scheduler-probe.json"
+        ))
+        .unwrap();
         for case in probe["cases"].as_array().unwrap() {
-            let programs: Vec<Vec<u8>> = case["programs"].as_array().unwrap().iter().map(|hex| {
-                let hex = hex.as_str().unwrap();
-                (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16).unwrap()).collect()
-            }).collect();
+            let programs: Vec<Vec<u8>> = case["programs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|hex| {
+                    let hex = hex.as_str().unwrap();
+                    (0..hex.len())
+                        .step_by(2)
+                        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                        .collect()
+                })
+                .collect();
             let mut vm = BinaryVm::new("caller.scn", programs[0].clone()).unwrap();
-            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32).unwrap();
-            vm.scenarios.insert(0x4000_0000, Scenario { name: "worker.scn".into(), data: programs[1].clone() });
+            vm.set_dispatch_quantum(case["quantum"].as_u64().unwrap() as u32)
+                .unwrap();
+            vm.scenarios.insert(
+                0x4000_0000,
+                Scenario {
+                    name: "worker.scn".into(),
+                    data: programs[1].clone(),
+                },
+            );
             vm.next_scenario_base = 0x4000_1000;
             vm.define_task(1, 0x4000_0000, 0, case.get("active").is_none());
             vm.thread_limit = 2;
             let mut events = Vec::new();
             loop {
                 assert!(events.len() < 1000, "{}", case["name"]);
-                let before: Vec<_> = (0..2).map(|id| {
-                    if id == vm.current_task { (vm.sp, vm.banks[&12][0]) }
-                    else { let task = &vm.tasks[&id]; (task.sp, task.locals[0]) }
-                }).collect();
+                let before: Vec<_> = (0..2)
+                    .map(|id| {
+                        if id == vm.current_task {
+                            (vm.sp, vm.banks[&12][0])
+                        } else {
+                            let task = &vm.tasks[&id];
+                            (task.sp, task.locals[0])
+                        }
+                    })
+                    .collect();
                 let shared = vm.banks[&10][0];
                 let event = vm.scheduled_step().unwrap();
-                if event == Event::End { break; }
+                if event == Event::End {
+                    break;
+                }
                 if event == Event::SchedulerPoll {
                     events.push(serde_json::json!({"event":"poll"}));
                     assert_eq!(vm.scheduled_step().unwrap(), event);
@@ -1556,17 +1678,22 @@ mod tests {
                     continue;
                 }
                 let location = match &event {
-                    Event::BinaryInstruction { location, .. } | Event::Platform { location, .. }
+                    Event::BinaryInstruction { location, .. }
+                    | Event::Platform { location, .. }
                     | Event::MouseButtonMapping { location, .. } => location,
                     other => panic!("unexpected event {other:?}"),
                 };
                 let (sp, local) = before[vm.current_task as usize];
-                events.push(serde_json::json!({"event":"instruction", "task":vm.current_task,
-                    "pc":location.offset, "sp":sp, "local":local, "shared":shared}));
+                events.push(
+                    serde_json::json!({"event":"instruction", "task":vm.current_task,
+                    "pc":location.offset, "sp":sp, "local":local, "shared":shared}),
+                );
                 if let Event::Platform { request, .. } = &event {
                     assert_eq!(vm.scheduled_step().unwrap(), event);
                     match request {
-                        PlatformRequest::LoadScenario { activate: true, .. } => vm.respond_scenario(programs[1].clone()).unwrap(),
+                        PlatformRequest::LoadScenario { activate: true, .. } => {
+                            vm.respond_scenario(programs[1].clone()).unwrap()
+                        }
                         PlatformRequest::PumpMessages => {
                             events.push(serde_json::json!({"event":"poll"}));
                             vm.respond(1).unwrap();
@@ -1575,14 +1702,95 @@ mod tests {
                     }
                 }
             }
-            assert_eq!(serde_json::json!(events), case["events"], "{}", case["name"]);
+            assert_eq!(
+                serde_json::json!(events),
+                case["events"],
+                "{}",
+                case["name"]
+            );
             for id in 0..2 {
                 vm.select_task(id);
-                assert_eq!(serde_json::json!({"sp":vm.sp, "local":vm.banks[&12][0],
-                    "popped":vm.banks[&12][1], "flags":vm.context_flags}), case["final"][id as usize], "{} task {id}", case["name"]);
+                assert_eq!(
+                    serde_json::json!({"sp":vm.sp, "local":vm.banks[&12][0],
+                    "popped":vm.banks[&12][1], "flags":vm.context_flags}),
+                    case["final"][id as usize],
+                    "{} task {id}",
+                    case["name"]
+                );
             }
             assert_eq!(vm.banks[&10][0], case["shared"].as_u64().unwrap() as u32);
         }
+    }
+
+    #[test]
+    fn malformed_indexed_jumps_and_memory_operations_stop_without_writes() {
+        let mut table = instruction(0x259, &100u32.to_le_bytes());
+        table.extend(immediate(0));
+        let mut crossing = instruction(0x259, &12u32.to_le_bytes());
+        crossing.extend(immediate(1));
+        crossing.extend(immediate(0));
+        let mut target = instruction(0x259, &16u32.to_le_bytes());
+        target.extend(immediate(0));
+        target.extend(immediate(0));
+        let mut cases = vec![table, crossing, target];
+        for opcode in [0x308, 0x309] {
+            let mut code = instruction(opcode, &immediate(0xffff_fffe));
+            code.extend(immediate(1));
+            code.extend(if opcode == 0x308 {
+                vec![12, 0, 0]
+            } else {
+                immediate(77)
+            });
+            cases.push(code);
+        }
+        for code in cases {
+            let mut vm = BinaryVm::new("invalid.scn", code.clone()).unwrap();
+            let error = vm.step().unwrap_err().to_string();
+            assert_eq!(vm.pc, 0);
+            assert_eq!(vm.data, code);
+            assert_eq!(vm.banks[&12][0], 0);
+            assert_eq!(vm.step().unwrap_err().to_string(), error);
+        }
+    }
+
+    #[test]
+    fn scheduler_holds_task_until_reply_and_honors_host_shutdown() {
+        let mut code = instruction(0x3bd, &[12, 0, 0]);
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("caller.scn", code).unwrap();
+        let mut worker = instruction(0x38e, &immediate(99));
+        worker.extend([12, 0, 0]);
+        worker.extend(instruction(0, &immediate(0)));
+        vm.scenarios.insert(
+            0x4000_0000,
+            Scenario {
+                name: "worker.scn".into(),
+                data: worker,
+            },
+        );
+        vm.define_task(1, 0x4000_0000, 0, true);
+        vm.rescan_tasks();
+        assert_eq!(vm.scheduled_step().unwrap(), Event::SchedulerPoll);
+        vm.respond(1).unwrap();
+        let request = vm.scheduled_step().unwrap();
+        assert!(matches!(
+            request,
+            Event::Platform {
+                request: PlatformRequest::ClockMilliseconds,
+                ..
+            }
+        ));
+        assert_eq!(vm.scheduled_step().unwrap(), request);
+        assert_eq!(vm.current_task(), 0);
+        vm.respond(123).unwrap();
+        vm.scheduled_step().unwrap();
+        assert_eq!(vm.current_task(), 1);
+        assert_eq!(vm.banks[&12][0], 99);
+        assert_eq!(vm.tasks[&0].locals[0], 123);
+        assert_eq!(vm.scheduled_step().unwrap(), Event::SchedulerPoll);
+        vm.respond(0).unwrap();
+        assert_eq!(vm.scheduled_step().unwrap(), Event::End);
+        assert_eq!(vm.steps, 2);
     }
 
     #[test]
