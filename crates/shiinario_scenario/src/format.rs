@@ -2,6 +2,18 @@
 use anyhow::{Context, Result, bail, ensure};
 
 pub(crate) fn integer_format(format: &[u8], arguments: &[u32]) -> Result<Vec<u8>> {
+    integer_format_with(format, |index| {
+        arguments
+            .get(index)
+            .copied()
+            .context("missing format argument")
+    })
+}
+
+pub(crate) fn integer_format_with(
+    format: &[u8],
+    mut argument_at: impl FnMut(usize) -> Result<u32>,
+) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut pos = 0;
     let mut argument = 0;
@@ -23,10 +35,11 @@ pub(crate) fn integer_format(format: &[u8], arguments: &[u32]) -> Result<Vec<u8>
             }
             let conversion = *format.get(pos).context("truncated format conversion")?;
             pos += 1;
-            let value = *arguments.get(argument).context("missing format argument")?;
+            ensure!(argument < 256, "format exceeds 256 arguments");
+            let value = argument_at(argument)?;
             argument += 1;
             let text = match conversion {
-                b'd' => (value as i32).to_string(),
+                b'd' | b'i' => (value as i32).to_string(),
                 b'u' => value.to_string(),
                 b'x' => format!("{value:x}"),
                 b'X' => format!("{value:X}"),

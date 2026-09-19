@@ -1812,6 +1812,27 @@ impl BinaryVm {
                 bytes.push(0);
                 memory_write = Some((self.memory_range(arguments[0], bytes.len())?, bytes));
             }
+            0x02da => {
+                let destination = self.read(&mut cursor)?;
+                let format_address = self.read(&mut cursor)?;
+                let format = self.string_bytes(format_address)?;
+                let arguments = self.read(&mut cursor)?;
+                let mut argument_bytes = 0;
+                let mut bytes = crate::format::integer_format_with(&format, |index| {
+                    argument_bytes = (index + 1) * 4;
+                    let address = arguments
+                        .checked_add(index as u32 * 4)
+                        .context("format argument address overflow")?;
+                    Ok(u32::from_le_bytes(
+                        self.memory_read(address, 4)?.as_slice().try_into()?,
+                    ))
+                })?;
+                bytes.push(0);
+                for (source, length) in [(format_address, format.len() + 1), (arguments, argument_bytes)] {
+                    ensure!(length == 0 || u64::from(destination) + bytes.len() as u64 <= u64::from(source) || u64::from(source) + length as u64 <= u64::from(destination), "overlapping format buffers are unresolved");
+                }
+                memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
+            }
             0x0104 => {
                 let address = self.read(&mut cursor)?;
                 ensure!(
