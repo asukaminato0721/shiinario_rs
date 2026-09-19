@@ -1,6 +1,8 @@
 //! Verified subset of the supplied v2.47 engine. See docs/SCN_RESEARCH.md.
 use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
+mod text_execution;
+use text_execution::{AsyncText, TextPhase};
 
 /// The original engine stores the full operand and treats every nonzero value as
 /// swapped. Input bits 0, 1 and 2 represent the first three physical mouse buttons.
@@ -71,6 +73,15 @@ pub enum SoundCommand {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    /// Controls plus bit 16 for the WM_CHAR-style latch. A clear only resets
+    /// that latch; it does not consume physical button/key state.
+    TextInput { clear: bool },
+    DrawGlyph {
+        surface: u32,
+        position: [i32; 2],
+        character: char,
+        style: crate::TextStyle,
+    },
     Sound {
         id: u32,
         command: SoundCommand,
@@ -434,6 +445,8 @@ pub struct BinaryVm {
     text_style: crate::text::TextStyle,
     /// Line-start X, current X, current Y in the default text context.
     text_cursor: [u32; 3],
+    text_layout: crate::text_layout::TextLayout,
+    async_text: Option<AsyncText>,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
 impl BinaryVm {
@@ -488,6 +501,8 @@ impl BinaryVm {
             task_timers: Default::default(),
             text_style: Default::default(),
             text_cursor: [0; 3],
+            text_layout: crate::text_layout::TextLayout::new([0; 3]),
+            async_text: None,
             pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
@@ -565,6 +580,9 @@ impl BinaryVm {
         if self.failure.is_some() || self.ended || self.pending.is_some() {
             return self.step();
         }
+        if self.async_text.as_ref().is_some_and(|text| text.ticking) {
+            return self.text_step();
+        }
         if !self.scheduler.started {
             self.scheduler.started = true;
             return Ok(self.scheduler_poll());
@@ -589,7 +607,7 @@ impl BinaryVm {
             }
             let flags = self.task_flags(self.scheduler.scan);
             ensure!(
-                flags & (2 | 8) == 0,
+                flags & 2 == 0,
                 "task {}: unsupported timer/transition flags {flags:#x}",
                 self.scheduler.scan
             );
@@ -598,6 +616,13 @@ impl BinaryVm {
                 continue;
             }
             self.select_task(self.scheduler.scan);
+            if flags & 8 != 0 {
+                let text = self.async_text.as_mut().context("text task has no text context")?;
+                ensure!(text.owner == self.current_task, "shared concurrent text contexts are unresolved");
+                text.ticking = true;
+                text.phase = TextPhase::Begin;
+                return self.text_step();
+            }
             self.scheduler.dispatching = true;
             self.scheduler.used = 0;
             self.scheduler.yielded = false;
@@ -607,6 +632,7 @@ impl BinaryVm {
         self.scheduler.yielded = self.scheduler.used >= self.dispatch_quantum
             || self.message_mode != 0
             || self.context_flags == 0
+            || self.context_flags & 8 != 0
             || matches!(
                 &event,
                 Event::Platform {
@@ -681,6 +707,7 @@ impl BinaryVm {
             if matches!(
                 request,
                 PlatformRequest::CreateAudioStream { .. }
+                    | PlatformRequest::DrawGlyph { .. }
                     | PlatformRequest::CreateSurface { .. }
                     | PlatformRequest::ReleaseSurface { .. }
                     | PlatformRequest::LoadImage { .. }
@@ -703,6 +730,7 @@ impl BinaryVm {
             }
         }
         let (event, destination) = self.pending.take().context("no pending platform request")?;
+        self.text_response(&event, value)?;
         if let Some((mut style, clock)) = self.pending_text_style.take() {
             match clock {
                 crate::text::TextClock::Character => style.character_epoch = value,
@@ -1354,6 +1382,7 @@ impl BinaryVm {
         if self.context_flags & 1 == 0 {
             return Ok(Event::End);
         }
+        ensure!(self.context_flags & 8 == 0, "asynchronous text requires scheduled_step");
         match self.execute() {
             Ok(event) => Ok(event),
             Err(error) => {
@@ -1900,6 +1929,19 @@ impl BinaryVm {
                 let y = self.destination(&mut cursor)?;
                 writes.push((x, self.text_cursor[1]));
                 writes.push((y, self.text_cursor[2]));
+            }
+            0x0083 => {
+                let surface = self.read(&mut cursor)?;
+                let address = self.read(&mut cursor)?;
+                ensure!(surface < 256 || surface == u32::MAX, "text surface out of bounds");
+                ensure!(self.async_text.is_none(), "shared concurrent text contexts are unresolved");
+                ensure!(self.string_bytes(address)?.len() <= 65536, "text exceeds 64 KiB");
+                self.text_layout.begin(self.text_cursor);
+                self.async_text = Some(AsyncText::new(self.current_task, surface, address, location.clone()));
+                self.context_flags |= 8;
+                if self.text_style.skip_mask & 8 != 0 {
+                    request = Some(PlatformRequest::TextInput { clear: true });
+                }
             }
             0x0084 => {
                 let surface = self.read(&mut cursor)?;

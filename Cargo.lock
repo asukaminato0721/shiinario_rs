@@ -2173,8 +2173,10 @@ dependencies = [
 name = "shiinario_runtime"
 version = "0.1.0"
 dependencies = [
+ "ab_glyph",
  "anyhow",
  "cpal",
+ "encoding_rs",
  "flate2",
  "pollster",
  "serde",

@@ -14,6 +14,14 @@ pub struct TextLayout {
 }
 
 impl TextLayout {
+    /// 431730 resets per-string bookkeeping but retains the prior wrap flags.
+    pub fn begin(&mut self, cursor: [u32; 3]) {
+        self.cursor = cursor;
+        self.previous = [cursor[1], cursor[2]];
+        self.punctuation_overhang = false;
+        self.processed_bytes = 0;
+    }
+
     pub fn new(cursor: [u32; 3]) -> Self {
         Self {
             cursor,
@@ -39,11 +47,12 @@ impl TextLayout {
     ) -> Result<[u32; 2]> {
         ensure!((1..=2).contains(&glyph.len()), "invalid CP932 glyph length");
         ensure!(next.len() <= 2, "invalid next CP932 character length");
-        ensure!(advances[0] != u32::MAX, "proportional text layout is unresolved");
+        ensure!(
+            advances[0] != u32::MAX,
+            "proportional text layout is unresolved"
+        );
         let advance = advances[glyph.len() - 1];
-        if self.cursor[1].wrapping_add(advance) >= line_limit
-            && contains(&punctuation[1], glyph)
-        {
+        if self.cursor[1].wrapping_add(advance) >= line_limit && contains(&punctuation[1], glyph) {
             self.newline(line_advance);
         }
         if self.punctuation_overhang {
@@ -100,41 +109,80 @@ mod tests {
         ))
         .unwrap();
         let decode = |hex: &str| {
-            (0..hex.len()).step_by(2)
-                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect::<Vec<_>>()
+            (0..hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+                .collect::<Vec<_>>()
         };
         for case in fixture["cases"].as_array().unwrap() {
             let cursor: [u32; 3] = serde_json::from_value(case["cursor"].clone()).unwrap();
             let mut layout = TextLayout::new(cursor);
-            let punctuation = std::array::from_fn(|i| decode(case["punctuation"][i].as_str().unwrap()));
+            let punctuation =
+                std::array::from_fn(|i| decode(case["punctuation"][i].as_str().unwrap()));
+            let advances: [u32; 2] = serde_json::from_value(case["advances"].clone()).unwrap();
             let glyphs = case["glyphs"].as_array().unwrap();
             let raw = decode(case["text"].as_str().unwrap());
             let mut offset = 0;
             for expected in glyphs {
                 // Conversion is intentionally outside this layout-only test.
                 let glyph = decode(expected["bytes"].as_str().unwrap());
-                let width = if matches!(raw[offset], 0x81..=0x9f | 0xe0..=0xfc) { 2 } else { 1 };
-                offset += width;
-                let next = if offset == raw.len() { &[] } else {
-                    let width = if matches!(raw[offset], 0x81..=0x9f | 0xe0..=0xfc) { 2 } else { 1 };
-                    &raw[offset..offset+width]
+                let width = if matches!(raw[offset], 0x81..=0x9f | 0xe0..=0xfc) {
+                    2
+                } else {
+                    1
                 };
-                let actual = layout.place(&glyph, next, [8,16], 16,
-                    case["limit"].as_u64().unwrap() as u32, &punctuation).unwrap();
+                offset += width;
+                let next = if offset == raw.len() {
+                    &[]
+                } else {
+                    let width = if matches!(raw[offset], 0x81..=0x9f | 0xe0..=0xfc) {
+                        2
+                    } else {
+                        1
+                    };
+                    &raw[offset..offset + width]
+                };
+                let actual = layout
+                    .place(
+                        &glyph,
+                        next,
+                        advances,
+                        case["line_advance"].as_u64().unwrap() as u32,
+                        case["limit"].as_u64().unwrap() as u32,
+                        &punctuation,
+                    )
+                    .unwrap();
                 assert_eq!(serde_json::json!(actual), expected["position"], "{case}");
             }
             assert_eq!(serde_json::json!(layout.cursor), case["final_cursor"]);
             assert_eq!(serde_json::json!(layout.previous), case["previous"]);
             assert_eq!(u64::from(layout.wrapped), case["wrapped"].as_u64().unwrap());
-            assert_eq!(u64::from(layout.wrapped_after), case["wrapped_after"].as_u64().unwrap());
-            assert_eq!(u64::from(layout.punctuation_overhang), case["punctuation_overhang"].as_u64().unwrap());
-            assert_eq!(u64::from(layout.processed_bytes), case["processed_bytes"].as_u64().unwrap());
+            assert_eq!(
+                u64::from(layout.wrapped_after),
+                case["wrapped_after"].as_u64().unwrap()
+            );
+            assert_eq!(
+                u64::from(layout.punctuation_overhang),
+                case["punctuation_overhang"].as_u64().unwrap()
+            );
+            assert_eq!(
+                u64::from(layout.processed_bytes),
+                case["processed_bytes"].as_u64().unwrap()
+            );
         }
-        let mut layout = TextLayout::new([0,0,0]);
+        let mut layout = TextLayout::new([0, 0, 0]);
         let before = layout.clone();
-        assert!(layout.place(b"", b"", [8,16], 16, 640, &Default::default()).is_err());
+        assert!(
+            layout
+                .place(b"", b"", [8, 16], 16, 640, &Default::default())
+                .is_err()
+        );
         assert_eq!(layout, before);
-        assert!(layout.place(b"a", b"", [u32::MAX,16], 16, 640, &Default::default()).is_err());
+        assert!(
+            layout
+                .place(b"a", b"", [u32::MAX, 16], 16, 640, &Default::default())
+                .is_err()
+        );
         assert_eq!(layout, before);
     }
 }

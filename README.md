@@ -6,8 +6,9 @@ An in-progress Rust compatibility runtime for Ran→Sem (Shiina Rio v2.47).
 pixels exactly match the original x86 renderer's BGR hash. Title-menu hover now
 runs with static sound-buffer playback. Clicking the first item advances through
 cleanup and scene replacement into `t\_MAI.SCN`, loads its story file and enters
-the transition library. Execution currently stops at unresolved `0x0568`,
-`efclib.scn:0x55cf`, with source/task context. Menu completion, dialogue, choices,
+the transition library. Mask transitions, cleanup and text-style initialization
+now execute. Further canvas clicks reach asynchronous text output `0x0083`,
+`start.SCN:0x61ec6`, which remains unresolved. Menu completion, dialogue, choices,
 movies and saves remain unfinished.
 
 The simulated startup/title trace passes 20,000 instructions against captured x86:

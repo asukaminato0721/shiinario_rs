@@ -61,11 +61,23 @@ impl Default for TextStyle {
 impl TextStyle {
     /// Validate the complete control stream before changing the retained style.
     pub fn configure(&self, bytes: &[u8]) -> Result<(Self, Option<TextClock>)> {
+        let (style, clock, _) = self.parse(bytes, false)?;
+        Ok((style, clock))
+    }
+
+    pub(crate) fn prefix(&self, bytes: &[u8]) -> Result<(Self, Option<TextClock>, usize)> {
+        self.parse(bytes, true)
+    }
+
+    fn parse(&self, bytes: &[u8], one: bool) -> Result<(Self, Option<TextClock>, usize)> {
         ensure!(bytes.len() <= 65536, "text controls exceed 64 KiB");
         let mut result = self.clone();
         let mut at = 0;
         let mut clock_read = None;
         while at < bytes.len() {
+            if one && at != 0 {
+                break;
+            }
             ensure!(
                 bytes.get(at) == Some(&b'_') && bytes.get(at + 1).is_some(),
                 "unsupported text control or glyph at byte {at}"
@@ -158,7 +170,7 @@ impl TextStyle {
                 }
             }
         }
-        Ok((result, clock_read))
+        Ok((result, clock_read, at))
     }
 }
 

@@ -7,6 +7,7 @@ mod presentation;
 pub mod resources;
 pub mod session;
 pub mod viewport;
+mod text_render;
 use anyhow::{Result, bail};
 use session::Host;
 use shiinario_assets::project::Project;
@@ -153,6 +154,7 @@ impl Host for TracePlatform {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::TextInput { .. } => Ok(0),
             PlatformRequest::ReadKeyState { .. } => Ok(input::key_state_reply(0, true)),
             PlatformRequest::ReadControls => Ok(input::ControlState::default().mask()),
             // The portable trace reports no x86 rendering acceleration.

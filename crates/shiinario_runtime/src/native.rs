@@ -104,6 +104,7 @@ struct NativeHost {
     dirty: bool,
     audio: Option<AudioOutput>,
     streams_started: usize,
+    text_key: bool,
 }
 impl NativeHost {
     fn key(&mut self, virtual_key: usize, pressed: bool) {
@@ -186,6 +187,11 @@ impl Host for NativeHost {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::TextInput { clear } => {
+                if *clear { self.text_key = false; return Ok(0); }
+                self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
+                Ok(self.controls.mask() | if self.text_key { 0x10000 } else { 0 })
+            }
             PlatformRequest::ReadKeyState { key } => {
                 Ok(self.async_keys.query(*key, self.controls.focused))
             }
@@ -319,6 +325,7 @@ impl App<'_> {
             dirty: true,
             audio: None,
             streams_started: 0,
+            text_key: false,
         });
         self.presentation = Some(presentation);
         Ok(())
@@ -364,6 +371,9 @@ impl ApplicationHandler for App<'_> {
                 host.cursor = [position.x as i32, position.y as i32]
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if event.state == ElementState::Pressed && event.text.as_ref().is_some_and(|s| !s.is_empty()) {
+                    host.text_key = true;
+                }
                 if let PhysicalKey::Code(key) = event.physical_key {
                     host.keyboard(key, event.state == ElementState::Pressed);
                 }

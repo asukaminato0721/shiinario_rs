@@ -11,6 +11,7 @@ pub use binary::{
     SurfaceBlend, SurfaceCopy, SurfacePoint, boot_binary,
 };
 pub use memory::SharedMemory;
+pub use text::TextStyle;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -161,6 +162,12 @@ pub enum AudioChannel {
 pub enum Event {
     /// Host poll between scheduler passes or priority-task dispatches.
     SchedulerPoll,
+    /// One asynchronous text scheduler pass, after its input/drawing replies.
+    TextTick {
+        task: u32,
+        completed: bool,
+        cursor: [u32; 2],
+    },
     ArchiveSearchPath {
         location: Location,
         name: String,

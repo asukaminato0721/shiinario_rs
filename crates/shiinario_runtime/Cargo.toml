@@ -14,6 +14,8 @@ cpal = "0.15.3"
 wgpu = "0.20"
 winit = "0.30.13"
 pollster = "0.3"
+ab_glyph = "0.2.32"
+encoding_rs.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
