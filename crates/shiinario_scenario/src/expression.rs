@@ -71,12 +71,22 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
         loop {
             self.spaces();
             let op = self.bytes.get(self.at).copied();
-            if !matches!(op, Some(b'*' | b'/' | b'|' | b'%')) {
+            let shift =
+                matches!(op, Some(b'<' | b'>')) && self.bytes.get(self.at + 1).copied() == op;
+            if !shift && !matches!(op, Some(b'*' | b'/' | b'|' | b'%')) {
                 return Ok(value);
             }
-            self.at += 1;
+            self.at += if shift { 2 } else { 1 };
             let rhs = self.atom(depth)?;
-            value = Self::checked(if op == Some(b'|') {
+            value = Self::checked(if shift {
+                let left = value as i64 as i32;
+                let count = rhs as i64 as u32;
+                f64::from(if op == Some(b'<') {
+                    left.wrapping_shl(count)
+                } else {
+                    left.wrapping_shr(count)
+                })
+            } else if op == Some(b'|') {
                 f64::from((value as i64 as i32) | (rhs as i64 as i32))
             } else if op == Some(b'%') {
                 let divisor = rhs as i64 as i32;
@@ -118,6 +128,45 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
             .context("missing expression operand")?;
         self.at += 1;
         match byte {
+            b'a'..=b'z' => {
+                let start = self.at - 1;
+                while self.bytes.get(self.at).is_some_and(u8::is_ascii_lowercase) {
+                    self.at += 1;
+                }
+                let name = &self.bytes[start..self.at];
+                ensure!(
+                    matches!(name, b"abs" | b"sqrt" | b"pow"),
+                    "unsupported expression function"
+                );
+                self.spaces();
+                ensure!(
+                    self.bytes.get(self.at) == Some(&b'('),
+                    "missing function opening parenthesis"
+                );
+                self.at += 1;
+                let first = self.sum(depth + 1)?;
+                self.spaces();
+                let result = match name {
+                    b"pow" => {
+                        ensure!(
+                            self.bytes.get(self.at) == Some(&b','),
+                            "pow requires two arguments"
+                        );
+                        self.at += 1;
+                        let second = self.sum(depth + 1)?;
+                        first.powf(second)
+                    }
+                    b"sqrt" => first.sqrt(),
+                    _ => f64::from((first as i64 as i32).wrapping_abs()),
+                };
+                self.spaces();
+                ensure!(
+                    self.bytes.get(self.at) == Some(&b')'),
+                    "missing function closing parenthesis"
+                );
+                self.at += 1;
+                Self::checked(result)
+            }
             b'-' => Self::checked(-self.atom(depth + 1)?),
             b'(' => {
                 let value = self.sum(depth + 1)?;
@@ -239,6 +288,12 @@ mod tests {
             b"{missing}",
             b"1=2",
             b"1+",
+            b"pow(2)",
+            b"pow(2,3,4)",
+            b"sqrt(-1)",
+            b"sqrt(1,2)",
+            b"abs()",
+            b"unknown(1)",
             b"(1",
             b"9007199254740992+1",
             b"_Q000",

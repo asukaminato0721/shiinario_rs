@@ -153,6 +153,10 @@ fn main() -> Result<()> {
             let mut events = 0usize;
             let mut recent = std::collections::VecDeque::with_capacity(tail_events);
             let mut stories = Vec::new();
+            let mut story_checkpoints = Vec::new();
+            let mut clock_reply_pending = false;
+            let mut last_clock_reply = 0u32;
+            let mut elapsed_clock_replies = 0u64;
             let mut scenarios = std::collections::BTreeSet::new();
             scenarios.insert(name.clone());
             let result = shiinario_runtime::trace_with_options(
@@ -186,6 +190,19 @@ fn main() -> Result<()> {
                 |event| {
                     use shiinario_scenario::{Event, PlatformRequest};
                     events += 1;
+                    if let Event::PlatformReply { value, .. } = event
+                        && clock_reply_pending
+                    {
+                        elapsed_clock_replies += u64::from(value.wrapping_sub(last_clock_reply));
+                        last_clock_reply = *value;
+                    }
+                    clock_reply_pending = matches!(
+                        event,
+                        Event::Platform {
+                            request: PlatformRequest::ClockMilliseconds,
+                            ..
+                        }
+                    );
                     if tail_events != 0 {
                         if recent.len() == tail_events {
                             recent.pop_front();
@@ -229,6 +246,7 @@ fn main() -> Result<()> {
                                 eprintln!("STORY {name}");
                             }
                             stories.push(name.clone());
+                            story_checkpoints.push(serde_json::json!({"name":name,"last_clock_reply_elapsed_ms":elapsed_clock_replies,"event":events}));
                         }
                         _ => {}
                     }
@@ -242,7 +260,7 @@ fn main() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}")),"recent_events":recent})
+                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"story_checkpoints":story_checkpoints,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}")),"recent_events":recent})
                     )?
                 );
             }
