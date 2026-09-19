@@ -483,6 +483,7 @@ impl BinaryVm {
         task.pc = pc;
         task.sp = CELLS;
         task.flags = u32::from(activate);
+        task.parameters.clear();
         self.task_entries.insert(id, (base, pc));
     }
     fn select_task(&mut self, id: u32) {
@@ -834,7 +835,28 @@ impl BinaryVm {
             },
         );
         let (id, activate) = (*id, *activate);
-        self.define_task(id, base, 0, activate);
+        self.task_entries.insert(id, (base, 0));
+        if id == self.current_task {
+            self.switch_scenario(base);
+            self.pc = 0;
+            self.sp = CELLS;
+            if activate {
+                self.parameters.clear();
+                self.context_flags = 1;
+            }
+        } else {
+            let task = self
+                .tasks
+                .entry(id)
+                .or_insert_with(|| TaskState::new(base, 0));
+            task.base = base;
+            task.pc = 0;
+            task.sp = CELLS;
+            if activate {
+                task.parameters.clear();
+                task.flags = 1;
+            }
+        }
         if activate {
             self.rescan_tasks();
         }
@@ -1328,10 +1350,7 @@ impl BinaryVm {
             }
             0x0001 | 0x0002 => {
                 let id = self.read(&mut cursor)?;
-                ensure!(
-                    id != self.current_task && id < CELLS as u32,
-                    "unsupported scenario task slot {id}"
-                );
+                ensure!(id < CELLS as u32, "unsupported scenario task slot {id}");
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadScenario {
                     id,
@@ -2205,7 +2224,7 @@ impl BinaryVm {
                     },
                 ));
             }
-            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039e..=0x039f => {
+            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039a..=0x039b | 0x039e..=0x039f => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
@@ -2217,6 +2236,8 @@ impl BinaryVm {
                     0x396 => first & second,
                     0x397 => first | second,
                     0x398 => first ^ second,
+                    0x39a => second.wrapping_shr(first),
+                    0x39b => second.wrapping_shl(first),
                     _ => second.wrapping_mul(first),
                 };
                 writes.push((destination, value));
@@ -2759,7 +2780,7 @@ mod tests {
                 if let Event::Platform { request, .. } = &event {
                     assert_eq!(vm.scheduled_step().unwrap(), event);
                     match request {
-                        PlatformRequest::LoadScenario { activate: true, .. } => {
+                        PlatformRequest::LoadScenario { .. } => {
                             vm.respond_scenario(programs[1].clone()).unwrap()
                         }
                         PlatformRequest::PumpMessages => {
