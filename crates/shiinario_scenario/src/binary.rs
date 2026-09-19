@@ -132,6 +132,10 @@ pub enum PlatformRequest {
     },
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
+    UnfilteredPixelation {
+        copy: SurfaceCopy,
+        block_size: i32,
+    },
     StretchSurface(SurfaceStretch),
     CaptureSurface(SurfaceCapture),
     MaskTransition(MaskTransition),
@@ -1678,7 +1682,7 @@ impl BinaryVm {
                     mode,
                 }));
             }
-            0x04e2 => {
+            0x04e2 | 0x0564 => {
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
                     x: self.read(&mut cursor)? as i32,
@@ -1697,11 +1701,25 @@ impl BinaryVm {
                     destination.id < 256 && source.id < 256,
                     "copy surface slot out of bounds"
                 );
-                request = Some(PlatformRequest::CopySurface(SurfaceCopy {
+                let copy = SurfaceCopy {
                     destination,
                     source,
                     size,
-                }));
+                };
+                request = Some(if opcode == 0x0564 {
+                    let block_size = self.read(&mut cursor)? as i32;
+                    ensure!(
+                        block_size <= 0 || self.best_effort,
+                        "pixelation is unresolved; use best-effort playback to omit the filter"
+                    );
+                    if block_size > 0 {
+                        PlatformRequest::UnfilteredPixelation { copy, block_size }
+                    } else {
+                        PlatformRequest::CopySurface(copy)
+                    }
+                } else {
+                    PlatformRequest::CopySurface(copy)
+                });
             }
             0x04f6 => {
                 let mut point = || -> Result<SurfacePoint> {
@@ -3073,10 +3091,18 @@ mod tests {
         code.extend(instruction(0x49d, &immediate(42)));
         let mut vm = BinaryVm::new("delay.scn", code).unwrap();
         vm.task_timers.insert(0, 17);
-        assert!(matches!(vm.step().unwrap(), Event::Platform { request: PlatformRequest::ClockMilliseconds, .. }));
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ClockMilliseconds,
+                ..
+            }
+        ));
         vm.respond(u32::MAX - 4).unwrap();
         for _ in 0..3 {
-            assert!(matches!(vm.scheduled_step().unwrap(), Event::Platform { request: PlatformRequest::WaitTaskTimer { epoch, duration: 10 }, .. } if epoch == u32::MAX - 4));
+            assert!(
+                matches!(vm.scheduled_step().unwrap(), Event::Platform { request: PlatformRequest::WaitTaskTimer { epoch, duration: 10 }, .. } if epoch == u32::MAX - 4)
+            );
             assert_eq!(vm.steps, 1);
             vm.respond(0).unwrap();
         }

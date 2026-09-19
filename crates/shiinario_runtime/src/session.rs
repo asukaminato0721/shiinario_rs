@@ -348,6 +348,15 @@ impl Session {
                 vm.respond_bytes(&[])?;
                 return Ok(true);
             }
+            if let PlatformRequest::UnfilteredPixelation { block_size, .. } = &request {
+                emit(&Event::CompatibilitySkip {
+                    location: location.clone(),
+                    opcode: 0x0564,
+                    detail: format!(
+                        "pixelation block size {block_size} omitted; unfiltered surface copied"
+                    ),
+                })?;
+            }
             let resource_reply = resources.respond(project, &request).with_context(|| {
                 format!(
                     "{}:{:#x}: resource request {request:?}",
@@ -356,6 +365,7 @@ impl Session {
             })?;
             if matches!(&request, PlatformRequest::DrawGlyph { surface: 0, .. })
                 || matches!(&request, PlatformRequest::StretchSurface(stretch) if stretch.destination.id==0)
+                || matches!(&request, PlatformRequest::UnfilteredPixelation { copy, .. } if copy.destination.id==0)
             {
                 host.respond(&PlatformRequest::InvalidateRect {
                     rect: [

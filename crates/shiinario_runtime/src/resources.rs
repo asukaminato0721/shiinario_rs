@@ -934,7 +934,8 @@ impl Resources {
             }
             PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
-            PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::CopySurface(copy)
+            | PlatformRequest::UnfilteredPixelation { copy, .. } => self.copy_surface(copy)?,
             PlatformRequest::StretchSurface(stretch) => self.stretch_surface(stretch)?,
             PlatformRequest::CaptureSurface(capture) => self.capture_surface(capture)?,
             PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,
