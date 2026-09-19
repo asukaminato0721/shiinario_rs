@@ -41,9 +41,6 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
         presented: 0,
     };
     EventLoop::new()?.run_app(&mut app)?;
-    if let Some(error) = app.error {
-        return Err(error);
-    }
     eprintln!(
         "Native run: {} instructions, {} presented frames; {}:{:#x}",
         app.instructions,
@@ -51,6 +48,16 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
         app.session.location().scenario,
         app.session.location().offset
     );
+    if let Some(host) = &app.host {
+        eprintln!(
+            "Native audio: {} streams started, {} device frames",
+            host.streams_started,
+            host.audio.as_ref().map_or(0, AudioOutput::rendered_frames)
+        );
+    }
+    if let Some(error) = app.error {
+        return Err(error);
+    }
     Ok(())
 }
 struct NativeHost {
@@ -66,6 +73,7 @@ struct NativeHost {
     class_style: u32,
     dirty: bool,
     audio: Option<AudioOutput>,
+    streams_started: usize,
 }
 impl NativeHost {
     fn key(&mut self, virtual_key: usize, pressed: bool) {
@@ -124,7 +132,9 @@ impl Host for NativeHost {
         self.audio
             .as_ref()
             .context("audio has not been initialized")?
-            .play(handle, stream, flags)
+            .play(handle, stream, flags)?;
+        self.streams_started += 1;
+        Ok(())
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
@@ -257,6 +267,7 @@ impl App<'_> {
             class_style: 0xb,
             dirty: true,
             audio: None,
+            streams_started: 0,
         });
         self.presentation = Some(presentation);
         Ok(())

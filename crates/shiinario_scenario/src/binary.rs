@@ -352,7 +352,6 @@ pub struct BinaryVm {
     shared_regions: std::collections::BTreeMap<u32, SharedMemory>,
     surface_regions: std::collections::BTreeMap<u32, u32>,
     next_shared: u32,
-    next_allocation: u32,
     // Entry points are separate from the task's resumable program counter.
     task_entries: std::collections::BTreeMap<u32, (u32, usize)>,
     current_task: u32,
@@ -406,7 +405,6 @@ impl BinaryVm {
             shared_regions: Default::default(),
             surface_regions: Default::default(),
             next_shared: 0x9000_0000,
-            next_allocation: 0x2000_0000,
             task_entries: Default::default(),
             current_task: 0,
             tasks: Default::default(),
@@ -728,6 +726,32 @@ impl BinaryVm {
             .map(Vec::as_slice)
             .context("resource address is not an allocation base")
     }
+    /// First-fit placement among live allocations. Each has a trailing guard
+    /// page; released local scopes must not consume virtual addresses forever.
+    fn allocation_address(&self, size: usize) -> Result<u32> {
+        ensure!(
+            size > 0 && size <= 16 * 1024 * 1024,
+            "allocation size outside 1..16 MiB"
+        );
+        let span = |len: usize| ((len as u32 + 4095) & !4095) + 4096;
+        let needed = span(size);
+        let mut address = 0x2000_0000u32;
+        for (&base, bytes) in &self.allocations {
+            if address.checked_add(needed).is_some_and(|end| end <= base) {
+                break;
+            }
+            address = base
+                .checked_add(span(bytes.len()))
+                .context("allocation address overflow")?;
+        }
+        ensure!(
+            address
+                .checked_add(needed)
+                .is_some_and(|end| end < 0x3000_0000),
+            "VM allocation address space exhausted"
+        );
+        Ok(address)
+    }
     /// Install a decoded archive entry and return its VM address to the script.
     pub fn respond_asset(&mut self, data: Vec<u8>) -> Result<u32> {
         let Some((
@@ -745,13 +769,8 @@ impl BinaryVm {
             !data.is_empty() && data.len() <= 16 * 1024 * 1024,
             "asset allocation outside 1..16 MiB"
         );
-        let address = self.next_allocation;
-        let next = address
-            .checked_add(((data.len() as u32 + 4095) & !4095) + 4096)
-            .filter(|&next| next < 0x3000_0000)
-            .context("VM allocation address space exhausted")?;
+        let address = self.allocation_address(data.len())?;
         self.allocations.insert(address, data);
-        self.next_allocation = next;
         self.write(destination, address);
         self.pending = None;
         Ok(address)
@@ -1738,19 +1757,14 @@ impl BinaryVm {
                         ensure!(cursor.byte()? == 0x12, "unsupported declaration operand");
                         names.push(cursor.declaration_name()?);
                     }
-                    let address = self.next_allocation;
                     let size = count * 40;
-                    let next = address
-                        .checked_add(((size as u32 + 4095) & !4095) + 4096)
-                        .context("allocation overflow")?;
-                    ensure!(next < 0x3000_0000, "VM allocation address space exhausted");
                     let mut bytes = vec![0; size];
                     for (i, name) in names.iter().enumerate() {
                         bytes[i * 40..i * 40 + name.len()].copy_from_slice(name);
                         bytes[i * 40 + 36] = 1;
                     }
+                    let address = self.allocation_address(bytes.len())?;
                     self.allocations.insert(address, bytes);
-                    self.next_allocation = next;
                     self.named_scopes.push(NamedScope {
                         allocation: address,
                         names,
@@ -1963,13 +1977,8 @@ impl BinaryVm {
                     "allocation size outside 1..16 MiB"
                 );
                 let destination = self.destination(&mut cursor)?;
-                let address = self.next_allocation;
-                let next = address
-                    .checked_add(((size as u32 + 4095) & !4095) + 4096)
-                    .context("allocation address overflow")?;
-                ensure!(next < 0x3000_0000, "VM allocation address space exhausted");
+                let address = self.allocation_address(size)?;
                 self.allocations.insert(address, vec![0; size]);
-                self.next_allocation = next;
                 writes.push((destination, address));
             }
             0x09e2 => {
@@ -2784,6 +2793,40 @@ mod tests {
         let mut vm = BinaryVm::new("bounds.scn", instruction(0x2db, &args)).unwrap();
         assert!(vm.step().is_err());
         assert!(vm.banks[&12].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn repeated_local_scopes_reuse_addresses_without_overwriting_live_memory() {
+        let mut args = immediate(64);
+        args.extend([12, 0, 0]);
+        let mut code = instruction(0x2bc, &args);
+        let loop_start = code.len();
+        code.extend(instruction(0x3cf, b"\x01\0\x12local\0"));
+        code.extend(instruction(0x3cf, b"\0\0"));
+        code.extend(instruction(
+            0x258,
+            &immediate(SCRIPT_BASE + loop_start as u32),
+        ));
+        let mut vm = BinaryVm::new("scope-loop.scn", code).unwrap();
+        vm.step().unwrap();
+        let persistent = vm.banks[&12][0];
+        vm.allocations.get_mut(&persistent).unwrap().fill(0xa5);
+        let mut previous = None;
+        // The old monotonic allocator exhausted its 256 MiB address arena
+        // after fewer than 32,768 push/pop pairs, despite only one live scope.
+        for _ in 0..40000 {
+            vm.step().unwrap();
+            let scope = vm.named_scopes.last().unwrap().allocation;
+            assert_eq!(*previous.get_or_insert(scope), scope);
+            assert_ne!(scope, persistent);
+            assert_eq!(vm.allocations[&scope][32..36], [0; 4]);
+            vm.step().unwrap();
+            assert!(vm.memory_read(scope, 4).is_err());
+            vm.step().unwrap();
+        }
+        assert_eq!(vm.allocations.len(), 1);
+        assert_eq!(vm.allocations[&persistent], vec![0xa5; 64]);
+        assert!(vm.memory_read(persistent + 64, 1).is_err());
     }
 
     #[test]
