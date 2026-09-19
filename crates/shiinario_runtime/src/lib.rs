@@ -59,7 +59,11 @@ pub fn trace_with_platform(
                     vm.respond_bytes(&[])?;
                     continue;
                 }
-                let value = platform.respond(&request)?;
+                let value = if let PlatformRequest::FileExists { path } = &request {
+                    u32::from(project.loose_path_exists(path)?)
+                } else {
+                    platform.respond(&request)?
+                };
                 emit(&Event::PlatformReply {
                     value,
                     simulated: true,
@@ -104,6 +108,15 @@ impl Default for TracePlatform {
 impl TracePlatform {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
+            PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
+            // Frozen until a trace supplies elapsed time explicitly.
+            PlatformRequest::ClockMilliseconds => Ok(0),
+            PlatformRequest::ReadRegistryValue {
+                root: 0x80000001,
+                path,
+                name,
+            } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "InstMode" => Ok(0),
             PlatformRequest::PumpMessages => Ok(1),
             PlatformRequest::DisableIme => Ok(0),
             PlatformRequest::DeviceCaps {

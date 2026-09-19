@@ -61,6 +61,14 @@ fn project_lookup_and_cache_budget() {
         b"synthetic asset fixture\n"
     );
     assert!(project.read("..\\fixture.txt").is_err());
+    assert!(!project.loose_path_exists("fixture.txt").unwrap());
+    assert!(!project.loose_path_exists("D\\GAME.INI").unwrap());
+    assert!(project.loose_path_exists("game.ini").unwrap());
+    assert!(project.loose_path_exists("..\\game.ini").is_err());
+    std::fs::create_dir(t.0.join("Saves")).unwrap();
+    std::fs::write(t.0.join("Saves/Slot.DAT"), b"state").unwrap();
+    assert!(project.loose_path_exists("SAVES\\slot.dat").unwrap());
+    assert!(project.loose_path_exists("saves").unwrap());
     let mut cache = Cache::new(5);
     let a = cache.read(&project, "A").unwrap();
     assert!(Arc::ptr_eq(&a, &cache.read(&project, "a").unwrap()));

@@ -1,6 +1,7 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
 //! are distinct formats; unknown instructions are never treated as no-ops.
 mod binary;
+mod format;
 pub use binary::{BinaryVm, MouseButtonMapping, PlatformRequest, boot_binary};
 
 use anyhow::{Context, Result, bail, ensure};

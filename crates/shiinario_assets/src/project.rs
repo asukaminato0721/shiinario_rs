@@ -196,6 +196,32 @@ impl Project {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
     }
+    /// Filesystem-only lookup used by SCN GetFileAttributes checks. Archive
+    /// entries and the archive basename fallback do not participate.
+    pub fn loose_path_exists(&self, name: &str) -> Result<bool> {
+        let normalized = normalize(name)?;
+        let mut current = self.root.clone();
+        for component in normalized.split('/') {
+            if !current.is_dir() {
+                return Ok(false);
+            }
+            let mut matched = None;
+            for entry in std::fs::read_dir(&current)? {
+                let entry = entry?;
+                if entry.file_name().to_string_lossy().to_lowercase() == component
+                    && !entry.file_type()?.is_symlink()
+                {
+                    ensure!(matched.is_none(), "ambiguous Windows filename {name}");
+                    matched = Some(entry.path());
+                }
+            }
+            let Some(path) = matched else {
+                return Ok(false);
+            };
+            current = path;
+        }
+        Ok(current.exists())
+    }
 }
 /// LRU cache counts decoded bytes and never retains a single oversized asset.
 pub struct Cache {

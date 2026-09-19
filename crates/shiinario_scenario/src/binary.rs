@@ -22,6 +22,24 @@ impl MouseButtonMapping {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    InitializeAudio { flags: u32 },
+    InitializeGraphics,
+    /// Low 32 bits of the host monotonic clock in milliseconds.
+    ClockMilliseconds,
+    ReadIniInteger {
+        file: String,
+        section: String,
+        key: String,
+        default: u32,
+    },
+    FileExists {
+        path: String,
+    },
+    ReadRegistryValue {
+        root: u32,
+        path: String,
+        name: String,
+    },
     ReadRegistryString {
         root: u32,
         path: String,
@@ -115,6 +133,19 @@ impl Cursor<'_> {
         ensure!(!name.is_empty(), "empty named variable");
         Ok(name)
     }
+    fn declaration_name(&mut self) -> Result<Vec<u8>> {
+        let mut name = Vec::new();
+        loop {
+            match self.byte()? {
+                0 => break,
+                b'[' => bail!("array declaration is unresolved"),
+                byte => name.push(byte),
+            }
+            ensure!(name.len() <= 31, "named variable exceeds 31 bytes");
+        }
+        ensure!(!name.is_empty(), "empty named variable");
+        Ok(name)
+    }
 }
 
 pub struct BinaryVm {
@@ -147,6 +178,7 @@ pub struct BinaryVm {
     named_scopes: Vec<NamedScope>,
     registry_root: u32,
     registry_path: String,
+    ini_path: String,
     pending_bytes: Option<u32>,
 }
 impl BinaryVm {
@@ -181,6 +213,7 @@ impl BinaryVm {
             named_scopes: Vec::new(),
             registry_root: 0,
             registry_path: String::new(),
+            ini_path: String::new(),
             pending_bytes: None,
         })
     }
@@ -521,6 +554,77 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x06a4 | 0x06c2 => {
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(if opcode == 0x06a4 {
+                    PlatformRequest::InitializeAudio { flags: self.media_flags }
+                } else {
+                    PlatformRequest::InitializeGraphics
+                });
+            }
+            0x02db => {
+                let mut arguments = Vec::new();
+                while cursor.data.get(cursor.pc) != Some(&0xff) {
+                    ensure!(arguments.len() < 256, "format exceeds 256 operands");
+                    arguments.push(self.read(&mut cursor)?);
+                }
+                cursor.byte()?;
+                ensure!(
+                    arguments.len() >= 2,
+                    "format needs destination and format string"
+                );
+                let format = self.string_bytes(arguments[1])?;
+                let mut bytes = crate::format::integer_format(&format, &arguments[2..])?;
+                bytes.push(0);
+                memory_write = Some((self.memory_range(arguments[0], bytes.len())?, bytes));
+            }
+            0x0104 => {
+                let address = self.read(&mut cursor)?;
+                ensure!(
+                    self.string_bytes(address)?.len() < 260,
+                    "INI path exceeds engine buffer"
+                );
+                self.ini_path = self.string(address)?;
+            }
+            0x0107 => {
+                let section = self.string(self.read(&mut cursor)?)?;
+                let key = self.string(self.read(&mut cursor)?)?;
+                let start = cursor.pc;
+                let default = self.read(&mut cursor)?;
+                cursor.pc = start;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadIniInteger {
+                    file: self.ini_path.clone(),
+                    section,
+                    key,
+                    default,
+                });
+            }
+            0x03bd => {
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ClockMilliseconds);
+            }
+            0x010e => {
+                let path = self.string(self.read(&mut cursor)?)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::FileExists { path });
+            }
+            0x00fd => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadRegistryValue {
+                    root: self.registry_root,
+                    path: self.registry_path.clone(),
+                    name,
+                });
+            }
+            0x02c6 => {
+                let destination = self.read(&mut cursor)?;
+                let source = self.read(&mut cursor)?;
+                let length = self.read(&mut cursor)? as usize;
+                let range = self.memory_range(destination, length)?;
+                memory_write = Some((range, self.memory_read(source, length)?));
+            }
             0x00fe => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 let address = self.read(&mut cursor)?;
@@ -582,7 +686,7 @@ impl BinaryVm {
                     let mut names = Vec::with_capacity(count);
                     for _ in 0..count {
                         ensure!(cursor.byte()? == 0x12, "unsupported declaration operand");
-                        names.push(cursor.variable_name()?);
+                        names.push(cursor.declaration_name()?);
                     }
                     let address = self.next_allocation;
                     let size = count * 40;
@@ -605,8 +709,12 @@ impl BinaryVm {
             }
             0x00fa => {
                 let root = self.read(&mut cursor)?;
-                let path = self.string(self.read(&mut cursor)?)?;
-                ensure!(path.len() < 256, "registry path exceeds engine buffer");
+                let address = self.read(&mut cursor)?;
+                ensure!(
+                    self.string_bytes(address)?.len() < 256,
+                    "registry path exceeds engine buffer"
+                );
+                let path = self.string(address)?;
                 self.registry_root = root;
                 self.registry_path = path;
             }
@@ -737,13 +845,14 @@ impl BinaryVm {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0396..=0x0398 => {
+            0x0393 | 0x0396..=0x0398 => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
                 cursor.pc = saved;
                 let destination = self.destination(&mut cursor)?;
                 let value = match opcode {
+                    0x393 => second.wrapping_add(first),
                     0x396 => first & second,
                     0x397 => first | second,
                     _ => first ^ second,
@@ -850,12 +959,14 @@ impl BinaryVm {
 pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
     let mut vm = BinaryVm::new(name, data.to_vec())?;
     loop {
-        if let Event::Platform { location, request } = vm.step()? {
-            bail!(
+        match vm.step()? {
+            Event::End => return Ok(()),
+            Event::Platform { location, request } => bail!(
                 "{}:{:#x}: platform host required: {request:?}",
                 location.scenario,
                 location.offset
-            );
+            ),
+            _ => {}
         }
     }
 }
@@ -898,6 +1009,126 @@ mod tests {
                 assert_eq!(&actual, expected, "{} step {}", vm.name, vm.steps);
             }
         }
+    }
+
+    #[test]
+    fn clock_and_shutdown_replies_control_execution() {
+        let mut code = instruction(0x3bd, &[12, 0, 0]);
+        code.extend(instruction(0x34, &[]));
+        let mut vm = BinaryVm::new("clock.scn", code).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ClockMilliseconds,
+                ..
+            }
+        ));
+        assert_eq!(vm.steps, 1);
+        assert!(vm.respond_bytes(b"wrong type").is_err());
+        vm.respond(u32::MAX).unwrap();
+        assert_eq!(vm.banks[&12][0], u32::MAX);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::PumpMessages,
+                ..
+            }
+        ));
+        vm.respond(0).unwrap();
+        assert!(matches!(vm.step().unwrap(), Event::End));
+        assert!(matches!(vm.step().unwrap(), Event::End));
+        assert_eq!(vm.steps, 2);
+    }
+
+    #[test]
+    fn platform_string_replies_are_bounded_and_can_retry() {
+        let mut vm = BinaryVm::new("directory.scn", instruction(0xa28, &[0x4c, 0, 0])).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ProjectDirectory,
+                ..
+            }
+        ));
+        assert!(vm.respond(1).is_err());
+        for bytes in [vec![b'x'; 256], b"bad\0path".to_vec()] {
+            assert!(vm.respond_bytes(&bytes).is_err());
+            assert!(vm.banks[&12].iter().all(|&v| v == 0));
+        }
+        vm.respond_bytes(b"Saves\\").unwrap();
+        assert_eq!(vm.string_bytes(bank_base(12)).unwrap(), b"Saves\\");
+        assert!(vm.respond_bytes(b"again").is_err());
+    }
+
+    #[test]
+    fn ini_read_uses_old_destination_as_default() {
+        let mut code = instruction(0x104, b"\x10settings.ini\0");
+        let mut args = immediate(77);
+        args.extend([12, 0, 0]);
+        code.extend(instruction(0x38e, &args));
+        code.extend(instruction(0x107, b"\x10Engine\0\x10Volume\0\x0c\0\0"));
+        let mut vm = BinaryVm::new("ini.scn", code).unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert!(matches!(vm.step().unwrap(), Event::Platform {
+            request: PlatformRequest::ReadIniInteger { file, section, key, default: 77 }, ..
+        } if file == "settings.ini" && section == "Engine" && key == "Volume"));
+        vm.respond(23).unwrap();
+        assert_eq!(vm.banks[&12][0], 23);
+    }
+
+    #[test]
+    fn formatting_consumes_terminator_and_bounds_destination() {
+        let mut args = vec![0x4c, 0, 0];
+        args.extend(b"\x10save%03d.dat\0");
+        args.extend(immediate(54));
+        args.push(0xff);
+        let mut code = instruction(0x2db, &args);
+        let next = code.len();
+        code.extend(instruction(0x49d, &immediate(7)));
+        let mut vm = BinaryVm::new("format.scn", code).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.pc, next);
+        assert_eq!(vm.string_bytes(bank_base(12)).unwrap(), b"save054.dat");
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 7);
+        for end in 0..args.len() {
+            let mut vm = BinaryVm::new("short.scn", instruction(0x2db, &args[..end])).unwrap();
+            assert!(vm.step().is_err());
+            assert!(vm.banks[&12].iter().all(|&v| v == 0));
+        }
+        args[1..3].copy_from_slice(&999u16.to_le_bytes());
+        let mut vm = BinaryVm::new("bounds.scn", instruction(0x2db, &args)).unwrap();
+        assert!(vm.step().is_err());
+        assert!(vm.banks[&12].iter().all(|&v| v == 0));
+    }
+
+    #[test]
+    fn invalid_named_declarations_do_not_allocate_or_push_scopes() {
+        for args in [
+            b"\x02\0\x12valid\0\x12truncated".as_slice(),
+            b"\x01\0\x12array[4]\0",
+            b"\x01\0\x12\0",
+        ] {
+            let mut vm = BinaryVm::new("scope.scn", instruction(0x3cf, args)).unwrap();
+            assert!(vm.step().is_err());
+            assert!(vm.allocations.is_empty());
+            assert!(vm.named_scopes.is_empty());
+            assert_eq!(vm.pc, 0);
+        }
+        let mut code = instruction(0x3cf, b"\x01\0\x12local\0");
+        code.extend(instruction(0x3cf, b"\0\0"));
+        code.extend(instruction(0x49d, b"\x12local\0"));
+        let mut vm = BinaryVm::new("scope.scn", code).unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert!(vm.allocations.is_empty());
+        assert!(
+            vm.step()
+                .unwrap_err()
+                .to_string()
+                .contains("undefined named variable")
+        );
     }
 
     #[test]
