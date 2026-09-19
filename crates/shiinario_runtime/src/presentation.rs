@@ -35,7 +35,8 @@ impl Presentation {
                 &wgpu::DeviceDescriptor {
                     label: Some("Shiina Rio presentation"),
                     required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults(),
+                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
                 },
                 None,
             )
