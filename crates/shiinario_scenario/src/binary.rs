@@ -47,6 +47,9 @@ pub struct ImageDraw {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    ReadKeyState {
+        key: u32,
+    },
     ReadControls,
     CursorPosition,
     MapCursor {
@@ -1220,6 +1223,11 @@ impl BinaryVm {
             opcode,
         };
         match opcode {
+            0x03e8 => {
+                let key = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadKeyState { key });
+            }
             0x0456 | 0x0492 => {
                 let begin = cursor.pc;
                 request = Some(if opcode == 0x0492 {

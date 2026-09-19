@@ -1,6 +1,12 @@
 //! Control masks recovered from the original v2.47 input functions.
 //! Device acquisition and event timing belong to the platform host.
 
+/// Opcode 03e8 sign-extends GetAsyncKeyState's SHORT, then applies the
+/// engine's activation flag. The query itself still occurs when inactive.
+pub fn key_state_reply(raw: i16, active: bool) -> u32 {
+    if active { raw as i32 as u32 } else { 0 }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct JoystickState {
     pub x: u32,
@@ -95,6 +101,38 @@ impl ControlState {
 mod tests {
     use super::*;
     use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
+    #[test]
+    fn individual_key_queries_match_original_short_and_activation_behavior() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/validation/key-state-probe.json"
+        ))
+        .unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let key = case["key"].as_u64().unwrap() as u32;
+            let value = key_state_reply(
+                case["raw"].as_u64().unwrap() as i16,
+                case["active"].as_bool().unwrap(),
+            );
+            assert_eq!(serde_json::json!(value), case["result"]);
+            let mut code = vec![0xe8, 3, 4];
+            code.extend_from_slice(&key.to_le_bytes());
+            code.extend_from_slice(&[12, 0, 0, 0x9d, 4, 12, 0, 0]);
+            let mut vm = BinaryVm::new("key.scn", code).unwrap();
+            let event = vm.step().unwrap();
+            assert!(
+                matches!(event, Event::Platform { request: PlatformRequest::ReadKeyState { key: actual }, .. } if actual==key)
+            );
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond(value).unwrap();
+            assert_eq!(
+                vm.location().offset,
+                case["next_offset"].as_u64().unwrap() as usize
+            );
+            assert!(
+                matches!(vm.step().unwrap(), Event::MouseButtonMapping { value: actual, .. } if actual==value)
+            );
+        }
+    }
     #[test]
     fn control_masks_match_original_keyboard_focus_mouse_and_joystick() {
         let fixture: serde_json::Value =

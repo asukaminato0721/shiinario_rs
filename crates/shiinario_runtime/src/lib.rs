@@ -2,12 +2,14 @@
 pub mod audio;
 pub mod input;
 pub mod resources;
+pub mod session;
 pub mod viewport;
-use anyhow::{Context, Result, bail};
-use sha2::{Digest, Sha256};
+use anyhow::{Result, bail};
+use session::Host;
 use shiinario_assets::project::Project;
-use shiinario_scenario::{BinaryVm, Event, Input, PlatformRequest, TextScript, TextVm};
+use shiinario_scenario::{Event, Input, PlatformRequest, TextScript, TextVm};
 use std::path::Path;
+use std::sync::Arc;
 pub fn boot(project: &Project) -> Result<()> {
     let name = &project.config.startup;
     let data = project.read(name)?;
@@ -50,232 +52,22 @@ pub fn trace_with_clock(
     );
     let data = project.read(name)?;
     if name.to_ascii_lowercase().ends_with(".scn") {
-        let mut vm = BinaryVm::new(name, data)?;
-        vm.set_viewport(project.config.width, project.config.height)?;
-        if let Some(value) = project.config.values.get("background") {
-            let value: i32 = value.parse().context("invalid Background configuration")?;
-            if value != -1 {
-                vm.set_background_mode(value as u32);
-            }
-        }
-        if let Some(value) = project.config.values.get("turbo") {
-            let value: i32 = value.parse().context("invalid Turbo configuration")?;
-            if value != -1 {
-                vm.set_dispatch_quantum((value as u32).max(1))?;
-            }
-        }
+        let mut session = session::Session::new(project, name)?;
         let mut platform = TracePlatform {
             tick_ms,
-            ..TracePlatform::default()
+            enabled: simulate_platform,
+            ..Default::default()
         };
-        let mut resources = resources::Resources::for_project(project)?;
-        let mut audio = audio::Mixer::default();
         for _ in 0..max_steps {
-            let event = match vm.scheduled_step() {
-                Ok(event) => event,
-                Err(error) => {
-                    for (name, data) in vm.scenario_buffers() {
-                        emit(&Event::ScenarioDigest {
-                            name: name.to_owned(),
-                            sha256: format!("{:x}", Sha256::digest(data)),
-                        })?;
-                    }
-                    return Err(error);
-                }
-            };
-            emit(&event)?;
-            if event == Event::SchedulerPoll {
-                if !simulate_platform {
-                    bail!(
-                        "scheduler requires a platform host; use --simulate-platform for a synthetic host"
-                    );
-                }
-                platform.poll();
-                vm.respond(1)?;
-                emit(&Event::PlatformReply {
-                    value: 1,
-                    simulated: true,
-                })?;
-                continue;
-            }
-            if let Event::ArchiveSearchPath { name, .. } = &event {
-                resources.register_archive(name);
-            }
-            if matches!(event, Event::End) {
+            if !session.step(project, &mut platform, &mut emit)? {
                 return Ok(());
             }
-            if let Event::Platform { location, request } = event {
-                if !simulate_platform {
-                    bail!(
-                        "{}:{:#x}: platform reply required: {request:?}; use --simulate-platform for a synthetic host",
-                        location.scenario,
-                        location.offset
-                    );
-                }
-                if matches!(
-                    request,
-                    PlatformRequest::CursorPosition | PlatformRequest::MapCursor { .. }
-                ) {
-                    let point = match request {
-                        PlatformRequest::CursorPosition => [0, 0],
-                        PlatformRequest::MapCursor { point } => {
-                            viewport::ViewportTransform::default().to_logical(point)?
-                        }
-                        _ => unreachable!(),
-                    };
-                    vm.respond_point(point)?;
-                    emit(&Event::PointReply {
-                        point,
-                        simulated: true,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::ImageBounds { id, frame } = &request {
-                    let bounds = resources.image_bounds(*id, *frame).with_context(|| {
-                        format!("{}:{:#x}: image bounds", location.scenario, location.offset)
-                    })?;
-                    vm.respond_image_bounds(bounds)?;
-                    emit(&Event::ImageBoundsReply { bounds })?;
-                    continue;
-                }
-                if let PlatformRequest::SurfacePixels { id } = &request {
-                    let address = vm.respond_surface_pixels(resources.surface_memory(*id))?;
-                    emit(&Event::PlatformReply {
-                        value: address,
-                        simulated: false,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::CreateAudioStream { address, flags } = &request {
-                    let handle = resources
-                        .create_audio_stream(vm.allocation_bytes(*address)?, *flags)
-                        .with_context(|| {
-                            format!(
-                                "{}:{:#x}: create audio stream",
-                                location.scenario, location.offset
-                            )
-                        })?;
-                    vm.respond(handle)?;
-                    emit(&Event::PlatformReply {
-                        value: handle,
-                        simulated: false,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::SetAudioStreamVolume { handle, percent } = &request {
-                    if *handle != 0 {
-                        resources
-                            .audio_stream(*handle)
-                            .with_context(|| {
-                                format!(
-                                    "{}:{:#x}: unknown audio stream handle {handle:#x}",
-                                    location.scenario, location.offset
-                                )
-                            })?
-                            .volume
-                            .set_percent(*percent)?;
-                    }
-                    vm.respond(1)?;
-                    emit(&Event::PlatformReply {
-                        value: 1,
-                        simulated: true,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::PlayAudioStream { handle, flags } = &request {
-                    let stream = resources
-                        .audio_stream(*handle)
-                        .context("unknown audio stream handle")?;
-                    audio
-                        .play(*handle, stream.clone(), *flags)
-                        .with_context(|| {
-                            format!(
-                                "{}:{:#x}: play audio stream",
-                                location.scenario, location.offset
-                            )
-                        })?;
-                    vm.respond(1)?;
-                    emit(&Event::PlatformReply {
-                        value: 1,
-                        simulated: true,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::LoadAsset { name } = &request {
-                    let bytes = resources.read_asset(project, name).with_context(|| {
-                        format!(
-                            "{}:{:#x}: load asset {name}",
-                            location.scenario, location.offset
-                        )
-                    })?;
-                    let address = vm.respond_asset(bytes)?;
-                    emit(&Event::PlatformReply {
-                        value: address,
-                        simulated: false,
-                    })?;
-                    continue;
-                }
-                if let PlatformRequest::LoadScenario { name, .. } = &request {
-                    let bytes = resources.read_asset(project, name).with_context(|| {
-                        format!(
-                            "{}:{:#x}: load scenario {name}",
-                            location.scenario, location.offset
-                        )
-                    })?;
-                    vm.respond_scenario(bytes)?;
-                    emit(&Event::PlatformReply {
-                        value: 1,
-                        simulated: false,
-                    })?;
-                    continue;
-                }
-                if matches!(&request, PlatformRequest::ProjectDirectory)
-                    || matches!(&request, PlatformRequest::ReadRegistryString { root: 0x80000001, path, name } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "DataPath")
-                {
-                    // An empty registry DataPath makes the SCN ask for the
-                    // installation directory. Empty project-relative paths
-                    // refer to Project.root; no host absolute path enters SCN.
-                    emit(&Event::PlatformBytesReply {
-                        bytes: Vec::new(),
-                        simulated: true,
-                    })?;
-                    vm.respond_bytes(&[])?;
-                    continue;
-                }
-                let resource_reply = resources.respond(project, &request).with_context(|| {
-                    format!(
-                        "{}:{:#x}: resource request {request:?}",
-                        location.scenario, location.offset
-                    )
-                })?;
-                if let PlatformRequest::DrawImages { id, .. } = &request {
-                    let memory = resources
-                        .surface_memory(*id)
-                        .context("draw surface missing")?;
-                    let bgr_sha256 = format!("{:x}", Sha256::digest(memory.read(0, memory.len())?));
-                    emit(&Event::SurfaceDigest {
-                        id: *id,
-                        bgr_sha256,
-                    })?;
-                }
-                let value = if let Some(value) = resource_reply {
-                    value
-                } else if let PlatformRequest::FileExists { path } = &request {
-                    u32::from(project.loose_path_exists(path)?)
-                } else {
-                    platform.respond(&request)?
-                };
-                emit(&Event::PlatformReply {
-                    value,
-                    simulated: resource_reply.is_none(),
-                })?;
-                vm.respond(value)?;
-            }
         }
+        session.digests(&mut emit)?;
         bail!(
             "{}:{:#x}: trace step budget {max_steps} exhausted",
-            vm.location().scenario,
-            vm.location().offset
+            session.location().scenario,
+            session.location().offset
         );
     }
     let script = TextScript::parse(name, &data)?;
@@ -299,6 +91,8 @@ pub fn trace_with_clock(
 }
 
 struct TracePlatform {
+    enabled: bool,
+    mixer: audio::Mixer,
     class_style: u32,
     clock_ms: u32,
     tick_ms: u32,
@@ -306,18 +100,45 @@ struct TracePlatform {
 impl Default for TracePlatform {
     fn default() -> Self {
         Self {
+            enabled: true,
+            mixer: audio::Mixer::default(),
             class_style: 0xb,
             clock_ms: 0,
             tick_ms: 0,
         }
     }
 }
-impl TracePlatform {
-    fn poll(&mut self) {
+impl Host for TracePlatform {
+    fn available(&self) -> bool {
+        self.enabled
+    }
+    fn simulated(&self) -> bool {
+        true
+    }
+    fn poll(&mut self) -> Result<()> {
         self.clock_ms = self.clock_ms.wrapping_add(self.tick_ms);
+        Ok(())
+    }
+    fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
+        match request {
+            PlatformRequest::CursorPosition => Ok([0, 0]),
+            PlatformRequest::MapCursor { point } => {
+                viewport::ViewportTransform::default().to_logical(*point)
+            }
+            _ => bail!("unsupported point request: {request:?}"),
+        }
+    }
+    fn play_stream(
+        &mut self,
+        handle: u32,
+        stream: Arc<resources::AudioStream>,
+        flags: u32,
+    ) -> Result<()> {
+        self.mixer.play(handle, stream, flags)
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::ReadKeyState { .. } => Ok(input::key_state_reply(0, true)),
             PlatformRequest::ReadControls => Ok(input::ControlState::default().mask()),
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
@@ -332,7 +153,7 @@ impl TracePlatform {
                 name,
             } if path == "software\\GuiltyPLUS\\Ran→Sem(DL)" && name == "InstMode" => Ok(0),
             PlatformRequest::PumpMessages => {
-                self.poll();
+                self.poll()?;
                 Ok(1)
             }
             PlatformRequest::DisableIme => Ok(0),
