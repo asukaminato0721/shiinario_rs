@@ -319,4 +319,43 @@ mod tests {
         assert!(result[0] < 220 && result[2] > 30);
         assert_eq!(&result[4..], &[0; 4]);
     }
+
+    #[test]
+    fn image_glyph_blends_partial_full_and_zero_opacity() {
+        let pixels = SharedMemory::zeroed(4).unwrap();
+        let mask = Mask {
+            offset: [0, 0],
+            size: [1, 1],
+            coverage: vec![64],
+        };
+        for (initial, opacity, expected) in [
+            ([0, 0, 0, 255], 128, [108, 39, 14, 255]),
+            ([30, 40, 50, 127], 256, [220, 80, 30, 255]),
+            ([30, 40, 50, 127], 0, [30, 40, 50, 127]),
+            // The native zero/zero entry is 255: RGB changes but stays invisible.
+            ([30, 40, 50, 0], 0, [219, 79, 30, 0]),
+        ] {
+            pixels.write(0, &initial).unwrap();
+            let style = TextStyle {
+                color: [220, 80, 30],
+                effects: 0,
+                opacity,
+                ..Default::default()
+            };
+            draw_mask(
+                Canvas {
+                    pixels: &pixels,
+                    size: [1, 1],
+                    stride: 4,
+                    rgba: true,
+                },
+                [0, 0],
+                &style,
+                &mask,
+                [1, 1],
+            )
+            .unwrap();
+            assert_eq!(pixels.read(0, 4).unwrap(), expected);
+        }
+    }
 }
