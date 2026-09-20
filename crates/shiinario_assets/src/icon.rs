@@ -19,7 +19,7 @@ pub struct Icon {
 pub fn from_game(directory: &Path) -> Result<Option<Icon>> {
     for path in crate::profile::Catalog::builtin()?.game_executables(directory)? {
         let mut bytes = Vec::new();
-        std::fs::File::open(&path)?
+        crate::fs::File::open(&path)?
             .take(128 * 1024 * 1024 + 1)
             .read_to_end(&mut bytes)?;
         ensure!(

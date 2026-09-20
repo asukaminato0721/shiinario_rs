@@ -1,16 +1,17 @@
 //! Bounded, read-only access to 's original WARC 1.7 assets.
 mod compression;
 mod crypt;
+pub mod fs;
 pub mod icon;
 mod nrbf;
 pub mod profile;
 use anyhow::{Context, Result, ensure};
+use fs::File;
 use profile::{Catalog, Profile};
 use serde::Serialize;
 use std::sync::Arc;
 use std::{
     collections::BTreeSet,
-    fs::File,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };

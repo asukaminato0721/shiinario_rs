@@ -43,29 +43,7 @@ impl TextRenderer {
         {
             let (name, _, bad) = encoding_rs::SHIFT_JIS.decode(&style.font_face);
             ensure!(!bad, "invalid CP932 font name");
-            let weight = if style.font_weight >= 600 { 200 } else { 80 };
-            let pattern = format!("{name}:lang=ja:weight={weight}");
-            let output = std::process::Command::new("fc-match")
-                .args(["--format=%{file}\n%{index}\n", &pattern])
-                .output()
-                .context("Japanese font lookup requires Fontconfig (fc-match)")?;
-            ensure!(output.status.success(), "Fontconfig font lookup failed");
-            let result = std::str::from_utf8(&output.stdout).context("font path is not UTF-8")?;
-            let mut lines = result.lines();
-            let path = lines
-                .next()
-                .filter(|s| !s.is_empty())
-                .context("Fontconfig returned no font")?;
-            let index: u32 = lines
-                .next()
-                .context("Fontconfig returned no face index")?
-                .parse()?;
-            let length = std::fs::metadata(path)?.len();
-            ensure!(length <= 32 * 1024 * 1024, "font exceeds 32 MiB");
-            let font: FontArc = FontVec::try_from_vec_and_index(std::fs::read(path)?, index)
-                .context("invalid font face")?
-                .into();
-            eprintln!("Text font: {name:?} -> {path} (face {index})");
+            let font = load_font(&name, style.font_weight)?;
             self.face = Some(Face {
                 name: style.font_face.clone(),
                 weight: style.font_weight,
@@ -358,4 +336,68 @@ mod tests {
             assert_eq!(pixels.read(0, 4).unwrap(), expected);
         }
     }
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
+    let weight = if font_weight >= 600 { 200 } else { 80 };
+    let pattern = format!("{name}:lang=ja:weight={weight}");
+    let output = std::process::Command::new("fc-match")
+        .args(["--format=%{file}\n%{index}\n", &pattern])
+        .output()
+        .context("Japanese font lookup requires Fontconfig (fc-match)")?;
+    ensure!(output.status.success(), "Fontconfig font lookup failed");
+    let result = std::str::from_utf8(&output.stdout).context("font path is not UTF-8")?;
+    let mut lines = result.lines();
+    let path = lines
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("Fontconfig returned no font")?;
+    let index: u32 = lines
+        .next()
+        .context("Fontconfig returned no face index")?
+        .parse()?;
+    let length = std::fs::metadata(path)?.len();
+    ensure!(length <= 32 * 1024 * 1024, "font exceeds 32 MiB");
+    let font: FontArc = FontVec::try_from_vec_and_index(std::fs::read(path)?, index)
+        .context("invalid font face")?
+        .into();
+    eprintln!("Text font: {name:?} -> {path} (face {index})");
+    Ok(font)
+}
+
+#[cfg(target_os = "android")]
+fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
+    for path in [
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/system/fonts/NotoSansJP-Regular.otf",
+        "/system/fonts/DroidSansFallback.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Ok(FontVec::try_from_vec_and_index(bytes, 0)
+                .context("invalid Android Japanese font")?
+                .into());
+        }
+    }
+    anyhow::bail!("no Japanese font found in /system/fonts")
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! { static BROWSER_FONT: std::cell::RefCell<Option<FontArc>> = const { std::cell::RefCell::new(None) }; }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_browser_font(bytes: Vec<u8>) -> Result<()> {
+    ensure!(bytes.len() <= 32 * 1024 * 1024, "font exceeds 32 MiB");
+    let font = FontVec::try_from_vec_and_index(bytes, 0)
+        .context("invalid browser font")?
+        .into();
+    BROWSER_FONT.with(|value| *value.borrow_mut() = Some(font));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
+    BROWSER_FONT
+        .with(|value| value.borrow().clone())
+        .context("select a Japanese TTF/OTF/TTC font before starting")
 }

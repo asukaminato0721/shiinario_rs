@@ -1,4 +1,4 @@
-//! Linux window, input and audio services for the shared scenario session.
+//! Native window, input and audio services for the shared scenario session.
 use crate::{
     audio::AudioOutput,
     input::{AsyncKeys, ControlState},
@@ -34,6 +34,14 @@ pub struct Options {
     pub scenario_dump: Option<PathBuf>,
 }
 pub fn run(project: &Project, options: Options) -> Result<()> {
+    run_with_event_loop(project, options, EventLoop::new()?)
+}
+
+pub(crate) fn run_with_event_loop(
+    project: &Project,
+    options: Options,
+    mut event_loop: EventLoop,
+) -> Result<()> {
     let dump = if let Some(path) = &options.scenario_dump {
         let parent = path
             .parent()
@@ -53,7 +61,6 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
         None
     };
     let session = Session::new(project, &project.config.startup)?;
-    let mut event_loop = EventLoop::new()?;
     let mut app = App {
         project,
         session,
@@ -355,6 +362,23 @@ impl ApplicationHandler for App<'_> {
         self.presentation = None;
     }
     fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if let Some(host) = &mut self.host {
+            // Android keeps the session across background/foreground transitions.
+            match pollster::block_on(Presentation::new(
+                host.window.clone(),
+                [self.project.config.width, self.project.config.height],
+            )) {
+                Ok(presentation) => {
+                    if let Ok(transform) = presentation.transform() {
+                        host.transform = transform;
+                    }
+                    host.dirty = true;
+                    self.presentation = Some(presentation);
+                }
+                Err(error) => self.fail(event_loop, error),
+            }
+            return;
+        }
         if self.host.is_none()
             && let Err(error) = self.initialize(event_loop)
         {
@@ -422,9 +446,8 @@ impl ApplicationHandler for App<'_> {
                 ..
             } => {
                 host.cursor = [position.x as i32, position.y as i32];
-                let Some(button) = button.mouse_button() else {
-                    return;
-                };
+                // Primary touch is a left click on mobile screens.
+                let button = button.mouse_button().unwrap_or(MouseButton::Left);
                 if let Some((bit, vk)) = match button {
                     MouseButton::Left => Some((1, 1)),
                     MouseButton::Right => Some((2, 2)),
@@ -462,6 +485,10 @@ impl ApplicationHandler for App<'_> {
     }
     fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
         if event_loop.exiting() {
+            return;
+        }
+        if self.presentation.is_none() {
+            event_loop.set_control_flow(ControlFlow::Wait);
             return;
         }
         let Some(host) = &mut self.host else {

@@ -3,16 +3,18 @@ use crate::{
     buffer_audio::BufferVoice,
     resources::{AudioStream, Sound, StreamVolume},
 };
-use anyhow::{Context, Result, bail, ensure};
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::{Context, bail};
+use anyhow::{Result, ensure};
+#[cfg(not(target_arch = "wasm32"))]
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use shiinario_scenario::SoundCommand;
-use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::{
+    Mutex,
+    atomic::{AtomicU64, Ordering},
 };
+use std::{collections::BTreeMap, sync::Arc};
 
 struct Voice {
     stream: Arc<AudioStream>,
@@ -296,12 +298,14 @@ impl Mixer {
 
 /// Owns the device stream; dropping it stops playback. Async errors remain
 /// observable by the host instead of being printed and forgotten.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct AudioOutput {
     _stream: cpal::Stream,
     mixer: Arc<Mutex<Mixer>>,
     error: Arc<Mutex<Option<String>>>,
     frames: Arc<AtomicU64>,
 }
+#[cfg(not(target_arch = "wasm32"))]
 impl AudioOutput {
     pub fn fade(&self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
         self.check()?;
@@ -410,6 +414,7 @@ impl AudioOutput {
             .is_playing(handle))
     }
 }
+#[cfg(not(target_arch = "wasm32"))]
 fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
