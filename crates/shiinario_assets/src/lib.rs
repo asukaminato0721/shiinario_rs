@@ -5,9 +5,10 @@ pub mod fs;
 pub mod icon;
 mod nrbf;
 pub mod profile;
+mod recovery;
 use anyhow::{Context, Result, ensure};
 use fs::File;
-use profile::{Catalog, Profile};
+use profile::Profile;
 use serde::Serialize;
 use std::sync::Arc;
 use std::{
@@ -36,7 +37,7 @@ fn u32le(b: &[u8]) -> u32 {
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let profile = Catalog::builtin()?.for_archive(path)?;
+        let profile = Profile::for_archive(path)?;
         Self::open_with_profile(path, profile)
     }
     pub fn open_with_profile(path: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
@@ -123,13 +124,13 @@ impl Archive {
             crypt::decrypt(&self.profile, &mut data[8..]);
         }
         if entry.flags & 0x20000000 != 0 {
-            crypt::decrypt2(&self.profile, &mut data[8..]);
+            crypt::decrypt2(&self.profile, &mut data[8..])?;
         }
         let compressed = matches!(sig & 0xffffff, 0x314859 | 0x4b5059 | 0x5a4c59);
         let mut output = compression::unpack(sig, &mut data, size as usize)
             .with_context(|| format!("{}:{}", self.path.display(), entry.name))?;
         if compressed && entry.flags & 0x40000000 != 0 {
-            crypt::decrypt2(&self.profile, &mut output);
+            crypt::decrypt2(&self.profile, &mut output)?;
         }
         Ok(output)
     }

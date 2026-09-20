@@ -17,7 +17,11 @@ pub struct Icon {
 }
 
 pub fn from_game(directory: &Path) -> Result<Option<Icon>> {
-    for path in crate::profile::Catalog::builtin()?.game_executables(directory)? {
+    let executables = match crate::recovery::in_directory(directory)? {
+        Some(game) => game.executables,
+        None => crate::profile::Catalog::builtin()?.game_executables(directory)?,
+    };
+    for path in executables {
         let mut bytes = Vec::new();
         crate::fs::File::open(&path)?
             .take(128 * 1024 * 1024 + 1)

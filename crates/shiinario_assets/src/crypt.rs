@@ -289,10 +289,14 @@ pub fn decrypt_index(profile: &Profile, offset: u32, data: &mut [u8]) {
         *d ^= key[i % 4] ^ !170u8;
     }
 }
-pub fn decrypt2(profile: &Profile, data: &mut [u8]) {
+pub fn decrypt2(profile: &Profile, data: &mut [u8]) -> anyhow::Result<()> {
     if data.len() < 1024 {
-        return;
+        return Ok(());
     }
+    anyhow::ensure!(
+        profile.decode.len() == 8192,
+        "second-stage WARC decryption requires a recovered DecodeBin table"
+    );
     let mut crc = 0xffffffffu32;
     for &b in &data[..256] {
         crc ^= (b as u32) << 24;
@@ -311,6 +315,7 @@ pub fn decrypt2(profile: &Profile, data: &mut [u8]) {
             *d ^= b;
         }
     }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {
@@ -319,5 +324,20 @@ mod tests {
     fn windows_epoch() {
         assert_eq!(filetime(0), [1601 | 1 << 16, 0, 0]);
         assert_eq!(filetime(116444736000000000), [1970 | 1 << 16, 0, 0]);
+    }
+
+    #[test]
+    fn missing_second_stage_table_is_an_error() {
+        let profile = Profile {
+            version: EngineVersion::V2_36,
+            entry_name_size: 16,
+            key: vec![],
+            image: vec![],
+            region: vec![],
+            decode: vec![],
+            helper_key: [0; 5],
+        };
+        assert!(decrypt2(&profile, &mut [0; 1024]).is_err());
+        assert!(decrypt2(&profile, &mut [0; 1023]).is_ok());
     }
 }

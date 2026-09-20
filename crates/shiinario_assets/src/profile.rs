@@ -17,7 +17,7 @@ use std::{
 const MAX_DATABASE: usize = 16 * 1024 * 1024;
 const BUNDLED_DATABASE: &[u8] = include_bytes!("../data/garbro/Formats.dat");
 
-/// Validated WARC v2.36/v2.47 decryption data read from a GARbro catalog.
+/// Validated WARC v2.36/v2.47 decryption data recovered from an executable or catalog.
 /// Loading does not execute .NET code. Other scheme versions are unsupported.
 #[derive(Debug)]
 pub struct Profile {
@@ -227,6 +227,34 @@ impl Catalog {
 }
 
 impl Profile {
+    /// Recover decryption data from supported PE contents and initialization patterns.
+    /// This does not load Formats.dat or execute any Windows code.
+    pub fn from_executable(bytes: &[u8]) -> Result<Self> {
+        crate::recovery::from_executable(bytes)
+    }
+
+    /// Prefer static executable recovery; use the catalog for other builds.
+    pub fn for_directory(directory: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let directory = directory.as_ref();
+        if let Some(game) = crate::recovery::in_directory(directory)? {
+            return Ok(game.profile);
+        }
+        Catalog::builtin()?.for_directory(directory)
+    }
+
+    /// Prefer EXE contents over filename mappings for direct archive access too.
+    pub fn for_archive(path: impl AsRef<Path>) -> Result<Arc<Self>> {
+        let path = path.as_ref();
+        let directory = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        if let Some(game) = crate::recovery::in_directory(directory)? {
+            return Ok(game.profile);
+        }
+        Catalog::builtin()?.for_archive(path)
+    }
+
     fn from_record(doc: &Document<'_>, scheme: &Value<'_>) -> Result<Self> {
         doc.class(scheme, "GameRes.Formats.ShiinaRio.EncryptionScheme")?;
         let version = doc.number(doc.field(scheme, "<Version>k__BackingField")?)?;
