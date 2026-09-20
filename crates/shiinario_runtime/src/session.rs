@@ -34,9 +34,6 @@ pub struct Session {
     movies: crate::movie::Movies,
 }
 impl Session {
-    pub fn set_best_effort(&mut self, enabled: bool) {
-        self.vm.set_best_effort(enabled);
-    }
     pub fn new(project: &Project, name: &str) -> Result<Self> {
         let mut vm = BinaryVm::with_version(name, project.read(name)?, project.config.version)?;
         vm.set_viewport(project.config.width, project.config.height)?;
@@ -509,26 +506,6 @@ impl Session {
                 })?;
                 return Ok(true);
             }
-            if let PlatformRequest::CreateSurface { flags, .. } = &request
-                && *flags != 0
-            {
-                emit(&Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode: 0x0546,
-                    detail: format!(
-                        "DirectDraw allocation flags {flags:#x} replaced with a software BGR24 surface"
-                    ),
-                })?;
-            }
-            if let PlatformRequest::UnfilteredPixelation { block_size, .. } = &request {
-                emit(&Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode: 0x0564,
-                    detail: format!(
-                        "pixelation block size {block_size} omitted; unfiltered surface copied"
-                    ),
-                })?;
-            }
             let resource_reply = resources.respond(project, &request).with_context(|| {
                 format!(
                     "{}:{:#x}: resource request {request:?}",
@@ -537,7 +514,7 @@ impl Session {
             })?;
             if matches!(&request, PlatformRequest::DrawGlyph { surface: 0, .. })
                 || matches!(&request, PlatformRequest::StretchSurface(stretch) if stretch.destination.id==0)
-                || matches!(&request, PlatformRequest::UnfilteredPixelation { copy, .. } if copy.destination.id==0)
+                || matches!(&request, PlatformRequest::PixelateSurface { copy, .. } if copy.destination.id==0)
             {
                 host.respond(&PlatformRequest::InvalidateRect {
                     rect: [

@@ -98,4 +98,3 @@ fn contains(list: &[u8], glyph: &[u8]) -> bool {
     }
     list.windows(glyph.len()).any(|bytes| bytes == glyph)
 }
-

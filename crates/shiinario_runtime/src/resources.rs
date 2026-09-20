@@ -2,12 +2,14 @@
 use anyhow::{Context, Result, bail, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::{
-    ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend, SurfaceCapture,
-    SurfaceCopy, SurfaceStretch,
+    ImageAffine, ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend,
+    SurfaceCapture, SurfaceCopy, SurfaceStretch,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+
+mod graphics;
 
 const LIMIT: usize = 256 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -977,8 +979,8 @@ impl Resources {
             id < 256 && width > 0 && height > 0 && width <= 16384 && height <= 16384,
             "invalid drawing surface dimensions or slot"
         );
-        // The VM authorizes these DirectDraw modes only in best-effort mode;
-        // Session logs their software fallback before allocating BGR24 storage.
+        // DirectDraw memory placement flags select the same portable, CPU-accessible
+        // surface. Presentation uploads this storage through the native renderer.
         ensure!(
             matches!(flags, 0 | 0x80000000 | 0xc0000000),
             "unresolved surface allocation flags {flags:#x}"
@@ -1230,8 +1232,11 @@ impl Resources {
             }
             PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
-            PlatformRequest::CopySurface(copy)
-            | PlatformRequest::UnfilteredPixelation { copy, .. } => self.copy_surface(copy)?,
+            PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::PixelateSurface { copy, block_size } => {
+                self.pixelate_surface(copy, *block_size)?
+            }
+            PlatformRequest::AffineImage(transform) => self.affine_image(transform)?,
             PlatformRequest::StretchSurface(stretch) => self.stretch_surface(stretch)?,
             PlatformRequest::CaptureSurface(capture) => self.capture_surface(capture)?,
             PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,

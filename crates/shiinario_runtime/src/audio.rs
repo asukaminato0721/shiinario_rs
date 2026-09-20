@@ -454,7 +454,6 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
 mod tests {
     use super::*;
     use crate::resources::{Resources, Sound};
-    use std::io::Read;
     fn synthetic() -> Arc<AudioStream> {
         let ogg = include_bytes!("../../shiinario_assets/tests/fixtures/sine.ogg");
         let mut data = b"OGV\0".to_vec();

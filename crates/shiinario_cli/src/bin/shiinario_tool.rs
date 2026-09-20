@@ -31,9 +31,6 @@ enum Command {
         /// JSON array of timestamped mouse/key snapshots for deterministic replay.
         #[arg(long, requires = "simulate_platform")]
         input: Option<PathBuf>,
-        /// Log identified presentation omissions and continue.
-        #[arg(long)]
-        best_effort: bool,
         /// Print coverage totals instead of every interpreter event.
         #[arg(long)]
         summary: bool,
@@ -128,7 +125,6 @@ fn main() -> Result<()> {
             simulate_platform,
             tick_ms,
             input,
-            best_effort,
             summary,
             final_frame,
             tail_events,
@@ -140,7 +136,6 @@ fn main() -> Result<()> {
                 .transpose()?
                 .unwrap_or_default();
             let mut instructions = std::collections::BTreeMap::<u16, usize>::new();
-            let mut skips = std::collections::BTreeMap::<u16, usize>::new();
             let mut glyphs = 0usize;
             let mut events = 0usize;
             let mut recent = std::collections::VecDeque::with_capacity(tail_events);
@@ -158,7 +153,6 @@ fn main() -> Result<()> {
                 shiinario_runtime::TraceOptions {
                     simulate_platform,
                     tick_ms,
-                    best_effort,
                     input,
                     final_frame: final_frame.map(
                         |path| -> Box<
@@ -205,17 +199,6 @@ fn main() -> Result<()> {
                         Event::BinaryInstruction { opcode, .. } => {
                             *instructions.entry(*opcode).or_default() += 1
                         }
-                        Event::CompatibilitySkip {
-                            location,
-                            opcode,
-                            detail,
-                        } => {
-                            *skips.entry(*opcode).or_default() += 1;
-                            eprintln!(
-                                "SKIP {}:{:#x} opcode={opcode:#06x}: {detail}",
-                                location.scenario, location.offset
-                            );
-                        }
                         Event::Platform {
                             request:
                                 PlatformRequest::DrawGlyph { .. }
@@ -252,7 +235,7 @@ fn main() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"story_checkpoints":story_checkpoints,"binary_instruction_counts":instructions,"skipped_instruction_counts":skips,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}")),"recent_events":recent})
+                        &serde_json::json!({"events":events,"glyphs":glyphs,"loaded_scenarios":scenarios,"story_reads":stories,"story_checkpoints":story_checkpoints,"binary_instruction_counts":instructions,"ended":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}")),"recent_events":recent})
                     )?
                 );
             }

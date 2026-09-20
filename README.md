@@ -34,6 +34,12 @@ while compressed input and decoded audio are retained under a memory budget.
 The independent movie regression suite runs with
 `cargo test -p shiinario_runtime --test movie --locked` and uses a synthetic clip.
 
+Graphics operations include image affine transforms, block pixelation,
+image-frame text and portable drawing surfaces.
+292 synthetic cases compare affine, pixelation and image-text pixels with the
+original v2.47 kernels. Native font outlines still depend on installed fonts.
+Unsupported commands report errors.
+
 Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not been verified.
 
 ```sh
@@ -71,7 +77,7 @@ Built and tested with Rust 1.98.1 on Linux. An older minimum toolchain has not b
 # Generate repeatable Start/advance input (does not select choices).
 python tools/research/make_story_input.py /tmp/input.json --skip
 # Deterministic input replay with compact counts and explicit compatibility omissions.
-./shiinario_tool trace START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --best-effort --summary
+./shiinario_tool trace START.SCN --simulate-platform --tick-ms 1 --max-steps 20000000 --input /tmp/input.json --summary
 ```
 
 Replay input is a JSON array of frames with strictly increasing `at_ms`, logical

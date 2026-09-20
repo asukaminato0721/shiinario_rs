@@ -1,5 +1,5 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
-//! are distinct formats. Compatibility omissions are explicit events.
+//! are distinct formats. Unsupported operations return errors.
 mod binary;
 mod expression;
 mod format;
@@ -7,9 +7,9 @@ mod memory;
 mod text;
 pub mod text_layout;
 pub use binary::{
-    BinaryVm, ImageDraw, MaskTransition, MouseButtonMapping, MovieCommand, PlatformRequest,
-    SoundCommand, SurfaceBlend, SurfaceCapture, SurfaceCopy, SurfacePoint, SurfaceStretch,
-    boot_binary,
+    BinaryVm, ImageAffine, ImageDraw, MaskTransition, MouseButtonMapping, MovieCommand,
+    PlatformRequest, SoundCommand, SurfaceBlend, SurfaceCapture, SurfaceCopy, SurfacePoint,
+    SurfaceStretch, boot_binary,
 };
 pub use memory::SharedMemory;
 pub use text::TextStyle;
@@ -161,11 +161,6 @@ pub enum AudioChannel {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event")]
 pub enum Event {
-    CompatibilitySkip {
-        location: Location,
-        opcode: u16,
-        detail: String,
-    },
     /// Host poll between scheduler passes or priority-task dispatches.
     SchedulerPoll,
     /// One asynchronous text scheduler pass, after its input/drawing replies.

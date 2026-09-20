@@ -28,8 +28,6 @@ use winit::{
 
 #[derive(Default)]
 pub struct Options {
-    /// Stop at presentation omissions instead of logging and continuing.
-    pub strict: bool,
     /// Optional bounded native smoke run, measured from window creation.
     pub run_for: Option<Duration>,
     /// Optional new directory outside the installation for modified SCN buffers.
@@ -54,8 +52,7 @@ pub fn run(project: &Project, options: Options) -> Result<()> {
     } else {
         None
     };
-    let mut session = Session::new(project, &project.config.startup)?;
-    session.set_best_effort(!options.strict);
+    let session = Session::new(project, &project.config.startup)?;
     let mut event_loop = EventLoop::new()?;
     let mut app = App {
         project,
@@ -483,17 +480,6 @@ impl ApplicationHandler for App<'_> {
         for _ in 0..10000 {
             let mut timer_wait = false;
             let result = self.session.step(self.project, host, |event| {
-                if let Event::CompatibilitySkip {
-                    location,
-                    opcode,
-                    detail,
-                } = event
-                {
-                    eprintln!(
-                        "SKIP {}:{:#x} opcode={opcode:#06x}: {detail}",
-                        location.scenario, location.offset
-                    );
-                }
                 if matches!(
                     event,
                     Event::Platform {

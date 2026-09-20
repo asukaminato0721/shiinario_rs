@@ -34,7 +34,6 @@ fn posted_close_ends_session_through_the_shared_native_and_trace_path() {
             ) {
                 posted = true;
             }
-            assert!(!matches!(event, Event::CompatibilitySkip { .. }));
             if *event == Event::End {
                 ended = true;
             }

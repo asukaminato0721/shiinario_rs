@@ -318,7 +318,7 @@ fn cp932_len(first: u8) -> usize {
 mod tests {
     use super::*;
     #[test]
-    fn best_effort_image_text_is_logged_and_surface_drawing_resumes() {
+    fn image_text_executes_and_surface_drawing_resumes() {
         let mut code = Vec::new();
         let immediate = |value: u32| {
             let mut out = vec![4];
@@ -337,23 +337,12 @@ mod tests {
         }
         code.extend(0u16.to_le_bytes());
         code.extend(immediate(0));
-        let mut strict = BinaryVm::new("image-text.scn", code.clone()).unwrap();
-        assert!(
-            strict
-                .step()
-                .unwrap_err()
-                .to_string()
-                .contains("image frames")
-        );
         let mut vm = BinaryVm::new("image-text.scn", code).unwrap();
-        vm.set_best_effort(true);
-        let mut skipped = 0;
         let mut drawn = Vec::new();
         for step in 0..100 {
             assert!(step < 99);
             match vm.scheduled_step().unwrap() {
                 Event::End => break,
-                Event::CompatibilitySkip { opcode: 0xb4, .. } => skipped += 1,
                 Event::SchedulerPoll => vm.respond(1).unwrap(),
                 Event::Platform {
                     request:
@@ -376,14 +365,6 @@ mod tests {
                 event => panic!("{event:?}"),
             }
         }
-        assert_eq!(skipped, 1);
         assert_eq!(drawn, vec![('A', [0, 0]), ('B', [8, 0])]);
     }
-    fn decode(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
 }

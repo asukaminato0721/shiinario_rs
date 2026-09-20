@@ -68,7 +68,6 @@ pub fn trace_with_clock(
 pub struct TraceOptions {
     pub simulate_platform: bool,
     pub tick_ms: u32,
-    pub best_effort: bool,
     pub input: Vec<replay::InputFrame>,
     /// Receive surface zero when binary replay ends, fails or reaches its budget.
     pub final_frame: Option<Box<dyn FnOnce(resources::Surface) -> Result<()>>>,
@@ -84,7 +83,6 @@ pub fn trace_with_options(
     let TraceOptions {
         simulate_platform,
         tick_ms,
-        best_effort,
         input,
         final_frame,
     } = options;
@@ -98,7 +96,6 @@ pub fn trace_with_options(
     );
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut session = session::Session::new(project, name)?;
-        session.set_best_effort(best_effort);
         let mut platform = TracePlatform {
             replay: replay::Replay::new(input)?,
             tick_ms,

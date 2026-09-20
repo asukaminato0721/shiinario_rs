@@ -78,7 +78,6 @@ fn integer(value: f64) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
     #[test]
     fn fitted_canvas_and_input_share_letterbox_coordinates() {
         for (physical, rect, center) in [

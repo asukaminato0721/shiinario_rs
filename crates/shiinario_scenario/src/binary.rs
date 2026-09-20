@@ -43,6 +43,19 @@ pub struct SurfaceCopy {
     pub size: [i32; 2],
 }
 
+/// 0574 uses IEEE-754 f32 bit patterns for angle (degrees) and x/y scales.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageAffine {
+    pub destination: [u32; 2],
+    pub destination_rect: [u32; 4],
+    pub source: [u32; 2],
+    pub source_rect: [u32; 4],
+    pub center: [i32; 2],
+    pub transform: [u32; 3],
+    pub flags: u32,
+    pub background: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SurfaceCapture {
     pub image: u32,
@@ -186,10 +199,11 @@ pub enum PlatformRequest {
     },
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
-    UnfilteredPixelation {
+    PixelateSurface {
         copy: SurfaceCopy,
         block_size: i32,
     },
+    AffineImage(ImageAffine),
     StretchSurface(SurfaceStretch),
     CaptureSurface(SurfaceCapture),
     MaskTransition(MaskTransition),
@@ -589,7 +603,6 @@ pub struct BinaryVm {
     background_mode: u32,
     archive_paths: Vec<String>,
     text_style: crate::text::TextStyle,
-    best_effort: bool,
     text_image: [u32; 2],
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the default text context.
@@ -666,7 +679,6 @@ impl BinaryVm {
             pending_delay: None,
             task_timers: Default::default(),
             text_style: Default::default(),
-            best_effort: false,
             text_image: [u32::MAX, 0],
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
@@ -684,9 +696,6 @@ impl BinaryVm {
     }
     /// Permit only explicitly identified presentation omissions. Unknown operand
     /// boundaries and control-flow operations still fail.
-    pub fn set_best_effort(&mut self, enabled: bool) {
-        self.best_effort = enabled;
-    }
     /// Number of instructions per native dispatcher invocation (INI Turbo).
     pub fn set_dispatch_quantum(&mut self, value: u32) -> Result<()> {
         ensure!(value > 0, "dispatcher quantum must be positive");
@@ -2176,21 +2185,20 @@ impl BinaryVm {
                 }));
             }
             0x0574 => {
-                // Original 4193e0 reads 19 numeric operands before performing
-                // an affine transform between mutable image frames.
-                ensure!(
-                    self.best_effort,
-                    "image affine transform is unresolved; use best-effort playback to omit it"
-                );
                 let mut arguments = [0u32; 19];
                 for value in &mut arguments {
                     *value = self.read(&mut cursor)?;
                 }
-                event = Event::CompatibilitySkip {
-                    location: location.clone(),
-                    opcode,
-                    detail: format!("image affine transform omitted; arguments={arguments:?}"),
-                };
+                request = Some(PlatformRequest::AffineImage(ImageAffine {
+                    destination: [arguments[0], arguments[1]],
+                    destination_rect: arguments[2..6].try_into().unwrap(),
+                    source: [arguments[6], arguments[7]],
+                    source_rect: arguments[8..12].try_into().unwrap(),
+                    center: [arguments[12] as i32, arguments[13] as i32],
+                    transform: arguments[14..17].try_into().unwrap(),
+                    flags: arguments[17],
+                    background: arguments[18],
+                }));
             }
             0x055e => {
                 let image = self.read(&mut cursor)?;
@@ -2270,12 +2278,8 @@ impl BinaryVm {
                 };
                 request = Some(if opcode == 0x0564 {
                     let block_size = self.read(&mut cursor)? as i32;
-                    ensure!(
-                        block_size <= 0 || self.best_effort,
-                        "pixelation is unresolved; use best-effort playback to omit the filter"
-                    );
                     if block_size > 0 {
-                        PlatformRequest::UnfilteredPixelation { copy, block_size }
+                        PlatformRequest::PixelateSurface { copy, block_size }
                     } else {
                         PlatformRequest::CopySurface(copy)
                     }
@@ -2635,10 +2639,6 @@ impl BinaryVm {
                     (operand, 0)
                 };
                 ensure!(id < 256, "surface index {id} out of bounds");
-                ensure!(
-                    flags == 0 || self.best_effort,
-                    "DirectDraw surface allocation requires best-effort software fallback"
-                );
                 request = Some(PlatformRequest::CreateSurface {
                     id,
                     width: self.viewport[0],
@@ -2754,20 +2754,10 @@ impl BinaryVm {
                 let values = [self.read(&mut cursor)?, self.read(&mut cursor)?];
                 if opcode == 0x00b4 {
                     ensure!(
-                        values[0] == u32::MAX || self.best_effort,
-                        "original text rasterization into image frames is unresolved; use best-effort playback for native alpha blending"
+                        values[0] == u32::MAX || values[0] < 256,
+                        "image text slot out of bounds"
                     );
                     self.text_image = values;
-                    if values[0] != u32::MAX {
-                        event = Event::CompatibilitySkip {
-                            location: location.clone(),
-                            opcode,
-                            detail: format!(
-                                "original image text rasterization replaced by native alpha blending in image {} frame {}",
-                                values[0], values[1]
-                            ),
-                        };
-                    }
                 } else {
                     self.text_image_offset = values;
                 }
@@ -3850,7 +3840,70 @@ mod tests {
         assert_eq!(vm.mouse_mapping.value, 11);
         code.truncate(131);
         let mut vm = BinaryVm::new("short.scn", code).unwrap();
-        vm.set_best_effort(true);
+        assert!(vm.step().is_err());
+        assert_eq!(vm.pc, 0);
+    }
+
+    #[test]
+    fn graphics_dispatch_preserves_operands_and_instruction_boundaries() {
+        let affine = [
+            1,
+            0,
+            0,
+            0,
+            6,
+            5,
+            2,
+            0,
+            0,
+            0,
+            6,
+            5,
+            3,
+            2,
+            90f32.to_bits(),
+            1f32.to_bits(),
+            2f32.to_bits(),
+            1,
+            0x11223344,
+        ];
+        let pixelation = [1, 0, 0, 6, 5, 2, 0, 0, 3];
+        let operands = |args: &[u32]| args.iter().flat_map(|v| immediate(*v)).collect::<Vec<_>>();
+        let mut code = instruction(0x574, &operands(&affine));
+        code.extend(instruction(0x564, &operands(&pixelation)));
+        code.extend(instruction(0x546, &immediate(0xc0000001)));
+        code.extend(instruction(0x49d, &immediate(7)));
+        let mut vm = BinaryVm::new("graphics.scn", code.clone()).unwrap();
+        let event = vm.step().unwrap();
+        assert!(matches!(&event, Event::Platform {
+            request: PlatformRequest::AffineImage(op), ..
+        } if op.transform == [90f32.to_bits(), 1f32.to_bits(), 2f32.to_bits()]
+            && op.source == [2, 0] && op.background == 0x11223344));
+        assert_eq!(vm.step().unwrap(), event);
+        vm.respond(1).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::PixelateSurface { block_size: 3, .. },
+                ..
+            }
+        ));
+        vm.respond(1).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::CreateSurface {
+                    id: 1,
+                    flags: 0xc0000000,
+                    ..
+                },
+                ..
+            }
+        ));
+        vm.respond(1).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 7);
+        let mut vm = BinaryVm::new("truncated-affine.scn", code[..96].to_vec()).unwrap();
         assert!(vm.step().is_err());
         assert_eq!(vm.pc, 0);
     }
@@ -3896,7 +3949,6 @@ mod tests {
         code.extend(instruction(0x5b6, &immediate(0)));
         code.extend(instruction(0x73f, &[12, 3, 0]));
         code.extend(instruction(0x49d, &immediate(7)));
-        // These requests work in strict mode, without compatibility skips.
         let mut vm = BinaryVm::new("movie.scn", code).unwrap();
         for command in [
             MovieCommand::Open {
@@ -4024,8 +4076,6 @@ mod tests {
         assert_eq!(&vm.data[20..24], &[0; 4]);
     }
 
-
-
     #[test]
     fn free_invalidates_pointers_reuses_space_and_preserves_other_allocations() {
         let mut code = instruction(0x02bc, &[immediate(64), vec![12, 0, 0]].concat());
@@ -4057,7 +4107,6 @@ mod tests {
         assert_eq!(vm.allocations.len(), 1);
     }
 
-
     #[test]
     fn released_task_entry_cannot_be_called_and_locals_survive_redefinition() {
         let mut code = instruction(0x000f, &immediate(10));
@@ -4079,8 +4128,6 @@ mod tests {
         assert_eq!(vm.tasks[&10].locals[0], 77);
         assert_eq!(vm.tasks[&10].sp, CELLS);
     }
-
-
 
     #[test]
     fn draw_list_is_bounded_and_reset_reuses_capacity() {
@@ -4119,7 +4166,6 @@ mod tests {
             assert_eq!(vm.data, before);
         }
     }
-
 
     #[test]
     fn shared_surface_replacement_invalidates_pointers_without_losing_pending_requests() {
@@ -4186,7 +4232,6 @@ mod tests {
             assert_eq!(vm.pc, 0);
         }
     }
-
 
     #[test]
     fn malformed_indexed_jumps_and_memory_operations_stop_without_writes() {
@@ -4272,7 +4317,6 @@ mod tests {
         assert_eq!(vm.steps, 2);
     }
 
-
     #[test]
     fn invalid_pop_and_return_cleanup_keep_stack_and_location() {
         let mut code = instruction(0x2f8, &immediate(7));
@@ -4294,7 +4338,6 @@ mod tests {
         assert_eq!((vm.sp, vm.pc), (998, 32));
         assert_eq!(vm.banks[&8], stack);
     }
-
 
     #[test]
     fn clock_and_shutdown_replies_control_execution() {
@@ -4586,9 +4629,6 @@ mod tests {
             assert_eq!(vm.banks[&12][0], 127);
         }
     }
-
-
-
 
     #[test]
     fn invalid_branch_target_is_diagnostic_not_a_panic() {

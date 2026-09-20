@@ -33,4 +33,3 @@ pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {
     }
     Ok(result)
 }
-

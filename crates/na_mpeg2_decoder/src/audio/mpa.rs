@@ -26,10 +26,10 @@ pub struct MpaAudioDecoder {
     sample_buf: Option<SampleBuffer<f32>>,
     sample_spec: Option<SignalSpec>,
 
-    // Best-effort PTS tracking. PES boundaries are not guaranteed to align
-    // with MPEG audio frame boundaries, so PTS anchors are associated with
-    // absolute byte offsets and applied only when a new audio frame begins.
-    next_pts_ms: Option<i64>,
+    // PES anchors belong to the first frame starting at or after their byte
+    // offset. Between anchors, retain exact sample durations: rounding each
+    // frame to milliseconds accumulates audible drift at 44.1 kHz.
+    next_pts_ticks: Option<i128>,
     pts_anchors: VecDeque<(u64, i64)>,
     buffer_stream_offset: u64,
 
@@ -45,7 +45,7 @@ impl MpaAudioDecoder {
             dec_codec: None,
             sample_buf: None,
             sample_spec: None,
-            next_pts_ms: None,
+            next_pts_ticks: None,
             pts_anchors: VecDeque::new(),
             buffer_stream_offset: 0,
             track_id: 0,
@@ -85,7 +85,7 @@ impl MpaAudioDecoder {
                 if anchor_offset > frame_stream_offset {
                     break;
                 }
-                self.next_pts_ms = Some(anchor_pts);
+                self.next_pts_ticks = Some(i128::from(anchor_pts) * TICKS_PER_MILLISECOND);
                 self.pts_anchors.pop_front();
             }
 
@@ -93,7 +93,7 @@ impl MpaAudioDecoder {
             let pkt_owned = self.buf[pos..pos + h.frame_len].to_vec();
             pos += h.frame_len;
 
-            let pts0 = self.next_pts_ms.unwrap_or(0);
+            let pts0 = self.next_pts_ms();
             self.decode_one_packet(&pkt_owned, pts0, h, &mut on_chunk)?;
         }
 
@@ -135,7 +135,7 @@ impl MpaAudioDecoder {
                     self.dec_codec = None;
                     self.sample_buf = None;
                     self.sample_spec = None;
-                    self.advance_pts_after_drop(pts_ms, header);
+                    self.advance_pts_after_drop(header);
                     return Ok(());
                 }
             };
@@ -190,11 +190,7 @@ impl MpaAudioDecoder {
                     });
                 }
 
-                let frames_i64 = frames as i64;
-                if frames_i64 > 0 && sample_rate > 0 {
-                    let dur_ms = (frames_i64 * 1000 + sample_rate as i64 / 2) / sample_rate as i64;
-                    self.next_pts_ms = Some(pts_ms.saturating_add(dur_ms.max(1)));
-                }
+                self.advance_pts(frames as u64, sample_rate);
             }
             Err(e) => {
                 if std::env::var_os("SG_MOVIE_TRACE").is_some()
@@ -206,23 +202,36 @@ impl MpaAudioDecoder {
                 self.dec_codec = None;
                 self.sample_buf = None;
                 self.sample_spec = None;
-                self.advance_pts_after_drop(pts_ms, header);
+                self.advance_pts_after_drop(header);
             }
         }
 
         Ok(())
     }
 
-    fn advance_pts_after_drop(&mut self, pts_ms: i64, header: MpaHeader) {
-        if header.sample_rate == 0 || header.samples_per_frame == 0 {
-            return;
+    fn advance_pts_after_drop(&mut self, header: MpaHeader) {
+        self.advance_pts(u64::from(header.samples_per_frame), header.sample_rate);
+    }
+
+    fn next_pts_ms(&self) -> i64 {
+        ((self.next_pts_ticks.unwrap_or(0) + TICKS_PER_MILLISECOND / 2)
+            .div_euclid(TICKS_PER_MILLISECOND))
+        .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+    }
+
+    fn advance_pts(&mut self, frames: u64, rate: u32) {
+        if rate != 0 {
+            self.next_pts_ticks = Some(
+                self.next_pts_ticks.unwrap_or(0)
+                    + i128::from(frames) * TICKS_PER_SECOND / i128::from(rate),
+            );
         }
-        let duration_ms = ((header.samples_per_frame as i64) * 1000
-            + (header.sample_rate as i64 / 2))
-            / header.sample_rate as i64;
-        self.next_pts_ms = Some(pts_ms.saturating_add(duration_ms.max(1)));
     }
 }
+
+// Least common multiple of all MPEG audio sample rates (8–48 kHz).
+const TICKS_PER_SECOND: i128 = 14_112_000;
+const TICKS_PER_MILLISECOND: i128 = TICKS_PER_SECOND / 1000;
 
 fn same_signal_spec(a: &SignalSpec, b: &SignalSpec) -> bool {
     a.rate == b.rate && a.channels == b.channels
@@ -412,3 +421,52 @@ const BITRATES_V2_L1: [u32; 16] = [
 const BITRATES_V2_L2L3: [u32; 16] = [
     0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, 0,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_clock_preserves_fractional_frames_and_rate_changes() {
+        let mut decoder = MpaAudioDecoder::new();
+        for rate in [8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000] {
+            decoder.next_pts_ticks = Some(-7 * TICKS_PER_MILLISECOND);
+            for _ in 0..10000 {
+                decoder.advance_pts(1152, rate);
+            }
+            assert_eq!(
+                decoder.next_pts_ms(),
+                -7 + (10000 * 1152 * 1000i64 + i64::from(rate) / 2) / i64::from(rate)
+            );
+        }
+        decoder.next_pts_ticks = None;
+        for _ in 0..100 {
+            decoder.advance_pts(441, 44100);
+            decoder.advance_pts(480, 48000);
+        }
+        assert_eq!(decoder.next_pts_ms(), 2000);
+    }
+
+    #[test]
+    fn pes_anchor_waits_for_frame_start_across_split_packets() {
+        // An invalid Layer II payload still consumes one frame's duration.
+        let mut frame = vec![0; 208];
+        frame[..4].copy_from_slice(&[0xff, 0xfd, 0x40, 0xc0]);
+        let mut decoder = MpaAudioDecoder::new();
+        decoder
+            .push_with(&frame[..100], Some(1000), |_| {})
+            .unwrap();
+        decoder
+            .push_with(&frame[100..], Some(2000), |_| {})
+            .unwrap();
+        assert_eq!(decoder.next_pts_ms(), 1026);
+        assert_eq!(decoder.pts_anchors.len(), 1);
+        decoder.push_with(&frame, None, |_| {}).unwrap();
+        assert_eq!(decoder.next_pts_ms(), 2026);
+        assert!(decoder.pts_anchors.is_empty());
+        for _ in 0..99 {
+            decoder.push_with(&frame, None, |_| {}).unwrap();
+        }
+        assert_eq!(decoder.next_pts_ms(), 4612);
+    }
+}

@@ -136,7 +136,6 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shiinario_scenario::{BinaryVm, Event, PlatformRequest};
     #[test]
     fn asynchronous_press_latches_survive_release_and_are_consumed_once() {
         let mut keys = AsyncKeys::default();
