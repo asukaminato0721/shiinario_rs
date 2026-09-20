@@ -10,6 +10,11 @@ cargo b -r
 
 Copy `target/release/shiinario_engine` into the game directory and run it.
 
+Branch pushes build Linux, macOS and Windows binaries for x86_64 and ARM64,
+plus FreeBSD x86_64. The GitHub Actions workflow uploads archives containing
+`shiinario_engine` and `shiinario_tool` and refreshes the rolling `pre-release`
+GitHub release after all builds succeed. Tag pushes do not run the workflow.
+
 you may need to fix the launch program since the key maybe not set
 
 (ask your agent for this)

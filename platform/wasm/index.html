@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shiina Rio</title>
+<link rel="stylesheet" href="style.css">
+<main>
+  <h1>Shiina Rio</h1>
+  <p>Select an original game folder and a Japanese font. Files stay on your device.</p>
+  <label>Game folder <input id="game" type="file" webkitdirectory multiple></label>
+  <label>Japanese font <input id="font" type="file" accept=".ttf,.otf,.ttc"></label>
+  <div class="buttons"><button id="start">Start</button><button id="stop" disabled>Stop</button><button id="fullscreen">Fullscreen</button></div>
+  <p id="status" role="status">Ready. Use Chrome or Edge over HTTPS or localhost.</p>
+  <canvas id="screen" width="800" height="600" tabindex="0" aria-label="Game screen"></canvas>
+  <p>Tap or click to advance. Right-click opens the game menu. Saves remain in this browser; keep the same game files when reopening.</p>
+</main>
+<script type="module" src="main.js"></script>
+</html>

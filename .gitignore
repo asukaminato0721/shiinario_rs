@@ -1,2 +1,8 @@
 /target
 __pycache__/
+/dist/
+/platform/android/.gradle/
+/platform/android/.kotlin/
+/platform/android/local.properties
+/platform/android/app/build/
+/platform/android/app/src/main/jniLibs/

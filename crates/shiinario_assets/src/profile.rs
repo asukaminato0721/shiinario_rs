@@ -1,5 +1,6 @@
 //! GARbro catalog loading, following FormatCatalog.DeserializeScheme and ImageArray.
 //! GARbro Copyright (C) 2015-2017 morkt (MIT); see THIRD_PARTY_NOTICES.md.
+use crate::fs::{self, File};
 use crate::{
     compression,
     nrbf::{self, Document, Value},
@@ -8,7 +9,6 @@ use anyhow::{Context, Result, ensure};
 use shiinario_core::EngineVersion;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, File},
     io::Read,
     path::Path,
     sync::{Arc, OnceLock},
@@ -170,7 +170,7 @@ impl Catalog {
         let mut paths = Vec::new();
         for entry in fs::read_dir(directory)? {
             let path = entry?.path();
-            if !path.is_file()
+            if !fs::is_file(&path)
                 || !path
                     .extension()
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
@@ -196,7 +196,7 @@ impl Catalog {
             .with_context(|| format!("identifying game in {}", directory.display()))?
         {
             let path = entry?.path();
-            if !path.is_file()
+            if !fs::is_file(&path)
                 || !path.extension().is_some_and(|ext| {
                     ext.eq_ignore_ascii_case("exe") || (archives && ext.eq_ignore_ascii_case("war"))
                 })

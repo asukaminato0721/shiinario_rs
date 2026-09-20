@@ -1,10 +1,16 @@
 //! Host-independent project startup and deterministic research traces.
+#[cfg(target_os = "android")]
+mod android;
 pub mod audio;
+#[cfg(target_arch = "wasm32")]
+mod browser;
 mod buffer_audio;
 mod calendar;
 pub mod input;
 pub mod movie;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod native;
+#[cfg(not(target_arch = "wasm32"))]
 mod presentation;
 pub mod replay;
 pub mod resources;
@@ -17,6 +23,7 @@ use shiinario_assets::project::Project;
 use shiinario_scenario::{Event, Input, PlatformRequest, TextScript, TextVm};
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
 pub fn boot(project: &Project) -> Result<()> {
     native::run(project, native::Options::default())
 }

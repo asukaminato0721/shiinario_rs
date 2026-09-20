@@ -1,0 +1,275 @@
+name: Build Artifacts
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - name: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+          - name: macos-x86_64
+            os: macos-15
+            target: x86_64-apple-darwin
+          - name: windows-x86_64
+            os: windows-2022
+            target: x86_64-pc-windows-msvc
+          - name: windows-arm64
+            os: windows-2022
+            target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcb1-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libvulkan-dev
+
+      - name: Build (release)
+        run: cargo build --release --locked -p shiinario_cli --bins --target ${{ matrix.target }} --verbose
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: shiinario-${{ matrix.name }}
+        run: |
+          mkdir -p dist
+          tar -C "target/${BUILD_TARGET}/release" \
+            -czf "dist/${ARTIFACT_NAME}.tar.gz" \
+            shiinario_engine shiinario_tool
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BUILD_TARGET: ${{ matrix.target }}
+          ARTIFACT_NAME: shiinario-${{ matrix.name }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path @(
+            "target/$env:BUILD_TARGET/release/shiinario_engine.exe",
+            "target/$env:BUILD_TARGET/release/shiinario_tool.exe"
+          ) -DestinationPath "dist/$env:ARTIFACT_NAME.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiinario-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  freebsd:
+    name: freebsd-x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build FreeBSD artifact
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.4"
+          arch: x86_64
+          usesh: true
+          sync: rsync
+          copyback: true
+          envs: CARGO_TERM_COLOR
+          prepare: |
+            set -e
+            pkg update
+            pkg install -y \
+              git rust pkgconf cmake ninja gmake llvm19 \
+              alsa-lib libX11 libXcursor libXi libXrandr libXinerama \
+              libxcb wayland libxkbcommon vulkan-loader
+          run: |
+            set -e
+            cargo build --release --locked -p shiinario_cli --bins --verbose
+            mkdir -p dist
+            tar -C target/release -czf dist/shiinario-freebsd-x86_64.tar.gz \
+              shiinario_engine shiinario_tool
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiinario-freebsd-x86_64
+          path: dist/shiinario-freebsd-x86_64.tar.gz
+          if-no-files-found: error
+
+  wasm:
+    name: wasm
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test browser filesystem
+        run: node --test platform/wasm/vfs.test.mjs
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build browser package
+        run: ./platform/scripts/build_wasm.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiinario-wasm
+          path: dist/wasm/shiinario-wasm.zip
+          if-no-files-found: error
+
+  android:
+    name: android (arm64 + x86_64)
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+      - name: Install Android components
+        run: sdkmanager "platforms;android-36" "build-tools;36.0.0" "ndk;28.2.13676358"
+      - name: Build installable APK
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          VARIANT: debug
+        run: ./platform/scripts/package_android_apk.sh
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: shiinario-android
+          path: dist/android/shiinario-android-debug.apk
+          if-no-files-found: error
+
+  prerelease:
+    name: Publish rolling prerelease
+    needs: [build, freebsd, wasm, android]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    concurrency:
+      group: shiinario-prerelease
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read workspace version
+        id: version
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import tomllib
+          from pathlib import Path
+
+          data = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))
+          print(f"version={data['workspace']['package']['version']}")
+          PY
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: shiinario-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::7}"
+          cat > "$RUNNER_TEMP/release-notes.md" <<EOF
+          Rolling prerelease from a branch push.
+
+          Version: v${VERSION}
+          Commit: ${GITHUB_SHA}
+
+          Desktop archives contain shiinario_engine and shiinario_tool.
+          The WASM archive contains the browser player; serve it over HTTPS or localhost.
+          The Android APK includes arm64-v8a and x86_64 and uses a debug signature.
+          EOF
+
+          if gh release view pre-release >/dev/null 2>&1; then
+            gh release delete pre-release --cleanup-tag --yes
+          fi
+
+          gh release create pre-release dist/* \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "shiinario v${VERSION} pre-release (${short_sha})" \
+            --notes-file "$RUNNER_TEMP/release-notes.md"

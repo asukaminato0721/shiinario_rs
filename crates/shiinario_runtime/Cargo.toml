@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[lib]
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 na_mpeg2_decoder = { path = "../na_mpeg2_decoder" }
 anyhow.workspace = true
@@ -12,12 +15,24 @@ shiinario_scenario.workspace = true
 serde.workspace = true
 sha2.workspace = true
 libc = "0.2"
+ab_glyph = "0.2.32"
+encoding_rs.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 cpal = "0.15.3"
 wgpu = "0.20"
 winit = "=0.31.0-beta.3"
 pollster = "0.3"
-ab_glyph = "0.2.32"
-encoding_rs.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "=0.31.0-beta.3", features = ["android-native-activity"] }
+android_logger = "0.15"
+log = "0.4"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 serde_json.workspace = true

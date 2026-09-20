@@ -100,15 +100,15 @@ impl Project {
         Self::open_with_profile(root, profile)
     }
     pub fn open_with_profile(root: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
-        let root = root.as_ref().canonicalize()?;
-        let mut paths = std::fs::read_dir(&root)?
+        let root = crate::fs::canonicalize(root.as_ref())?;
+        let mut paths = crate::fs::read_dir(&root)?
             .map(|e| e.map(|e| e.path()))
             .collect::<std::io::Result<Vec<_>>>()?;
         paths.sort();
         let mut configs = Vec::new();
         for p in &paths {
             if p.extension().is_some_and(|s| s.eq_ignore_ascii_case("ini")) {
-                let data = std::fs::read(p)?;
+                let data = crate::fs::read(p)?;
                 if let Ok(c) = Config::parse(p.clone(), &data) {
                     configs.push(c);
                 }
@@ -153,7 +153,7 @@ impl Project {
             depth: usize,
         ) -> Result<()> {
             ensure!(depth < 32, "asset directory nesting exceeds limit");
-            let mut paths = std::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
+            let mut paths = crate::fs::read_dir(dir)?.collect::<std::io::Result<Vec<_>>>()?;
             paths.sort_by_key(|e| e.file_name());
             for e in paths {
                 let ty = e.file_type()?;
@@ -197,10 +197,10 @@ impl Project {
         match self.resolve(name)? {
             Source::Loose(p) => {
                 ensure!(
-                    std::fs::metadata(p)?.len() <= MAX_OUTPUT as u64,
+                    crate::fs::metadata(p)?.len() <= MAX_OUTPUT as u64,
                     "asset exceeds cap"
                 );
-                Ok(std::fs::read(p)?)
+                Ok(crate::fs::read(p)?)
             }
             Source::Archive(a, e) => self.archives[*a].read(&self.archives[*a].entries[*e]),
         }
@@ -217,7 +217,7 @@ impl Project {
     /// Original WARC index fields, in decoded-size / stored-size order.
     pub fn sizes_with_archives(&self, name: &str, paths: &[String]) -> Result<[u32; 2]> {
         if let Some(path) = self.loose_path(name, false)? {
-            let size = std::fs::metadata(path)?.len();
+            let size = crate::fs::metadata(path)?.len();
             ensure!(size <= MAX_OUTPUT as u64, "file exceeds cap");
             return Ok([0, size as u32]);
         }
@@ -251,14 +251,14 @@ impl Project {
     pub fn directory_exists(&self, name: &str) -> Result<bool> {
         Ok(self
             .loose_path(name, false)?
-            .is_some_and(|path| path.is_dir()))
+            .is_some_and(|path| crate::fs::is_dir(&path)))
     }
     /// Create one game-relative directory with Windows-style case lookup.
     pub fn create_directory(&self, name: &str) -> Result<bool> {
         let Some(path) = self.loose_path(name, true)? else {
             return Ok(false);
         };
-        match std::fs::create_dir(path) {
+        match crate::fs::create_dir(path) {
             Ok(()) => Ok(true),
             Err(error)
                 if matches!(
@@ -280,11 +280,11 @@ impl Project {
         let mut current = self.root.clone();
         let mut components = normalized.split('/').peekable();
         while let Some(component) = components.next() {
-            if !current.is_dir() {
+            if !crate::fs::is_dir(&current) {
                 return Ok(None);
             }
             let mut matched = None;
-            for entry in std::fs::read_dir(&current)? {
+            for entry in crate::fs::read_dir(&current)? {
                 let entry = entry?;
                 if entry.file_name().to_string_lossy().to_lowercase() == component {
                     ensure!(
@@ -307,7 +307,7 @@ impl Project {
         let Some(path) = self.loose_path(name, false)? else {
             return Ok(None);
         };
-        let mut file = std::fs::File::open(path)?;
+        let mut file = crate::fs::File::open(path)?;
         ensure!(
             file.metadata()?.len() <= MAX_OUTPUT as u64,
             "file exceeds cap"
@@ -321,19 +321,23 @@ impl Project {
         Ok(Some(bytes))
     }
     /// Preserve the previous slot if a write fails. Persist only original bytes.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn write_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
         use std::io::Write;
         ensure!(bytes.len() <= 16 * 1024 * 1024, "file write exceeds 16 MiB");
         let target = self
             .loose_path(name, true)?
             .context("file parent directory does not exist")?;
-        ensure!(!target.is_dir(), "file destination is a directory");
+        ensure!(
+            !crate::fs::is_dir(&target),
+            "file destination is a directory"
+        );
         let parent = target.parent().context("missing file parent")?;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let (temp, mut file) = loop {
             let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = parent.join(format!(".shiinario-{}-{id}.tmp", std::process::id()));
-            match std::fs::OpenOptions::new()
+            match crate::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
                 .open(&path)
@@ -347,13 +351,25 @@ impl Project {
             file.write_all(bytes)?;
             file.sync_all()?;
             drop(file);
-            std::fs::rename(&temp, &target)?;
+            crate::fs::rename(&temp, &target)?;
             Ok(())
         })();
         if result.is_err() {
-            let _ = std::fs::remove_file(temp);
+            let _ = crate::fs::remove_file(temp);
         }
         result.with_context(|| format!("write file {name}"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    pub fn write_file(&self, name: &str, bytes: &[u8]) -> Result<()> {
+        ensure!(bytes.len() <= 16 * 1024 * 1024, "file write exceeds 16 MiB");
+        let target = self
+            .loose_path(name, true)?
+            .context("file parent directory does not exist")?;
+        ensure!(
+            !crate::fs::is_dir(&target),
+            "file destination is a directory"
+        );
+        crate::fs::write(target, bytes).with_context(|| format!("write file {name}"))
     }
 }
 /// LRU cache counts decoded bytes and never retains a single oversized asset.
