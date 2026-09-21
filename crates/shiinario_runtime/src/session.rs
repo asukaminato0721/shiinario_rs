@@ -58,6 +58,9 @@ impl Session {
     pub fn surface(&self, id: u32) -> Option<Surface> {
         self.resources.surface(id)
     }
+    pub fn display(&self) -> Option<&Surface> {
+        self.resources.display()
+    }
     pub fn location(&self) -> shiinario_scenario::Location {
         self.vm.location()
     }
@@ -101,6 +104,14 @@ impl Session {
             host.mouse_mapping(*value);
         }
         emit(&event)?;
+        if matches!(event, Event::TextTick { .. })
+            && let Some(rect) = resources.commit_text_display()
+        {
+            // Updating the retained pixels alone does not schedule a native
+            // redraw or a browser frame. Notify the host just as the original
+            // glyph renderer's InvalidateRect call does.
+            host.respond(&PlatformRequest::InvalidateRect { rect })?;
+        }
         if event == Event::SchedulerPoll {
             if !host.available() {
                 bail!(
@@ -512,19 +523,9 @@ impl Session {
                     location.scenario, location.offset
                 )
             })?;
-            if matches!(&request, PlatformRequest::DrawGlyph { surface: 0, .. })
-                || matches!(&request, PlatformRequest::StretchSurface(stretch) if stretch.destination.id==0)
-                || matches!(&request, PlatformRequest::PixelateSurface { copy, .. } if copy.destination.id==0)
-            {
-                host.respond(&PlatformRequest::InvalidateRect {
-                    rect: [
-                        0,
-                        0,
-                        project.config.width as i32,
-                        project.config.height as i32,
-                    ],
-                })?;
-            }
+            // Bulk drawing modifies the working DIB until SCN invalidates it.
+            // Text also submits its own glyph rectangles at TextTick, matching
+            // the native text renderer without exposing the rest of the DIB.
             if let PlatformRequest::LoadSound { id, .. } = &request {
                 host.install_sound(
                     *id,
@@ -556,6 +557,9 @@ impl Session {
             } else if let PlatformRequest::CreateDirectory { path } = &request {
                 u32::from(resources.create_directory(project, path, host.simulated())?)
             } else {
+                if let PlatformRequest::InvalidateRect { rect } = &request {
+                    resources.commit_display(*rect);
+                }
                 host.respond(&request)?
             };
             // A task can remain in a timer retry without reaching another

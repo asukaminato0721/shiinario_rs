@@ -306,6 +306,7 @@ impl Movie {
                 },
             )?;
             if self.surface == 0 {
+                resources.commit_display([0, 0, i32::MAX, i32::MAX]);
                 invalidate(host)?;
             }
         }
@@ -489,6 +490,7 @@ impl Movies {
                         source_size: resources.surface_dimensions(movie.surface)?,
                         mode: 0xcc0020,
                     })?;
+                    resources.commit_display([x, y, x.saturating_add(w), y.saturating_add(h)]);
                     invalidate(host)?;
                 }
             }

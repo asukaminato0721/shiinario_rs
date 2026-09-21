@@ -237,9 +237,9 @@ impl BrowserPlayer {
         if !self.host.dirty {
             return Vec::new();
         }
-        if let Some(surface) = self.session.surface(0) {
+        if let Some(surface) = self.session.display() {
             self.host.dirty = false;
-            return surface.rgba;
+            return surface.rgba.clone();
         }
         Vec::new()
     }

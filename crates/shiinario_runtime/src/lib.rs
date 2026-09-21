@@ -76,7 +76,7 @@ pub struct TraceOptions {
     pub simulate_platform: bool,
     pub tick_ms: u32,
     pub input: Vec<replay::InputFrame>,
-    /// Receive surface zero when binary replay ends, fails or reaches its budget.
+    /// Receive the last presented frame when binary replay stops.
     pub final_frame: Option<Box<dyn FnOnce(resources::Surface) -> Result<()>>>,
 }
 
@@ -125,7 +125,8 @@ pub fn trace_with_options(
         })();
         if let Some(capture) = final_frame {
             let captured = session
-                .surface(0)
+                .display()
+                .cloned()
                 .ok_or_else(|| anyhow::anyhow!("trace has no display surface"))
                 .and_then(capture);
             if let Err(capture_error) = captured {

@@ -102,7 +102,7 @@ impl TextRenderer {
         position: [i32; 2],
         character: char,
         style: &TextStyle,
-    ) -> Result<()> {
+    ) -> Result<Option<[i32; 4]>> {
         ensure!(
             style.background_mode == 1,
             "opaque text backgrounds are unresolved"
@@ -137,7 +137,7 @@ fn draw_mask(
     style: &TextStyle,
     mask: &Mask,
     edge: [i32; 2],
-) -> Result<()> {
+) -> Result<Option<[i32; 4]>> {
     let opacity = if style.effects & 1 != 0 {
         style.shadow_opacity
     } else {
@@ -148,6 +148,7 @@ fn draw_mask(
         i64::from(position[0]) + i64::from(mask.offset[0]),
         i64::from(position[1]) + i64::from(mask.offset[1]),
     ];
+    let mut damage: Option<[i32; 4]> = None;
     let mut blend = |x: i64, y: i64, coverage: u8, color: [u8; 3]| {
         if x < 0
             || y < 0
@@ -157,6 +158,11 @@ fn draw_mask(
         {
             return;
         }
+        let rect = damage.get_or_insert([x as i32, y as i32, x as i32 + 1, y as i32 + 1]);
+        rect[0] = rect[0].min(x as i32);
+        rect[1] = rect[1].min(y as i32);
+        rect[2] = rect[2].max(x as i32 + 1);
+        rect[3] = rect[3].max(y as i32 + 1);
         let alpha = ((((u32::from(coverage) * 255) >> 6) * opacity) >> 8) as i32;
         if target.rgba {
             let offset = y as usize * target.stride + x as usize * 4;
@@ -262,12 +268,114 @@ fn draw_mask(
             );
         }
     }
-    target.pixels.write(0, &pixels)
+    target.pixels.write(0, &pixels)?;
+    Ok(damage)
+}
+
+#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
+    let weight = if font_weight >= 600 { 200 } else { 80 };
+    let pattern = format!("{name}:lang=ja:weight={weight}");
+    let output = std::process::Command::new("fc-match")
+        .args(["--format=%{file}\n%{index}\n", &pattern])
+        .output()
+        .context("Japanese font lookup requires Fontconfig (fc-match)")?;
+    ensure!(output.status.success(), "Fontconfig font lookup failed");
+    let result = std::str::from_utf8(&output.stdout).context("font path is not UTF-8")?;
+    let mut lines = result.lines();
+    let path = lines
+        .next()
+        .filter(|s| !s.is_empty())
+        .context("Fontconfig returned no font")?;
+    let index: u32 = lines
+        .next()
+        .context("Fontconfig returned no face index")?
+        .parse()?;
+    let length = std::fs::metadata(path)?.len();
+    ensure!(length <= 32 * 1024 * 1024, "font exceeds 32 MiB");
+    let font: FontArc = FontVec::try_from_vec_and_index(std::fs::read(path)?, index)
+        .context("invalid font face")?
+        .into();
+    eprintln!("Text font: {name:?} -> {path} (face {index})");
+    Ok(font)
+}
+
+#[cfg(target_os = "android")]
+fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
+    for path in [
+        "/system/fonts/NotoSansCJK-Regular.ttc",
+        "/system/fonts/NotoSansJP-Regular.otf",
+        "/system/fonts/DroidSansFallback.ttf",
+    ] {
+        if let Ok(bytes) = std::fs::read(path) {
+            return Ok(FontVec::try_from_vec_and_index(bytes, 0)
+                .context("invalid Android Japanese font")?
+                .into());
+        }
+    }
+    anyhow::bail!("no Japanese font found in /system/fonts")
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! { static BROWSER_FONT: std::cell::RefCell<Option<FontArc>> = const { std::cell::RefCell::new(None) }; }
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn set_browser_font(bytes: Vec<u8>) -> Result<()> {
+    ensure!(bytes.len() <= 32 * 1024 * 1024, "font exceeds 32 MiB");
+    let font = FontVec::try_from_vec_and_index(bytes, 0)
+        .context("invalid browser font")?
+        .into();
+    BROWSER_FONT.with(|value| *value.borrow_mut() = Some(font));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
+    BROWSER_FONT
+        .with(|value| value.borrow().clone())
+        .context("select a Japanese TTF/OTF/TTC font before starting")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn glyph_damage_includes_effects_clips_and_ignores_empty_masks() {
+        let pixels = SharedMemory::zeroed(8 * 8 * 3).unwrap();
+        let mask = Mask {
+            offset: [1, -1],
+            size: [1, 1],
+            coverage: vec![64],
+        };
+        let style = TextStyle {
+            effects: 1 | 0x400,
+            shadow_offset: [4, 3],
+            ..Default::default()
+        };
+        let target = || Canvas {
+            pixels: &pixels,
+            size: [8, 8],
+            stride: 24,
+            rgba: false,
+        };
+        // Foreground at (3, 1), a 2-pixel outline, shadow at (7, 4).
+        assert_eq!(
+            draw_mask(target(), [2, 2], &style, &mask, [2, 2]).unwrap(),
+            Some([1, 0, 8, 5])
+        );
+        assert_eq!(
+            draw_mask(target(), [i32::MAX, 2], &style, &mask, [2, 2]).unwrap(),
+            None
+        );
+        let empty = Mask {
+            coverage: vec![0],
+            ..mask
+        };
+        assert_eq!(
+            draw_mask(target(), [2, 2], &style, &empty, [2, 2]).unwrap(),
+            None
+        );
+    }
     #[test]
     fn image_glyph_preserves_native_color_rounding_and_transparency() {
         let pixels = SharedMemory::zeroed(8).unwrap();
@@ -336,68 +444,4 @@ mod tests {
             assert_eq!(pixels.read(0, 4).unwrap(), expected);
         }
     }
-}
-
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
-fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
-    let weight = if font_weight >= 600 { 200 } else { 80 };
-    let pattern = format!("{name}:lang=ja:weight={weight}");
-    let output = std::process::Command::new("fc-match")
-        .args(["--format=%{file}\n%{index}\n", &pattern])
-        .output()
-        .context("Japanese font lookup requires Fontconfig (fc-match)")?;
-    ensure!(output.status.success(), "Fontconfig font lookup failed");
-    let result = std::str::from_utf8(&output.stdout).context("font path is not UTF-8")?;
-    let mut lines = result.lines();
-    let path = lines
-        .next()
-        .filter(|s| !s.is_empty())
-        .context("Fontconfig returned no font")?;
-    let index: u32 = lines
-        .next()
-        .context("Fontconfig returned no face index")?
-        .parse()?;
-    let length = std::fs::metadata(path)?.len();
-    ensure!(length <= 32 * 1024 * 1024, "font exceeds 32 MiB");
-    let font: FontArc = FontVec::try_from_vec_and_index(std::fs::read(path)?, index)
-        .context("invalid font face")?
-        .into();
-    eprintln!("Text font: {name:?} -> {path} (face {index})");
-    Ok(font)
-}
-
-#[cfg(target_os = "android")]
-fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
-    for path in [
-        "/system/fonts/NotoSansCJK-Regular.ttc",
-        "/system/fonts/NotoSansJP-Regular.otf",
-        "/system/fonts/DroidSansFallback.ttf",
-    ] {
-        if let Ok(bytes) = std::fs::read(path) {
-            return Ok(FontVec::try_from_vec_and_index(bytes, 0)
-                .context("invalid Android Japanese font")?
-                .into());
-        }
-    }
-    anyhow::bail!("no Japanese font found in /system/fonts")
-}
-
-#[cfg(target_arch = "wasm32")]
-thread_local! { static BROWSER_FONT: std::cell::RefCell<Option<FontArc>> = const { std::cell::RefCell::new(None) }; }
-
-#[cfg(target_arch = "wasm32")]
-pub(crate) fn set_browser_font(bytes: Vec<u8>) -> Result<()> {
-    ensure!(bytes.len() <= 32 * 1024 * 1024, "font exceeds 32 MiB");
-    let font = FontVec::try_from_vec_and_index(bytes, 0)
-        .context("invalid browser font")?
-        .into();
-    BROWSER_FONT.with(|value| *value.borrow_mut() = Some(font));
-    Ok(())
-}
-
-#[cfg(target_arch = "wasm32")]
-fn load_font(_name: &str, _weight: u32) -> Result<FontArc> {
-    BROWSER_FONT
-        .with(|value| value.borrow().clone())
-        .context("select a Japanese TTF/OTF/TTC font before starting")
 }

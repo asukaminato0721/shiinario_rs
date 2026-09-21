@@ -470,8 +470,8 @@ impl ApplicationHandler for App<'_> {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(canvas) = self.session.surface(0) {
-                    match presentation.draw(&canvas) {
+                if let Some(canvas) = self.session.display() {
+                    match presentation.draw(canvas) {
                         Ok(shown) => {
                             host.dirty = !shown;
                             self.presented += usize::from(shown);

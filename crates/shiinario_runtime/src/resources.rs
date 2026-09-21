@@ -104,6 +104,8 @@ struct OpenFile {
 pub struct Resources {
     text_renderer: crate::text_render::TextRenderer,
     surfaces: BTreeMap<u32, DrawingSurface>,
+    display: Option<Surface>,
+    text_damage: Vec<[i32; 4]>,
     images: BTreeMap<u32, Image>,
     sounds: BTreeMap<u32, Arc<Sound>>,
     streams: BTreeMap<u32, Arc<AudioStream>>,
@@ -174,6 +176,12 @@ impl Resources {
         for id in 0..count as u32 {
             resources.create_surface(id, project.config.width, project.config.height, 0)?;
         }
+        resources.commit_display([
+            0,
+            0,
+            project.config.width as i32,
+            project.config.height as i32,
+        ]);
         Ok(resources)
     }
     pub fn asset_sizes(&self, project: &Project, name: &str) -> Result<[u32; 2]> {
@@ -381,7 +389,76 @@ impl Resources {
             self.archives.push(name.to_owned());
         }
     }
-    /// Snapshot the top-down BGR24 DIB for an RGBA presentation host.
+    /// Original 432f00 invalidates each glyph's bounds (434060 -> 417560).
+    /// Paint after that text scheduler invocation returns: a delayed character
+    /// is visible before the next wait, while instant text finishes as a batch.
+    /// Keep separate rectangles so wrapping cannot expose unfinished pixels
+    /// between lines. The host font's raster bounds include shadow and edges.
+    /// Return the union for the host's paint notification. Only the individual
+    /// glyph rectangles are copied from the working DIB into the display.
+    pub(crate) fn commit_text_display(&mut self) -> Option<[i32; 4]> {
+        let mut damage = std::mem::take(&mut self.text_damage);
+        let mut invalidated: Option<[i32; 4]> = None;
+        for rect in damage.drain(..) {
+            self.commit_display(rect);
+            let union = invalidated.get_or_insert(rect);
+            union[0] = union[0].min(rect[0]);
+            union[1] = union[1].min(rect[1]);
+            union[2] = union[2].max(rect[2]);
+            union[3] = union[3].max(rect[3]);
+        }
+        self.text_damage = damage;
+        invalidated
+    }
+    /// Copy a submitted Windows RECT into the retained display. Pixels outside
+    /// the RECT can already contain an unfinished background/text composition.
+    pub(crate) fn commit_display(&mut self, rect: [i32; 4]) {
+        let Some(surface) = self.surfaces.get(&0) else {
+            return;
+        };
+        let [left, top, right, bottom] = rect;
+        let left = left.clamp(0, surface.width as i32) as usize;
+        let right = right.clamp(0, surface.width as i32) as usize;
+        let top = top.clamp(0, surface.height as i32) as usize;
+        let bottom = bottom.clamp(0, surface.height as i32) as usize;
+        if left >= right || top >= bottom {
+            return;
+        }
+        if self.display.as_ref().is_none_or(|display| {
+            display.width != surface.width || display.height != surface.height
+        }) {
+            let mut rgba = vec![0; surface.width as usize * surface.height as usize * 4];
+            for pixel in rgba.as_chunks_mut::<4>().0 {
+                pixel[3] = 255;
+            }
+            self.display = Some(Surface {
+                width: surface.width,
+                height: surface.height,
+                rgba,
+            });
+        }
+        let display = self.display.as_mut().unwrap();
+        let stride = surface.width as usize * 4;
+        let bytes = surface
+            .pixels
+            .read(top * surface.stride, (bottom - top) * surface.stride)
+            .expect("clipped display rows are inside the drawing surface");
+        for (y, row) in (top..bottom).zip(bytes.chunks_exact(surface.stride)) {
+            let target = &mut display.rgba[y * stride + left * 4..y * stride + right * 4];
+            for (rgba, bgr) in target
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(row[left * 3..right * 3].as_chunks::<3>().0)
+            {
+                rgba.copy_from_slice(&[bgr[2], bgr[1], bgr[0], 255]);
+            }
+        }
+    }
+    pub fn display(&self) -> Option<&Surface> {
+        self.display.as_ref()
+    }
+    /// Snapshot a working top-down BGR24 DIB, including unfinished drawing.
     pub fn surface(&self, id: u32) -> Option<Surface> {
         let surface = self.surfaces.get(&id)?;
         let bytes = surface.pixels.read(0, surface.pixels.len()).ok()?;
@@ -1215,7 +1292,7 @@ impl Resources {
                     .surfaces
                     .get(surface)
                     .context("text surface is not allocated")?;
-                self.text_renderer.draw(
+                let damage = self.text_renderer.draw(
                     crate::text_render::Canvas {
                         rgba: false,
                         pixels: &target.pixels,
@@ -1226,6 +1303,11 @@ impl Resources {
                     *character,
                     style,
                 )?;
+                if *surface == 0
+                    && let Some(rect) = damage
+                {
+                    self.text_damage.push(rect);
+                }
             }
             PlatformRequest::HitTestImages { x, y, items } => {
                 return Ok(Some(self.hit_test_images(*x, *y, items)?));
@@ -1354,6 +1436,33 @@ mod tests {
         assert_eq!(resources.resident_bytes(), 4);
         assert_eq!(resources.frame(1, 0).unwrap().surface.rgba, [0, 0, 0, 255]);
         assert!(resources.frame(1, 1).is_err());
+    }
+    #[test]
+    fn display_retains_text_outside_invalidated_rect_and_unfinished_drawing() {
+        let mut resources = Resources::default();
+        resources.create_surface(0, 3, 2, 0).unwrap();
+        resources.fill_surface(0, [0, 0, 3, 2], [255; 3]).unwrap();
+        resources.commit_display([0, 0, 3, 2]);
+        let completed = resources.display().unwrap().clone();
+
+        // A new composition clears the working DIB before redrawing text.
+        // Window expose/resize must keep the previously submitted pixels.
+        resources.fill_surface(0, [0, 0, 3, 2], [0; 3]).unwrap();
+        assert_eq!(resources.display(), Some(&completed));
+        // Updating an animated cursor must not erase text outside its RECT.
+        resources
+            .fill_surface(0, [1, 1, 1, 1], [12, 34, 56])
+            .unwrap();
+        resources.commit_display([1, 1, 2, 2]);
+        let mut expected = completed;
+        expected.rgba[16..20].copy_from_slice(&[12, 34, 56, 255]);
+        assert_eq!(resources.display(), Some(&expected));
+        for rect in [[2, 1, 1, 2], [0, 0, 0, 2], [-3, -2, -1, -1]] {
+            resources.commit_display(rect);
+            assert_eq!(resources.display(), Some(&expected));
+        }
+        resources.commit_display([-10, -10, i32::MAX, i32::MAX]);
+        assert_eq!(resources.display(), resources.surface(0).as_ref());
     }
     #[test]
     fn surface_replacement_preserves_budget_and_failed_replacement_keeps_pixels() {
