@@ -17,7 +17,7 @@ use std::{
 const MAX_DATABASE: usize = 16 * 1024 * 1024;
 const BUNDLED_DATABASE: &[u8] = include_bytes!("../data/garbro/Formats.dat");
 
-/// Validated WARC v2.36/v2.47 decryption data recovered from an executable or catalog.
+/// Validated WARC v2.36/v2.47/v2.49 decryption data recovered from an executable or catalog.
 /// Loading does not execute .NET code. Other scheme versions are unsupported.
 #[derive(Debug)]
 pub struct Profile {
@@ -28,6 +28,7 @@ pub struct Profile {
     pub(crate) region: Vec<u8>,
     pub(crate) decode: Vec<u8>,
     pub(crate) helper_key: [u32; 5],
+    pub(crate) prefix_xor_key: Option<[u8; 64]>,
 }
 
 /// Embedded GARbro schemes and filename-to-game mappings.
@@ -259,7 +260,7 @@ impl Profile {
         doc.class(scheme, "GameRes.Formats.ShiinaRio.EncryptionScheme")?;
         let version = doc.number(doc.field(scheme, "<Version>k__BackingField")?)?;
         let version = EngineVersion::from_scheme(version).with_context(|| {
-            format!("unsupported scheme version {version} (only v2.36/v2.47 are implemented)")
+            format!("unsupported scheme version {version} (only v2.36/v2.47/v2.49 are implemented)")
         })?;
         let entry_name_size = doc.number(doc.field(scheme, "EntryNameSize")?)?;
         ensure!(
@@ -317,6 +318,7 @@ impl Profile {
             region: region.to_vec(),
             decode: decode.to_vec(),
             helper_key,
+            prefix_xor_key: None,
         })
     }
 

@@ -96,7 +96,7 @@ impl Voice {
         let a = self.frame_at(self.frame)?;
         let b = self.frame_at(self.frame + 1).unwrap_or(a);
         let fraction = self.fraction as f32 / rate as f32;
-        let volume = (self.stream.volume.percent() as i32).clamp(0, 100) as u32;
+        let volume = self.stream.volume.output_percent();
         if volume != self.volume {
             self.volume = volume;
             // DirectSound attenuation is in hundredths of a decibel.

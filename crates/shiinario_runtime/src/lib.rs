@@ -272,6 +272,8 @@ impl Host for TracePlatform {
                 Ok(1)
             }
             PlatformRequest::DisableIme => Ok(0),
+            // SM_SWAPBUTTON: replay uses primary/secondary button identities.
+            PlatformRequest::SystemMetric { index: 23 } => Ok(0),
             PlatformRequest::DeviceCaps {
                 device: 0,
                 index: 12,
@@ -302,6 +304,22 @@ pub fn open(path: impl AsRef<Path>) -> Result<Project> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn system_mouse_metric_does_not_reapply_the_script_button_mapping() {
+        let mut host = TracePlatform::default();
+        for mapping in [0, 1] {
+            host.mouse_mapping(mapping);
+            assert_eq!(
+                host.respond(&PlatformRequest::SystemMetric { index: 23 })
+                    .unwrap(),
+                0
+            );
+        }
+        assert!(
+            host.respond(&PlatformRequest::SystemMetric { index: -1 })
+                .is_err()
+        );
+    }
     #[test]
     fn timer_wait_checks_advance_one_millisecond_without_polling() {
         let mut clock = TracePlatform {

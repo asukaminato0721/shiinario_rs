@@ -130,6 +130,9 @@ impl Session {
         if let Event::ArchiveSearchPath { name, .. } = &event {
             resources.register_archive(name);
         }
+        if let Event::ArchiveSearchPathRemoved { name, .. } = &event {
+            resources.unregister_archive(name);
+        }
         if matches!(event, Event::End) {
             self.movies.stop_all(host)?;
             return Ok(false);

@@ -21,6 +21,22 @@ fn stream(percent: u32) -> Arc<AudioStream> {
 }
 
 #[test]
+fn out_of_range_volume_remains_observable_without_changing_output() {
+    let stream = stream(50);
+    let mut mixer = Mixer::default();
+    mixer.play(1, stream.clone(), 2).unwrap();
+    let mut before = [0.; 4];
+    mixer.render(&mut before, 48000, 1).unwrap();
+    stream.volume.set_percent(200).unwrap();
+    assert_eq!(stream.volume.percent(), 200);
+    let mut after = [0.; 4];
+    mixer.render(&mut after, 48000, 1).unwrap();
+    assert_eq!(before, after);
+    stream.volume.set_percent(100).unwrap();
+    mixer.render(&mut after, 48000, 1).unwrap();
+    assert_eq!(after, [0.5; 4]);
+}
+#[test]
 fn original_workers_match_rendered_and_simulated_timing() {
     // Original 2.36 and 2.47 start/worker routines executed with Unicorn.
     // Sleep, thread creation and DirectSound calls were stubbed; volume,

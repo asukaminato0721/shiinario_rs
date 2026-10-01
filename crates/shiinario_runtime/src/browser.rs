@@ -121,6 +121,8 @@ impl Host for BrowserHost {
             PlatformRequest::InitializeGraphics | PlatformRequest::ReleaseGraphics => Ok(1),
             // Select the verified scalar renderer; SIMD CPU flags describe the original x86 host.
             PlatformRequest::CpuFeatures => Ok(0),
+            // SM_SWAPBUTTON: browser input already uses primary/secondary buttons.
+            PlatformRequest::SystemMetric { index: 23 } => Ok(0),
             PlatformRequest::DeviceCaps {
                 device: 0,
                 index: 12,

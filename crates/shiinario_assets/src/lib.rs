@@ -123,6 +123,7 @@ impl Archive {
         if entry.flags & 0x80000000 != 0 {
             crypt::decrypt(&self.profile, &mut data[8..]);
         }
+        crypt::decrypt_extra(&self.profile, &mut data[8..]);
         if entry.flags & 0x20000000 != 0 {
             crypt::decrypt2(&self.profile, &mut data[8..])?;
         }

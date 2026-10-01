@@ -234,7 +234,7 @@ fn helper4(profile: &Profile, data: &mut [u8]) {
     let crc = region_crc(&profile.region, flags, buf[1] >> 8);
     key[6] = match profile.version {
         EngineVersion::V2_36 => crc,
-        EngineVersion::V2_47 => crc.wrapping_add(key[9]),
+        EngineVersion::V2_47 | EngineVersion::V2_49 => crc.wrapping_add(key[9]),
     };
     for (chunk, k) in data[..40].as_chunks_mut::<4>().0.iter_mut().zip(key) {
         for (d, b) in chunk.iter_mut().zip(k.to_le_bytes()) {
@@ -317,9 +317,65 @@ pub fn decrypt2(profile: &Profile, data: &mut [u8]) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+pub fn decrypt_extra(profile: &Profile, data: &mut [u8]) {
+    if let Some(key) = &profile.prefix_xor_key
+        && data.len() >= 512
+    {
+        let len = data.len();
+        for (i, byte) in data[..(len & 126) | 1].iter_mut().enumerate() {
+            *byte ^= key[i & 63];
+        }
+        for (byte, key) in data[256..260].iter_mut().zip((len as u32).to_le_bytes()) {
+            *byte ^= key;
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn extra_crypt_respects_minimum_length_and_prefix_boundaries() {
+        let mut profile = Profile {
+            prefix_xor_key: Some(std::array::from_fn(|i| i as u8 + 1)),
+            version: EngineVersion::V2_49,
+            entry_name_size: 32,
+            key: vec![],
+            image: vec![],
+            region: vec![],
+            decode: vec![],
+            helper_key: [0; 5],
+        };
+        for (length, prefix) in [
+            (511, 0),
+            (512, 1),
+            (513, 1),
+            (574, 63),
+            (575, 63),
+            (638, 127),
+            (639, 127),
+            (640, 1),
+        ] {
+            let mut data = vec![0; length];
+            decrypt_extra(&profile, &mut data);
+            for (i, &byte) in data.iter().enumerate() {
+                let expected = if i < prefix {
+                    (i % 64) as u8 + 1
+                } else if length >= 512 && (256..260).contains(&i) {
+                    (length as u32).to_le_bytes()[i - 256]
+                } else {
+                    0
+                };
+                assert_eq!(byte, expected, "length={length}, offset={i}");
+            }
+            decrypt_extra(&profile, &mut data);
+            assert_eq!(data, vec![0; length]);
+        }
+        profile.prefix_xor_key = None;
+        let mut data = vec![7; 1024];
+        decrypt_extra(&profile, &mut data);
+        assert_eq!(data, vec![7; 1024]);
+    }
     #[test]
     fn windows_epoch() {
         assert_eq!(filetime(0), [1601 | 1 << 16, 0, 0]);
@@ -329,6 +385,7 @@ mod tests {
     #[test]
     fn missing_second_stage_table_is_an_error() {
         let profile = Profile {
+            prefix_xor_key: None,
             version: EngineVersion::V2_36,
             entry_name_size: 16,
             key: vec![],

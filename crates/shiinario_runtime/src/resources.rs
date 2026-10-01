@@ -43,27 +43,40 @@ pub struct AudioStream {
     pub volume: StreamVolume,
 }
 /// Shared with the audio callback so volume changes preserve playback position.
-pub struct StreamVolume(AtomicU32);
+pub struct StreamVolume {
+    percent: AtomicU32,
+    output_percent: AtomicU32,
+}
 impl Default for StreamVolume {
     fn default() -> Self {
-        Self(AtomicU32::new(100))
+        Self {
+            percent: AtomicU32::new(100),
+            output_percent: AtomicU32::new(100),
+        }
     }
 }
 impl StreamVolume {
     // The original fade worker retains the signed overshoot when it stops
     // playback. Keep that value observable through opcode 06e3.
     pub(crate) fn set_fade_percent(&self, percent: u32) {
-        self.0.store(percent, Ordering::Relaxed);
+        self.percent.store(percent, Ordering::Relaxed);
+        self.output_percent
+            .store((percent as i32).clamp(0, 100) as u32, Ordering::Relaxed);
     }
     pub fn percent(&self) -> u32 {
-        self.0.load(Ordering::Relaxed)
+        self.percent.load(Ordering::Relaxed)
+    }
+    pub(crate) fn output_percent(&self) -> u32 {
+        self.output_percent.load(Ordering::Relaxed)
     }
     pub fn set_percent(&self, percent: u32) -> Result<()> {
-        ensure!(
-            percent <= 100,
-            "audio volume percentage out of bounds: {percent}"
-        );
-        self.0.store(percent, Ordering::Relaxed);
+        // The native setter stores the requested value before calling
+        // DirectSound. Some games pass 200: keep it observable, but retain
+        // the previous output level when it is outside the volume table.
+        self.percent.store(percent, Ordering::Relaxed);
+        if percent <= 100 {
+            self.output_percent.store(percent, Ordering::Relaxed);
+        }
         Ok(())
     }
     /// Original 101-entry table, verified by executing every valid index.
@@ -173,6 +186,7 @@ impl Resources {
         let count = if count == -1 { 2 } else { count.max(1) };
         ensure!(count <= 256, "initial surface count exceeds 256");
         let mut resources = Self::default();
+        resources.register_archive(&project.config.archive);
         for id in 0..count as u32 {
             resources.create_surface(id, project.config.width, project.config.height, 0)?;
         }
@@ -387,6 +401,15 @@ impl Resources {
             .any(|item| item.eq_ignore_ascii_case(name))
         {
             self.archives.push(name.to_owned());
+        }
+    }
+    pub fn unregister_archive(&mut self, name: &str) {
+        if let Some(index) = self
+            .archives
+            .iter()
+            .position(|item| item.eq_ignore_ascii_case(name))
+        {
+            self.archives.remove(index);
         }
     }
     /// Original 432f00 invalidates each glyph's bounds (434060 -> 417560).
@@ -670,11 +693,14 @@ impl Resources {
         }
         Ok(u32::MAX)
     }
-    fn draw_images(&mut self, id: u32, items: &[ImageDraw]) -> Result<()> {
+    fn draw_images(&mut self, id: u32, items: &[ImageDraw], clip: Option<[i32; 4]>) -> Result<()> {
         let destination = self
             .surfaces
             .get(&id)
             .context("drawing surface is not allocated")?;
+        let [clip_left, clip_top, clip_right, clip_bottom] = clip
+            .unwrap_or([0, 0, destination.width as i32, destination.height as i32])
+            .map(i64::from);
         let mut ordered: Vec<_> = items
             .iter()
             .filter(|item| item.flags & 0x8000_0000 != 0 && item.layer != u32::MAX)
@@ -714,8 +740,8 @@ impl Resources {
             let top = i64::from(item.y) + i64::from(frame.y);
             let right = (left + i64::from(frame.surface.width)).min(i64::from(destination.width));
             let bottom = (top + i64::from(frame.surface.height)).min(i64::from(destination.height));
-            for y in top.max(0)..bottom {
-                for x in left.max(0)..right {
+            for y in top.max(0).max(clip_top)..bottom.min(clip_bottom) {
+                for x in left.max(0).max(clip_left)..right.min(clip_right) {
                     let src = ((y - top) as usize * frame.surface.width as usize
                         + (x - left) as usize)
                         * 4;
@@ -960,6 +986,47 @@ impl Resources {
             surface
                 .pixels
                 .write(row * surface.stride + left * 3, &row_bytes)?;
+        }
+        Ok(())
+    }
+    fn draw_image_into_image(
+        &mut self,
+        destination: [u32; 2],
+        position: [i32; 2],
+        source: [u32; 2],
+    ) -> Result<()> {
+        // Decode before borrowing the destination, including self-copies.
+        let frame = self.frame(source[0], source[1] as usize)?;
+        let Some(Image::Mutable { frames, .. }) = self.images.get_mut(&destination[0]) else {
+            anyhow::bail!("image drawing destination must be mutable");
+        };
+        let dst = frames
+            .get_mut(destination[1] as usize)
+            .context("missing destination frame")?;
+        let left = i64::from(position[0]) + i64::from(frame.x);
+        let top = i64::from(position[1]) + i64::from(frame.y);
+        for y in top.max(0)..(top + i64::from(frame.surface.height)).min(i64::from(dst.height)) {
+            for x in left.max(0)..(left + i64::from(frame.surface.width)).min(i64::from(dst.width))
+            {
+                let src =
+                    ((y - top) as usize * frame.surface.width as usize + (x - left) as usize) * 4;
+                let method = frame.methods[src / 4];
+                if !matches!(method, 2..=5) {
+                    continue;
+                }
+                let write = (y as usize * dst.width as usize + x as usize) * 4;
+                let alpha = i32::from(frame.surface.rgba[src + 3]);
+                for channel in 0..3 {
+                    let source = frame.surface.rgba[src + channel];
+                    let old = dst.rgba[write + channel];
+                    dst.rgba[write + channel] = if alpha == 255 && method != 5 {
+                        source
+                    } else {
+                        (i32::from(old) + (((i32::from(source) - i32::from(old)) * alpha) >> 8))
+                            as u8
+                    };
+                }
+            }
         }
         Ok(())
     }
@@ -1312,7 +1379,9 @@ impl Resources {
             PlatformRequest::HitTestImages { x, y, items } => {
                 return Ok(Some(self.hit_test_images(*x, *y, items)?));
             }
-            PlatformRequest::DrawImages { id, items } => self.draw_images(*id, items)?,
+            PlatformRequest::DrawImages { id, items, clip } => {
+                self.draw_images(*id, items, *clip)?
+            }
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
             PlatformRequest::PixelateSurface { copy, block_size } => {
@@ -1320,6 +1389,11 @@ impl Resources {
             }
             PlatformRequest::AffineImage(transform) => self.affine_image(transform)?,
             PlatformRequest::StretchSurface(stretch) => self.stretch_surface(stretch)?,
+            PlatformRequest::DrawImageIntoImage {
+                destination,
+                position,
+                source,
+            } => self.draw_image_into_image(*destination, *position, *source)?,
             PlatformRequest::CaptureSurface(capture) => self.capture_surface(capture)?,
             PlatformRequest::MaskTransition(transition) => self.mask_transition(transition)?,
             PlatformRequest::FillSurface { id, rect, color } => {
@@ -1366,6 +1440,81 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn draw_list_clip_uses_exclusive_right_bottom_and_preserves_other_pixels() {
+        let mut resources = Resources::default();
+        resources.create_surface(0, 4, 2, 0).unwrap();
+        resources.create_image(1, 4, 2, 3, 1).unwrap();
+        resources.fill_image(1, 0, [0, 0, 4, 2], 0x112233).unwrap();
+        let items = [ImageDraw {
+            image: 1,
+            frame: 0,
+            flags: 0x80000000,
+            layer: 0,
+            x: 0,
+            y: 0,
+            extra: [0; 2],
+        }];
+        resources
+            .draw_images(0, &items, Some([1, 0, 3, 1]))
+            .unwrap();
+        let pixels = resources.surfaces[&0].pixels.read(0, 24).unwrap();
+        assert_eq!(&pixels[..3], &[0; 3]);
+        assert_ne!(&pixels[3..6], &[0; 3]);
+        assert_eq!(&pixels[3..6], &pixels[6..9]);
+        assert_eq!(&pixels[9..], &[0; 15]);
+        resources
+            .draw_images(0, &items, Some([3, 1, 1, 0]))
+            .unwrap();
+        assert_eq!(resources.surfaces[&0].pixels.read(0, 24).unwrap(), pixels);
+        resources.draw_images(0, &items, None).unwrap();
+        assert!(
+            resources.surfaces[&0]
+                .pixels
+                .read(0, 24)
+                .unwrap()
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .all(|p| p == &pixels[3..6])
+        );
+    }
+    #[test]
+    fn image_composition_clips_blends_and_preserves_destination_alpha() {
+        let mut resources = Resources::default();
+        resources.create_image(1, 3, 1, 4, 1).unwrap();
+        resources.create_image(2, 2, 1, 4, 1).unwrap();
+        resources
+            .fill_image(1, 0, [0, 0, 3, 1], 0x20202040)
+            .unwrap();
+        resources
+            .fill_image(2, 0, [0, 0, 2, 1], 0x80604080)
+            .unwrap();
+        resources
+            .draw_image_into_image([1, 0], [-1, 0], [2, 0])
+            .unwrap();
+        assert_eq!(
+            resources.frame(1, 0).unwrap().surface.rgba,
+            [80, 64, 48, 64, 32, 32, 32, 64, 32, 32, 32, 64]
+        );
+        let before = resources.frame(1, 0).unwrap().surface;
+        assert!(
+            resources
+                .draw_image_into_image([1, 0], [0, 0], [2, 1])
+                .is_err()
+        );
+        assert_eq!(resources.frame(1, 0).unwrap().surface, before);
+        resources
+            .fill_image(1, 0, [0, 0, 1, 1], 0xaabbccff)
+            .unwrap();
+        resources
+            .draw_image_into_image([1, 0], [1, 0], [1, 0])
+            .unwrap();
+        assert_eq!(
+            &resources.frame(1, 0).unwrap().surface.rgba[4..8],
+            &[0xaa, 0xbb, 0xcc, 64]
+        );
+    }
     #[test]
     fn capture_clips_both_rectangles_and_converts_padded_bgr_to_rgba() {
         use shiinario_scenario::SurfacePoint;

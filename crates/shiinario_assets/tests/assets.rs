@@ -37,6 +37,7 @@ fn configuration_versions_and_wana_catalog_mapping() {
     for (version, expected) in [
         ("2.36", EngineVersion::V2_36),
         ("2.47", EngineVersion::V2_47),
+        ("2.49", EngineVersion::V2_49),
     ] {
         let text = format!(
             "[椎名里緒 v{version}]\r\nWindowWidth=800\r\nWindowHeight=600\r\nArc=fixture.war\r\nScn=start.scn\r\n"
@@ -90,7 +91,21 @@ fn project_lookup_and_cache_budget() {
     std::fs::write(t.0.join("a"), b"12").unwrap();
     std::fs::write(t.0.join("b"), b"345").unwrap();
     std::fs::write(t.0.join("c"), b"6789").unwrap();
+    std::fs::create_dir(t.0.join("Release00")).unwrap();
+    std::fs::write(t.0.join("Release00/Scene.WAR"), FIXTURE).unwrap();
     let project = Project::open(&t.0).unwrap();
+    assert_eq!(project.archives.len(), 2);
+    assert_eq!(
+        project
+            .read_with_archives("fixture.txt", &["release00\\scene.war".into()])
+            .unwrap(),
+        b"synthetic asset fixture\n"
+    );
+    assert!(
+        project
+            .read_with_archives("fixture.txt", &["scene.war".into()])
+            .is_err()
+    );
     assert_eq!(
         project.read("D\\FIXTURE.txt").unwrap(),
         b"synthetic asset fixture\n"

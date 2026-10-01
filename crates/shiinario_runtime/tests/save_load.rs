@@ -34,6 +34,81 @@ impl Drop for Game {
 }
 
 #[test]
+fn startup_archive_is_registered_when_resources_are_created() {
+    let game = Game::new();
+    let project = game.project();
+    let resources = Resources::for_project(&project).unwrap();
+    assert_eq!(
+        resources.read_asset(&project, "fixture.txt").unwrap(),
+        b"synthetic asset fixture\n"
+    );
+}
+
+#[test]
+fn removed_archives_stop_resolving_assets_and_can_be_registered_again() {
+    let game = Game::new();
+    let project = game.project();
+    let mut resources = Resources::for_project(&project).unwrap();
+    resources.unregister_archive("MISSING.WAR");
+    assert!(resources.read_asset(&project, "fixture.txt").is_ok());
+    resources.unregister_archive("FIXTURE.WAR");
+    assert!(resources.read_asset(&project, "fixture.txt").is_err());
+    assert!(resources.asset_sizes(&project, "fixture.txt").is_err());
+    resources.register_archive("fixture.war");
+    assert_eq!(
+        resources.read_asset(&project, "fixture.txt").unwrap(),
+        b"synthetic asset fixture\n"
+    );
+    resources.unregister_archive("fixture.war");
+    project
+        .write_file("fixture.txt", b"loose override")
+        .unwrap();
+    assert_eq!(
+        resources.read_asset(&project, "fixture.txt").unwrap(),
+        b"loose override"
+    );
+}
+
+#[test]
+fn scenario_archive_removal_reaches_the_shared_runtime() {
+    use shiinario_scenario::Event;
+    let game = Game::new();
+    for restore in [false, true] {
+        let mut code = b"\xdf\0\x10FIXTURE.WAR\0".to_vec();
+        if restore {
+            code.extend(b"\xdd\0\x10fixture.war\0");
+        }
+        // AssetSizes fixture.txt -> two variables, then end of script.
+        code.extend(b"\x58\x01\x10fixture.txt\0\x0c\0\0\x0c\x01\0\0\0\x04\x01\0\0\0");
+        std::fs::write(game.0.join("switch.scn"), code).unwrap();
+        let project = game.project();
+        let mut removed = false;
+        let mut sizes = false;
+        let result = shiinario_runtime::trace_with_platform(
+            &project,
+            "switch.scn",
+            30,
+            true,
+            |event| {
+                removed |= matches!(event, Event::ArchiveSearchPathRemoved { name, .. } if name == "fixture.war");
+                sizes |= matches!(event, Event::AssetSizesReply { .. });
+                Ok(())
+            },
+        );
+        assert!(removed);
+        assert_eq!(sizes, restore);
+        if restore {
+            result.unwrap();
+        } else {
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("asset not found in registered archives")
+            );
+        }
+    }
+}
+
+#[test]
 fn asset_reads_reload_saves_and_respect_file_precedence() {
     let game = Game::new();
     let project = game.project();

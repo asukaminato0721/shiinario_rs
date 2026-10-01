@@ -173,6 +173,10 @@ pub enum Event {
         location: Location,
         name: String,
     },
+    ArchiveSearchPathRemoved {
+        location: Location,
+        name: String,
+    },
     BinaryInstruction {
         location: Location,
         opcode: u16,

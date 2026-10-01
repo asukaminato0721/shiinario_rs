@@ -114,7 +114,7 @@ impl Project {
         }
         let config = configs
             .first()
-            .context("no supported Shiina Rio v2.36/v2.47 configuration found")?
+            .context("no supported Shiina Rio v2.36/v2.47/v2.49 configuration found")?
             .clone();
         ensure!(
             configs.iter().all(|c| c.version == config.version
@@ -172,6 +172,18 @@ impl Project {
             Ok(())
         }
         loose(&root, &root, &mut files, 0)?;
+        // Subdirectory archives participate only when a script registers their
+        // relative path. Do not flatten their entries into the startup index.
+        for source in files.values() {
+            if let Source::Loose(path) = source
+                && path.parent() != Some(root.as_path())
+                && path
+                    .extension()
+                    .is_some_and(|s| s.eq_ignore_ascii_case("war"))
+            {
+                archives.push(Archive::open_with_profile(path, profile.clone())?);
+            }
+        }
         let project = Self {
             root,
             config,

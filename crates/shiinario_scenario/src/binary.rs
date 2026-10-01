@@ -192,6 +192,8 @@ pub enum PlatformRequest {
     DrawImages {
         id: u32,
         items: Vec<ImageDraw>,
+        /// Optional left/top/right/bottom clipping rectangle.
+        clip: Option<[i32; 4]>,
     },
     /// Logical left/top/right/bottom; request repaint without clearing.
     InvalidateRect {
@@ -205,6 +207,11 @@ pub enum PlatformRequest {
     },
     AffineImage(ImageAffine),
     StretchSurface(SurfaceStretch),
+    DrawImageIntoImage {
+        destination: [u32; 2],
+        position: [i32; 2],
+        source: [u32; 2],
+    },
     CaptureSurface(SurfaceCapture),
     MaskTransition(MaskTransition),
     SurfacePixels {
@@ -365,6 +372,9 @@ pub enum PlatformRequest {
         name: String,
     },
     MouseButtons,
+    SystemMetric {
+        index: i32,
+    },
     ReadRegistryValue {
         root: u32,
         path: String,
@@ -1960,17 +1970,26 @@ impl BinaryVm {
                 }
                 cursor.byte()?;
                 let destination = self.destination(&mut cursor)?;
-                ensure!(
-                    convention == 1
-                        && module.eq_ignore_ascii_case("kernel32.dll")
-                        && symbol == "CreateDirectoryA"
-                        && arguments.len() == 2
-                        && arguments[1] == 0,
-                    "unsupported DLL call {module}!{symbol} (convention {convention})"
-                );
-                let path = self.string(arguments[0])?;
-                response_destination = Some(destination);
-                request = Some(PlatformRequest::CreateDirectory { path });
+                if convention == 1
+                    && module.eq_ignore_ascii_case("user32.dll")
+                    && symbol == "GetDoubleClickTime"
+                    && (arguments.is_empty() || arguments == [0])
+                {
+                    // Portable host default, in milliseconds.
+                    writes.push((destination, 500));
+                } else {
+                    ensure!(
+                        convention == 1
+                            && module.eq_ignore_ascii_case("kernel32.dll")
+                            && symbol == "CreateDirectoryA"
+                            && arguments.len() == 2
+                            && arguments[1] == 0,
+                        "unsupported DLL call {module}!{symbol} (convention {convention})"
+                    );
+                    let path = self.string(arguments[0])?;
+                    response_destination = Some(destination);
+                    request = Some(PlatformRequest::CreateDirectory { path });
+                }
             }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
@@ -2200,6 +2219,19 @@ impl BinaryVm {
                     background: arguments[18],
                 }));
             }
+            0x0562 => {
+                let destination = [self.read(&mut cursor)?, self.read(&mut cursor)?];
+                let position = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let source = [self.read(&mut cursor)?, self.read(&mut cursor)?];
+                request = Some(PlatformRequest::DrawImageIntoImage {
+                    destination,
+                    position,
+                    source,
+                });
+            }
             0x055e => {
                 let image = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
@@ -2251,6 +2283,21 @@ impl BinaryVm {
                     source_size,
                     mode,
                 }));
+            }
+            0x04e7 => {
+                // Report the portable software renderer (original mode 1).
+                // This mode has no hardware texture filtering options.
+                for value in [1, 0, 0, 0] {
+                    writes.push((self.destination(&mut cursor)?, value));
+                }
+            }
+            0x04e8 => {
+                let mode = self.read(&mut cursor)?;
+                let _min_filter = self.read(&mut cursor)?;
+                let _mag_filter = self.read(&mut cursor)?;
+                let _options = self.read(&mut cursor)?;
+                let destination = self.destination(&mut cursor)?;
+                writes.push((destination, u32::from(mode == 1)));
             }
             0x04e2 | 0x0564 => {
                 let destination = SurfacePoint {
@@ -2351,10 +2398,6 @@ impl BinaryVm {
             0x06df => {
                 let handle = self.read(&mut cursor)?;
                 let percent = self.read(&mut cursor)?;
-                ensure!(
-                    percent <= 100,
-                    "audio volume percentage out of bounds: {percent}"
-                );
                 request = Some(PlatformRequest::SetAudioStreamVolume { handle, percent });
             }
             0x06d8 | 0x06da => {
@@ -2468,16 +2511,29 @@ impl BinaryVm {
                             item.extra[1] = red | green << 8 | blue << 16;
                         }
                     }
-                    EngineVersion::V2_47 => item.extra[1] = self.read(&mut cursor)?,
+                    EngineVersion::V2_47 | EngineVersion::V2_49 => {
+                        item.extra[1] = self.read(&mut cursor)?
+                    }
                 }
                 self.draw_list.push(item);
             }
-            0x04c4 => {
+            0x04c4 | 0x04c5 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "draw surface index out of bounds");
+                let clip = if opcode == 0x04c5 {
+                    Some([
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                    ])
+                } else {
+                    None
+                };
                 request = Some(PlatformRequest::DrawImages {
                     id,
                     items: self.draw_list.clone(),
+                    clip,
                 });
             }
             0x04b1 => {
@@ -2571,9 +2627,9 @@ impl BinaryVm {
                     length,
                 });
             }
-            0x00dd => {
+            0x00dd | 0x00df => {
                 ensure!(
-                    self.archive_paths.len() < 256,
+                    opcode == 0x00df || self.archive_paths.len() < 256,
                     "archive search list exceeds 256 entries"
                 );
                 let address = self.read(&mut cursor)?;
@@ -2587,13 +2643,25 @@ impl BinaryVm {
                 let name = String::from_utf8(bytes.clone())?;
                 bytes.push(0);
                 memory_write = Some((self.memory_range(address, bytes.len())?, bytes));
-                if !self.archive_paths.contains(&name) {
-                    self.archive_paths.push(name.clone());
+                if opcode == 0x00df {
+                    // v2.49 429c76 lowercases the caller's buffer and removes
+                    // the matching archive, shifting later entries in order.
+                    if let Some(index) = self.archive_paths.iter().position(|item| item == &name) {
+                        self.archive_paths.remove(index);
+                    }
+                    event = Event::ArchiveSearchPathRemoved {
+                        location: location.clone(),
+                        name,
+                    };
+                } else {
+                    if !self.archive_paths.contains(&name) {
+                        self.archive_paths.push(name.clone());
+                    }
+                    event = Event::ArchiveSearchPath {
+                        location: location.clone(),
+                        name,
+                    };
                 }
-                event = Event::ArchiveSearchPath {
-                    location: location.clone(),
-                    name,
-                };
             }
             0x0032 => self.message_mode = 0,
             0x0a5c => {
@@ -2625,7 +2693,9 @@ impl BinaryVm {
                     _ => {}
                 }
             }
-            0x0776 => {
+            // v2.49 also exposes desktop-sized borderless fullscreen (0778).
+            // Both modes use the portable host's borderless fullscreen request.
+            0x0776 | 0x0778 => {
                 request = Some(PlatformRequest::SetFullscreen {
                     enabled: self.read(&mut cursor)? != 0,
                 })
@@ -3384,6 +3454,12 @@ impl BinaryVm {
                 self.allocations.insert(address, vec![0; size]);
                 writes.push((destination, address));
             }
+            0x09dd => {
+                // v2.49 425f80: GetSystemMetrics(index), then result destination.
+                let index = self.read(&mut cursor)? as i32;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::SystemMetric { index });
+            }
             0x09e2 => {
                 let device = self.read(&mut cursor)?;
                 let index = self.read(&mut cursor)? as i32;
@@ -3759,6 +3835,74 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn renderer_query_commits_only_after_all_destinations_are_valid() {
+        let args = [12, 0, 0, 12, 1, 0, 12, 2, 0, 12, 3, 0];
+        for length in 0..args.len() {
+            let mut vm = BinaryVm::new("query.scn", instruction(0x4e7, &args[..length])).unwrap();
+            vm.banks.get_mut(&12).unwrap()[..4].fill(9);
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+            assert_eq!(&vm.banks[&12][..4], &[9; 4]);
+        }
+        let mut vm = BinaryVm::new("query.scn", instruction(0x4e7, &args)).unwrap();
+        vm.step().unwrap();
+        assert_eq!(&vm.banks[&12][..4], &[1, 0, 0, 0]);
+        for mode in [0, 1, 2, 3] {
+            let mut args: Vec<_> = [mode, 0, 0, 0].into_iter().flat_map(immediate).collect();
+            args.extend([12, 0, 0]);
+            let mut vm = BinaryVm::new("renderer.scn", instruction(0x4e8, &args)).unwrap();
+            vm.step().unwrap();
+            assert_eq!(vm.banks[&12][0], u32::from(mode == 1));
+        }
+    }
+
+    #[test]
+    fn v249_menu_commands_preserve_operand_boundaries() {
+        let mut code = instruction(
+            0x562,
+            &[33, 0, u32::MAX, 4, 31, 2]
+                .into_iter()
+                .flat_map(immediate)
+                .collect::<Vec<_>>(),
+        );
+        code.extend(instruction(
+            0x6df,
+            &[1, 200].into_iter().flat_map(immediate).collect::<Vec<_>>(),
+        ));
+        code.extend(instruction(0x778, &immediate(1)));
+        code.extend(instruction(0x49d, &immediate(7)));
+        let mut vm = BinaryVm::with_version("menu.scn", code, EngineVersion::V2_49).unwrap();
+        for expected in [
+            PlatformRequest::DrawImageIntoImage {
+                destination: [33, 0],
+                position: [-1, 4],
+                source: [31, 2],
+            },
+            PlatformRequest::SetAudioStreamVolume {
+                handle: 1,
+                percent: 200,
+            },
+            PlatformRequest::SetFullscreen { enabled: true },
+        ] {
+            assert!(
+                matches!(vm.step().unwrap(), Event::Platform { request, .. } if request == expected)
+            );
+            vm.respond(1).unwrap();
+        }
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping().value, 7);
+    }
+
+    #[test]
+    fn double_click_time_dll_call_returns_portable_default() {
+        let mut args = immediate(1);
+        args.extend(b"\x10USER32.DLL\0\x10GetDoubleClickTime\0\xff\x0c\0\0");
+        let mut vm = BinaryVm::new("double-click.scn", instruction(0x1a4, &args)).unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.banks[&12][0], 500);
     }
 
     #[test]
@@ -4387,6 +4531,87 @@ mod tests {
         );
         assert_eq!(vm.step().unwrap(), event);
         vm.respond(1).unwrap();
+    }
+
+    #[test]
+    fn archive_removal_lowercases_in_place_preserves_order_and_allows_reregistration() {
+        let remove = instruction(0xdf, b"\x10SECOND.WAR\0");
+        let mut code = remove.clone();
+        code.extend(instruction(0xdf, b"\x10missing.war\0"));
+        code.extend(instruction(0xdd, b"\x10SECOND.WAR\0"));
+        let mut vm = BinaryVm::new("archive.scn", code).unwrap();
+        vm.archive_paths = ["first.war", "second.war", "third.war"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(
+            matches!(vm.step().unwrap(), Event::ArchiveSearchPathRemoved { name, .. } if name == "second.war")
+        );
+        assert_eq!(&vm.data[3..remove.len()], b"second.war\0");
+        assert_eq!(vm.archive_paths, ["first.war", "third.war"]);
+        vm.step().unwrap();
+        assert_eq!(vm.archive_paths, ["first.war", "third.war"]);
+        vm.step().unwrap();
+        assert_eq!(vm.archive_paths, ["first.war", "third.war", "second.war"]);
+        for args in [&b"\x10unterminated"[..], &b"\x10\x82\xa0\0"[..]] {
+            let mut vm = BinaryVm::new("invalid.scn", instruction(0xdf, args)).unwrap();
+            vm.archive_paths.push("keep.war".into());
+            let before = vm.data.clone();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+            assert_eq!(vm.data, before);
+            assert_eq!(vm.archive_paths, ["keep.war"]);
+        }
+        let mut vm = BinaryVm::new("full.scn", remove).unwrap();
+        vm.archive_paths = (0..256).map(|i| format!("{i}.war")).collect();
+        vm.archive_paths[100] = "second.war".into();
+        vm.step().unwrap();
+        assert_eq!(vm.archive_paths.len(), 255);
+    }
+
+    #[test]
+    #[ignore = "requires extracted original topmenu.scn; set SHIINARIO_TOPMENU_SCN"]
+    fn original_v249_scene_switch_removes_archives_and_clears_the_path_buffer() -> Result<()> {
+        let code = std::fs::read(
+            std::env::var_os("SHIINARIO_TOPMENU_SCN").context("set SHIINARIO_TOPMENU_SCN")?,
+        )?;
+        ensure!(
+            code.get(0x15e..0x165) == Some(&b"\xdf\0\x12ptr\0"[..]),
+            "unexpected topmenu layout"
+        );
+        let mut vm = BinaryVm::with_version("topmenu.scn", code, EngineVersion::V2_49)?;
+        let mut paths = vec![0; 36 * 10];
+        for (i, path) in [b"release00\\SCA001.WAR", b"release00\\SCA002.WAR"]
+            .iter()
+            .enumerate()
+        {
+            paths[i * 36..i * 36 + path.len()].copy_from_slice(*path);
+        }
+        let address = vm.allocation_address(paths.len())?;
+        vm.allocations.insert(address, paths);
+        vm.banks.get_mut(&14).unwrap()[127] = address;
+        vm.archive_paths = [
+            "haku_com.war",
+            "release00\\sca001.war",
+            "release00\\sca002.war",
+            "other.war",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        vm.pc = 0xf4;
+        let mut removed = Vec::new();
+        for _ in 0..200 {
+            if vm.pc == 0x196 {
+                break;
+            }
+            if let Event::ArchiveSearchPathRemoved { name, .. } = vm.step()? {
+                removed.push(name);
+            }
+        }
+        assert_eq!(vm.pc, 0x196);
+        assert_eq!(removed, ["release00\\sca001.war", "release00\\sca002.war"]);
+        assert_eq!(vm.archive_paths, ["haku_com.war", "other.war"]);
+        assert_eq!(vm.allocations[&address], vec![0; 360]);
+        Ok(())
     }
 
     #[test]

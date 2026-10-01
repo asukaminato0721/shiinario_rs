@@ -265,6 +265,9 @@ impl Host for NativeHost {
             PlatformRequest::InitializeGraphics | PlatformRequest::ReleaseGraphics => Ok(1),
             // Select the verified scalar renderer; SIMD CPU flags describe the original x86 host.
             PlatformRequest::CpuFeatures => Ok(0),
+            // SM_SWAPBUTTON: input events already identify primary/secondary
+            // buttons. No additional system-level swap is needed.
+            PlatformRequest::SystemMetric { index: 23 } => Ok(0),
             PlatformRequest::DeviceCaps {
                 device: 0,
                 index: 12,
@@ -524,6 +527,7 @@ impl ApplicationHandler for App<'_> {
                         | Event::Platform { .. }
                         | Event::MouseButtonMapping { .. }
                         | Event::ArchiveSearchPath { .. }
+                        | Event::ArchiveSearchPathRemoved { .. }
                 ) {
                     self.instructions += 1;
                 }

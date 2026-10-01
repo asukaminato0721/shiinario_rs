@@ -91,6 +91,7 @@ fn same_profile(a: &Profile, b: &Profile) -> bool {
         && a.image == b.image
         && a.region == b.region
         && a.decode == b.decode
+        && a.prefix_xor_key == b.prefix_xor_key
 }
 
 struct PeImage<'a> {
@@ -204,6 +205,7 @@ fn recover(image: &PeImage<'_>) -> Result<Profile> {
         match bytes.get(at + ENGINE_PREFIX.len()..at + ENGINE_PREFIX.len() + 2)? {
             b"36" => Some(EngineVersion::V2_36),
             b"47" => Some(EngineVersion::V2_47),
+            b"49" => Some(EngineVersion::V2_49),
             _ => None,
         }
     });
@@ -247,30 +249,88 @@ fn recover(image: &PeImage<'_>) -> Result<Profile> {
     )?;
     let decode = match version {
         EngineVersion::V2_36 => Vec::new(),
-        EngineVersion::V2_47 => recover_decoder(image)?,
+        EngineVersion::V2_47 | EngineVersion::V2_49 => recover_decoder(image)?,
     };
     Ok(Profile {
         version,
         entry_name_size: match version {
             EngineVersion::V2_36 => 16,
-            EngineVersion::V2_47 => 32,
+            EngineVersion::V2_47 | EngineVersion::V2_49 => 32,
         },
         key,
         helper_key,
         region,
         decode,
         image: crypt_image,
+        prefix_xor_key: match version {
+            EngineVersion::V2_49 => Some(recover_prefix_xor(image)?),
+            _ => None,
+        },
     })
+}
+
+fn recover_prefix_xor(image: &PeImage<'_>) -> Result<[u8; 64]> {
+    unique(
+        matches(image.bytes, b"\xf6\x05").filter_map(|at| {
+            // test byte ptr [extra crypt descriptor],1; jz initialization end.
+            if slice(image.bytes, at + 6, 3).ok()? != [1, 0x0f, 0x84] {
+                return None;
+            }
+            let descriptor = image.pointed(at + 2).ok()?;
+            if word_at(image.bytes, descriptor).ok()? != 0x2001 {
+                return None;
+            }
+            let size = word_at(image.bytes, descriptor + 4).ok()? as usize;
+            let packed = word_at(image.bytes, descriptor + 20).ok()? as usize;
+            if size > 65536 || packed > 65536 {
+                return None;
+            }
+            let code =
+                compression::zlib(slice(image.bytes, descriptor + 32, packed).ok()?, size).ok()?;
+            if code.len() != size {
+                return None;
+            }
+            prefix_xor_program(&code).ok()
+        }),
+        "supported v2.49 extra crypt program",
+    )
+}
+
+fn prefix_xor_program(code: &[u8]) -> Result<[u8; 64]> {
+    // Recognize the KM6532 wrapper and its bounded XOR loop; do not execute it.
+    ensure!(
+        code.starts_with(b"\xe9\xfb\x04\0\0"),
+        "unsupported extra crypt wrapper"
+    );
+    for pattern in [
+        &b"\x81\x09\x02\x03\0\0"[..],           // enable pre-compression stages
+        &b"\x81\x7d\x14\0\x02\0\0"[..],         // minimum length 512
+        &b"\x83\xe1\x7e\x83\xc9\x01"[..],       // (length & 126) | 1
+        &b"\x33\xf1\x53\x89\xb0\0\x01\0\0"[..], // XOR length at 256
+    ] {
+        ensure!(
+            matches(code, pattern).next().is_some(),
+            "unsupported extra crypt operation"
+        );
+    }
+    let at = word_at(code, 0x24)? as usize;
+    let program = slice(code, at, 37)?;
+    ensure!(
+        program[..9] == *b"\x3b\x03\x60\x3f\0\0\0\x10\x19"
+            && program[13..] == *b"\x10\x18\x40\0\0\0\x71\x2a\x40\0\0\0\x82\x9b\x30\0\0\0\xd9\xdd\xff\xff\xff\xff",
+        "unsupported extra crypt bytecode"
+    );
+    Ok(slice(code, word_at(program, 9)? as usize, 64)?.try_into()?)
 }
 
 fn recover_helper(image: &PeImage<'_>, at: usize) -> Result<([u32; 5], Vec<u8>, Vec<u8>)> {
     let bytes = image.bytes;
     let call = slice(bytes, at, 31)?;
-    // jbe; lea eax/ecx,[edi+4]; push helper; push eax/ecx; call helper; add esp,8.
+    // jbe; lea eax/ecx/edx,[edi+4]; push helper; push register; call helper; add esp,8.
     ensure!(
         call[12] == 0x76
             && call[14] == 0x8d
-            && matches!(call[15], 0x47 | 0x4f)
+            && matches!(call[15], 0x47 | 0x4f | 0x57)
             && call[16..18] == [4, 0x68]
             && call[22] == 0x50 + ((call[15] >> 3) & 7)
             && call[23] == 0xe8
@@ -318,8 +378,24 @@ fn recover_helper(image: &PeImage<'_>, at: usize) -> Result<([u32; 5], Vec<u8>, 
                 return None;
             }
             let factor = image.pointed(p + 2).ok()?;
-            let len =
+            let mut len =
                 -f64::from_le_bytes(slice(bytes, factor, 8).ok()?.try_into().ok()?) * 4294967296.0;
+            if len == 1.0 {
+                // v2.49 multiplies by a length returned from a small function
+                // before scaling by -1 / 2^32. Follow that call, not a fixed address.
+                let before = p.saturating_sub(48);
+                let lengths = matches(&bytes[before..p], b"\xe8").filter_map(|q| {
+                    let q = before + q;
+                    let target = image
+                        .address(q + 5)
+                        .ok()?
+                        .wrapping_add(word_at(bytes, q + 1).ok()?);
+                    let code = slice(bytes, image.offset(target).ok()?, 11).ok()?;
+                    (code[0] == 0xb8 && code[5..] == [0x25, 0xff, 0xff, 0, 0, 0xc3])
+                        .then(|| word_at(code, 1).ok().map(|v| (v & 0xffff) as f64))?
+                });
+                len = unique(lengths, "crypt image length function").ok()?;
+            }
             if !(1.0..=1048576.0).contains(&len) || len.fract() != 0.0 {
                 return None;
             }
@@ -349,10 +425,10 @@ fn png_bytes(bytes: &[u8], start: usize) -> Result<&[u8]> {
 }
 
 fn recover_decoder(image: &PeImage<'_>) -> Result<Vec<u8>> {
-    unique(matches(image.bytes, b"\x6a\0\x56\x6a\0\x68").filter_map(|at| {
-        let code = slice(image.bytes, at, 16).ok()?;
-        if code[10..12] != [0x50, 0xe8] { return None; }
-        let data = image.pointed(at + 6).ok()?;
+    unique(matches(image.bytes, b"\x6a\0\x68").filter_map(|at| {
+        let code = slice(image.bytes, at, 13).ok()?;
+        if code[7..9] != [0x50, 0xe8] { return None; }
+        let data = image.pointed(at + 3).ok()?;
         let header = data.checked_sub(8)?;
         if slice(image.bytes, header, 8).ok()? != [0,32,0,0,0,32,0,0] { return None; }
         let decoded = compression::yh1(slice(image.bytes, data, 8192).ok()?, 8192).ok()?;
@@ -595,6 +671,26 @@ mod tests {
     }
 
     #[test]
+    fn extra_crypt_program_checks_bytecode_and_pointer_bounds() {
+        let mut code = vec![0; 512];
+        code[..5].copy_from_slice(b"\xe9\xfb\x04\0\0");
+        code[0x24..0x28].copy_from_slice(&128u32.to_le_bytes());
+        let wrapper = b"\x81\x09\x02\x03\0\0\x81\x7d\x14\0\x02\0\0\x83\xe1\x7e\x83\xc9\x01\x33\xf1\x53\x89\xb0\0\x01\0\0";
+        code[64..64 + wrapper.len()].copy_from_slice(wrapper);
+        let program = b"\x3b\x03\x60\x3f\0\0\0\x10\x19\0\x01\0\0\x10\x18\x40\0\0\0\x71\x2a\x40\0\0\0\x82\x9b\x30\0\0\0\xd9\xdd\xff\xff\xff\xff";
+        code[128..128 + program.len()].copy_from_slice(program);
+        let key = std::array::from_fn(|i| i as u8);
+        code[256..320].copy_from_slice(&key);
+        assert_eq!(prefix_xor_program(&code).unwrap(), key);
+        assert!(prefix_xor_program(&code[..319]).is_err());
+        code[128] ^= 1;
+        assert!(prefix_xor_program(&code).is_err());
+        code[128] ^= 1;
+        code[137..141].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(prefix_xor_program(&code).is_err());
+    }
+
+    #[test]
     fn rejects_unknown_executables_and_invalid_decoder_streams() {
         for size in [0, 64, 544_768, 18_333_696] {
             assert!(from_executable(&vec![0; size]).is_err());
@@ -604,6 +700,42 @@ mod tests {
         let mut code = vec![0xff; 8192];
         code[0x12f0..0x12f4].copy_from_slice(&1u32.to_le_bytes());
         assert!(expand_decode(code).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires original v2.49 game installation; set SHIINARIO_V249_EXE"]
+    fn original_v249_archives_decode() -> Result<()> {
+        use crate::Archive;
+        let exe = PathBuf::from(
+            std::env::var_os("SHIINARIO_V249_EXE").context("set SHIINARIO_V249_EXE")?,
+        );
+        let profile = Arc::new(from_executable(&fs::read(&exe)?)?);
+        assert_eq!(profile.version, EngineVersion::V2_49);
+        let mut directories = vec![exe.parent().unwrap().to_path_buf()];
+        let mut count = 0;
+        while let Some(directory) = directories.pop() {
+            for entry in fs::read_dir(directory)? {
+                let entry = entry?;
+                let path = entry.path();
+                if entry.file_type()?.is_dir() {
+                    directories.push(path);
+                } else if path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("war"))
+                {
+                    let archive = Archive::open_with_profile(&path, profile.clone())?;
+                    for entry in &archive.entries {
+                        archive
+                            .read(entry)
+                            .with_context(|| format!("{}:{}", path.display(), entry.name))?;
+                    }
+                    println!("{}: {} entries", path.display(), archive.entries.len());
+                    count += 1;
+                }
+            }
+        }
+        ensure!(count > 0, "no archives found");
+        Ok(())
     }
 
     /// Local original-game regression; no proprietary binaries are checked in.
