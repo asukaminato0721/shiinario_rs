@@ -3472,6 +3472,10 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::DeviceCaps { device, index });
             }
+            0x049c => {
+                // v2.48 41dd00: return the current mouse-button mapping.
+                writes.push((self.destination(&mut cursor)?, self.mouse_mapping.value));
+            }
             0x049d => {
                 let value = self.read(&mut cursor)?;
                 self.mouse_mapping.value = value;
@@ -4834,6 +4838,26 @@ mod tests {
             for (physical, expected) in masks.into_iter().enumerate() {
                 assert_eq!(vm.mouse_mapping().map_buttons(physical as u8), expected);
             }
+        }
+    }
+
+    #[test]
+    fn mouse_mapping_query_preserves_raw_value_and_next_instruction() {
+        for value in [0, 1, 2, u32::MAX] {
+            let mut code = instruction(0x49d, &immediate(value));
+            code.extend(instruction(0x49c, &[12, 0, 0]));
+            code.extend(instruction(0x49d, &immediate(0)));
+            code.extend(instruction(0x49d, &[12, 0, 0]));
+            let mut vm = BinaryVm::with_version("mouse.scn", code, EngineVersion::V2_48).unwrap();
+            vm.step().unwrap();
+            vm.step().unwrap();
+            assert_eq!(vm.pc, 12);
+            assert_eq!(vm.banks[&12][0], value);
+            assert_eq!(vm.mouse_mapping.value, value);
+            vm.step().unwrap();
+            assert_eq!(vm.mouse_mapping.value, 0);
+            vm.step().unwrap();
+            assert_eq!(vm.mouse_mapping.value, value);
         }
     }
 
