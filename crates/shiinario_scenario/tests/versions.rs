@@ -17,6 +17,7 @@ fn program_info_dispatches_by_version() {
     for (version, expected) in [
         (EngineVersion::V2_36, [236, 20050900]),
         (EngineVersion::V2_47, [247, 20090401]),
+        (EngineVersion::V2_48, [248, 20101101]),
         (EngineVersion::V2_49, [249, 20110301]),
     ] {
         let mut code = instruction(0x3c0, &[12, 0, 0, 12, 1, 0]);
@@ -44,6 +45,7 @@ fn image_draw_operands_preserve_the_next_instruction() {
             0x563412,
         ),
         (EngineVersion::V2_47, 0, vec![123], 123),
+        (EngineVersion::V2_48, 0, vec![123], 123),
         (EngineVersion::V2_49, 0, vec![123], 123),
     ] {
         let args: Vec<u8> = [1, 2, flags, 3, 4, 5, 6]

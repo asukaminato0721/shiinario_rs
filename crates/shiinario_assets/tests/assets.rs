@@ -37,6 +37,7 @@ fn configuration_versions_and_wana_catalog_mapping() {
     for (version, expected) in [
         ("2.36", EngineVersion::V2_36),
         ("2.47", EngineVersion::V2_47),
+        ("2.48", EngineVersion::V2_48),
         ("2.49", EngineVersion::V2_49),
     ] {
         let text = format!(

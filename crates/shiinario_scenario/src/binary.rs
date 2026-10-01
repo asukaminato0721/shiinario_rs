@@ -2511,7 +2511,7 @@ impl BinaryVm {
                             item.extra[1] = red | green << 8 | blue << 16;
                         }
                     }
-                    EngineVersion::V2_47 | EngineVersion::V2_49 => {
+                    EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
                         item.extra[1] = self.read(&mut cursor)?
                     }
                 }
@@ -2792,6 +2792,11 @@ impl BinaryVm {
                     key,
                     default,
                 });
+            }
+            0x03b6 => {
+                // v2.48 41d310: timeGetTime, then write one destination.
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ClockMilliseconds);
             }
             0x03b7 | 0x03b8 => {
                 calendar_destinations = Some([
@@ -4485,31 +4490,33 @@ mod tests {
 
     #[test]
     fn clock_and_shutdown_replies_control_execution() {
-        let mut code = instruction(0x3bd, &[12, 0, 0]);
-        code.extend(instruction(0x34, &[]));
-        let mut vm = BinaryVm::new("clock.scn", code).unwrap();
-        assert!(matches!(
-            vm.step().unwrap(),
-            Event::Platform {
-                request: PlatformRequest::ClockMilliseconds,
-                ..
-            }
-        ));
-        assert_eq!(vm.steps, 1);
-        assert!(vm.respond_bytes(b"wrong type").is_err());
-        vm.respond(u32::MAX).unwrap();
-        assert_eq!(vm.banks[&12][0], u32::MAX);
-        assert!(matches!(
-            vm.step().unwrap(),
-            Event::Platform {
-                request: PlatformRequest::PumpMessages,
-                ..
-            }
-        ));
-        vm.respond(0).unwrap();
-        assert!(matches!(vm.step().unwrap(), Event::End));
-        assert!(matches!(vm.step().unwrap(), Event::End));
-        assert_eq!(vm.steps, 2);
+        for opcode in [0x03b6, 0x03bd] {
+            let mut code = instruction(opcode, &[12, 0, 0]);
+            code.extend(instruction(0x34, &[]));
+            let mut vm = BinaryVm::new("clock.scn", code).unwrap();
+            assert!(matches!(
+                vm.step().unwrap(),
+                Event::Platform {
+                    request: PlatformRequest::ClockMilliseconds,
+                    ..
+                }
+            ));
+            assert_eq!(vm.steps, 1);
+            assert!(vm.respond_bytes(b"wrong type").is_err());
+            vm.respond(u32::MAX).unwrap();
+            assert_eq!(vm.banks[&12][0], u32::MAX);
+            assert!(matches!(
+                vm.step().unwrap(),
+                Event::Platform {
+                    request: PlatformRequest::PumpMessages,
+                    ..
+                }
+            ));
+            vm.respond(0).unwrap();
+            assert!(matches!(vm.step().unwrap(), Event::End));
+            assert!(matches!(vm.step().unwrap(), Event::End));
+            assert_eq!(vm.steps, 2);
+        }
     }
 
     #[test]

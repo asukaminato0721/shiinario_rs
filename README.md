@@ -1,6 +1,6 @@
 # shiinario_rs
 
-An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47, with initial v2.49 support.
+An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47, with initial v2.48 and v2.49 support.
 
 **Full-route gameplay is not complete yet but is mostly usable**
 

@@ -205,6 +205,7 @@ fn recover(image: &PeImage<'_>) -> Result<Profile> {
         match bytes.get(at + ENGINE_PREFIX.len()..at + ENGINE_PREFIX.len() + 2)? {
             b"36" => Some(EngineVersion::V2_36),
             b"47" => Some(EngineVersion::V2_47),
+            b"48" => Some(EngineVersion::V2_48),
             b"49" => Some(EngineVersion::V2_49),
             _ => None,
         }
@@ -249,13 +250,15 @@ fn recover(image: &PeImage<'_>) -> Result<Profile> {
     )?;
     let decode = match version {
         EngineVersion::V2_36 => Vec::new(),
-        EngineVersion::V2_47 | EngineVersion::V2_49 => recover_decoder(image)?,
+        EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
+            recover_decoder(image)?
+        }
     };
     Ok(Profile {
         version,
         entry_name_size: match version {
             EngineVersion::V2_36 => 16,
-            EngineVersion::V2_47 | EngineVersion::V2_49 => 32,
+            EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => 32,
         },
         key,
         helper_key,
@@ -703,14 +706,27 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires original v2.48 game installation; set SHIINARIO_V248_EXE"]
+    fn original_v248_archives_decode() -> Result<()> {
+        original_archives_decode("SHIINARIO_V248_EXE", EngineVersion::V2_48)
+    }
+
+    #[test]
     #[ignore = "requires original v2.49 game installation; set SHIINARIO_V249_EXE"]
     fn original_v249_archives_decode() -> Result<()> {
+        original_archives_decode("SHIINARIO_V249_EXE", EngineVersion::V2_49)
+    }
+
+    fn original_archives_decode(variable: &str, version: EngineVersion) -> Result<()> {
         use crate::Archive;
-        let exe = PathBuf::from(
-            std::env::var_os("SHIINARIO_V249_EXE").context("set SHIINARIO_V249_EXE")?,
-        );
+        let exe =
+            PathBuf::from(std::env::var_os(variable).with_context(|| format!("set {variable}"))?);
         let profile = Arc::new(from_executable(&fs::read(&exe)?)?);
-        assert_eq!(profile.version, EngineVersion::V2_49);
+        assert_eq!(profile.version, version);
+        if version == EngineVersion::V2_48 {
+            let reference = crate::profile::Catalog::builtin()?.profile("Tanetsuke Mura")?;
+            assert!(same_profile(&profile, &reference));
+        }
         let mut directories = vec![exe.parent().unwrap().to_path_buf()];
         let mut count = 0;
         while let Some(directory) = directories.pop() {

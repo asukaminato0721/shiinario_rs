@@ -234,7 +234,9 @@ fn helper4(profile: &Profile, data: &mut [u8]) {
     let crc = region_crc(&profile.region, flags, buf[1] >> 8);
     key[6] = match profile.version {
         EngineVersion::V2_36 => crc,
-        EngineVersion::V2_47 | EngineVersion::V2_49 => crc.wrapping_add(key[9]),
+        EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
+            crc.wrapping_add(key[9])
+        }
     };
     for (chunk, k) in data[..40].as_chunks_mut::<4>().0.iter_mut().zip(key) {
         for (d, b) in chunk.iter_mut().zip(k.to_le_bytes()) {

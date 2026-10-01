@@ -96,7 +96,7 @@ which the pinned catalog contains without a corresponding `GameMap` entry.
 The serialized upstream catalog remains unchanged.
 
 The full upstream catalog does not imply complete support for other games. The
-reader currently accepts v2.36/v2.47/v2.49 schemes with 16- or 32-byte entry names and no
+reader currently accepts v2.36/v2.47/v2.48/v2.49 schemes with 16- or 32-byte entry names and no
 extra crypt stage, and validates table sizes. An enum selects the version-specific
 helper transform; index size follows the scheme's entry-name size.
 Unsupported mapped schemes report their name

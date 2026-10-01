@@ -8,6 +8,8 @@ pub enum EngineVersion {
     #[default]
     #[serde(rename = "椎名里緒 v2.47")]
     V2_47,
+    #[serde(rename = "椎名里緒 v2.48")]
+    V2_48,
     #[serde(rename = "椎名里緒 v2.49")]
     V2_49,
 }
@@ -17,6 +19,7 @@ impl EngineVersion {
         match section {
             "椎名里緒 v2.36" => Some(Self::V2_36),
             "椎名里緒 v2.47" => Some(Self::V2_47),
+            "椎名里緒 v2.48" => Some(Self::V2_48),
             "椎名里緒 v2.49" => Some(Self::V2_49),
             _ => None,
         }
@@ -26,6 +29,7 @@ impl EngineVersion {
         match version {
             2360 => Some(Self::V2_36),
             2470 => Some(Self::V2_47),
+            2480 => Some(Self::V2_48),
             2490 => Some(Self::V2_49),
             _ => None,
         }
@@ -36,6 +40,7 @@ impl EngineVersion {
         match self {
             Self::V2_36 => [236, 20050900],
             Self::V2_47 => [247, 20090401],
+            Self::V2_48 => [248, 20101101],
             Self::V2_49 => [249, 20110301],
         }
     }

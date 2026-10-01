@@ -114,7 +114,7 @@ impl Project {
         }
         let config = configs
             .first()
-            .context("no supported Shiina Rio v2.36/v2.47/v2.49 configuration found")?
+            .context("no supported Shiina Rio v2.36/v2.47/v2.48/v2.49 configuration found")?
             .clone();
         ensure!(
             configs.iter().all(|c| c.version == config.version
