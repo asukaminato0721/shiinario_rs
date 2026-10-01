@@ -43,11 +43,11 @@ impl Voice {
         let period = fade.period_ms * u64::from(rate);
         while fade.elapsed >= period {
             fade.elapsed -= period;
-            let next = i64::from(self.stream.volume.percent() as i32) + i64::from(fade.step);
+            let next = (self.stream.volume.percent() as i32).wrapping_add(fade.step);
             let done = if fade.step > 0 {
-                next >= i64::from(fade.target)
+                next >= fade.target as i32
             } else {
-                next <= i64::from(fade.target)
+                next <= fade.target as i32
             };
             if done {
                 let stop = fade.step < 0 && fade.stop;
@@ -186,7 +186,9 @@ impl Mixer {
     /// Original 2.36/2.47 workers sleep 5 ms and compare the counter before
     /// incrementing it: interval 30 means one volume step every 35 ms.
     pub fn fade(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
-        ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
+        // The native worker accepts the full 31-bit target; bit 31 controls
+        // whether a descending fade stops playback. Values above 100 remain
+        // observable through the stream-volume query.
         if let Some(voice) = self.voices.get_mut(&handle) {
             // Replacing a fade cancels the old worker even at the endpoint.
             voice.fade = None;

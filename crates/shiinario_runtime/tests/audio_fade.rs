@@ -37,8 +37,30 @@ fn out_of_range_volume_remains_observable_without_changing_output() {
     assert_eq!(after, [0.5; 4]);
 }
 #[test]
+fn fade_above_volume_table_preserves_output_until_it_returns_to_range() {
+    let stream = stream(50);
+    let mut mixer = Mixer::default();
+    mixer.play(1, stream.clone(), 2).unwrap();
+    let mut before = [0.; 4];
+    mixer.render(&mut before, 48000, 1).unwrap();
+    stream.volume.set_percent(200).unwrap();
+    mixer.fade(1, 0, -25, 0x80000096).unwrap();
+    mixer.advance_ms(20);
+    assert_eq!(stream.volume.percent(), 150);
+    assert!(mixer.is_playing(1));
+    let mut after = [0.; 4];
+    mixer.render(&mut after, 48000, 1).unwrap();
+    assert_eq!(before, after);
+    mixer.fade(1, 0, -25, 0x80000064).unwrap();
+    mixer.advance_ms(20);
+    assert_eq!(stream.volume.percent(), 100);
+    mixer.render(&mut after, 48000, 1).unwrap();
+    assert_eq!(after, [0.5; 4]);
+}
+
+#[test]
 fn original_workers_match_rendered_and_simulated_timing() {
-    // Original 2.36 and 2.47 start/worker routines executed with Unicorn.
+    // Original 2.36, 2.47 and 2.49 start/worker routines executed with Unicorn.
     // Sleep, thread creation and DirectSound calls were stubbed; volume,
     // counters, termination and stop decisions ran as original x86 code.
     let fixture: serde_json::Value =
@@ -118,40 +140,43 @@ fn fade_changes_samples_and_replacement_stop_and_replay_cancel_it() {
     mixer.play(1, stream.clone(), 2).unwrap();
     mixer.advance_ms(100);
     assert_eq!(stream.volume.percent(), 70);
-    // Null/stopped handles are harmless, and invalid targets fail before mutation.
-    mixer.fade(0, 30, -1, 0).unwrap();
-    assert!(mixer.fade(1, 30, -1, 101).is_err());
+    // Null/stopped handles are harmless, including targets above 100.
+    mixer.fade(0, 30, -1, 200).unwrap();
+    mixer.stop(1);
+    mixer.fade(1, 30, -1, 200).unwrap();
 }
 
 #[test]
 fn strict_vm_accepts_fade_and_continues_without_waiting() {
-    let mut code = 0x06ecu16.to_le_bytes().to_vec();
-    for value in [7u32, 30, (-20i32) as u32, 0x80000000] {
-        code.push(4);
-        code.extend(value.to_le_bytes());
-    }
-    let next = code.len();
-    code.extend(0x049du16.to_le_bytes());
-    code.extend([4, 9, 0, 0, 0]);
-    let mut vm = BinaryVm::new("fade.scn", code).unwrap();
-    assert!(matches!(
-        vm.step().unwrap(),
-        Event::Platform {
-            request: PlatformRequest::FadeAudioStream {
-                handle: 7,
-                interval: 30,
-                step: -20,
-                target: 0x80000000
-            },
-            ..
+    for target in [0x80000000, 200, 0x800000c8, u32::MAX] {
+        let mut code = 0x06ecu16.to_le_bytes().to_vec();
+        for value in [7u32, 30, (-20i32) as u32, target] {
+            code.push(4);
+            code.extend(value.to_le_bytes());
         }
-    ));
-    vm.respond(1).unwrap();
-    assert_eq!(vm.location().offset, next);
-    assert!(matches!(
-        vm.step().unwrap(),
-        Event::MouseButtonMapping { value: 9, .. }
-    ));
+        let next = code.len();
+        code.extend(0x049du16.to_le_bytes());
+        code.extend([4, 9, 0, 0, 0]);
+        let mut vm = BinaryVm::new("fade.scn", code).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::FadeAudioStream {
+                    handle: 7,
+                    interval: 30,
+                    step: -20,
+                    target: actual_target
+                },
+                ..
+            } if actual_target == target
+        ));
+        vm.respond(1).unwrap();
+        assert_eq!(vm.location().offset, next);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::MouseButtonMapping { value: 9, .. }
+        ));
+    }
 }
 
 #[test]

@@ -18,3 +18,8 @@ Unicorn executes the original start/worker code; Sleep, thread creation,
 thread shutdown, and DirectSound calls are stubbed. Executable SHA-256 hashes
 and entry addresses are recorded in the fixture. No game media is included.
 The Rust tests compare both simulated time and 44.1/48 kHz mixer output clocks.
+
+Eight v2.49 cases additionally cover targets above 100, the full 31-bit target
+range, signed 32-bit arithmetic wraparound, descending overshoot, and equal
+targets. The original worker's volume-table call is stubbed for these cases;
+the recorded values are script-visible volumes and playback-stop decisions.

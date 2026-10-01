@@ -1993,9 +1993,11 @@ impl BinaryVm {
             }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
-                let code = self.memory_read(address, native_helper::THUMBNAIL_CODE_SIZE)?;
                 ensure!(
-                    native_helper::is_thumbnail(&code),
+                    native_helper::THUMBNAIL_CODE_SIZES.iter().any(|&size| {
+                        self.memory_read(address, size)
+                            .is_ok_and(|code| native_helper::is_thumbnail(&code))
+                    }),
                     "unsupported native SCN helper at {address:#x}"
                 );
                 let source = self.banks[&12][0];
@@ -2387,7 +2389,6 @@ impl BinaryVm {
                 let interval = self.read(&mut cursor)?;
                 let step = self.read(&mut cursor)? as i32;
                 let target = self.read(&mut cursor)?;
-                ensure!(target & 0x7fffffff <= 100, "audio fade target exceeds 100");
                 request = Some(PlatformRequest::FadeAudioStream {
                     handle,
                     interval,
@@ -3840,6 +3841,61 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    #[ignore = "requires extracted TANEGAME start.SCN; set SHIINARIO_TANE_START_SCN"]
+    fn original_v248_save_thumbnail_consumes_helper_and_preserves_buffers() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let path =
+            std::env::var_os("SHIINARIO_TANE_START_SCN").context("set SHIINARIO_TANE_START_SCN")?;
+        let original = std::fs::read(path)?;
+        let source: Vec<_> = (0..native_helper::SOURCE_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        for (truncate, corrupt, overlap) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            let mut code = original.clone();
+            if truncate {
+                // The 115-byte helper also works at the exact end of a script.
+                code.truncate(0xb1eeb + 115);
+            }
+            if corrupt {
+                code[0xb1eeb + 50] ^= 1;
+            }
+            let mut vm = BinaryVm::with_version("start.SCN", code, EngineVersion::V2_48)?;
+            vm.pc = 0xb0a2e;
+            vm.allocations.insert(0x50000000, source.clone());
+            vm.allocations
+                .insert(0x60000000, vec![0xa5; native_helper::TARGET_SIZE + 32]);
+            vm.banks.get_mut(&12).unwrap()[..2]
+                .copy_from_slice(&[0x50000000, if overlap { 0x50000010 } else { 0x60000010 }]);
+            let banks = vm.banks.clone();
+            let stack = vm.sp;
+            if corrupt || overlap {
+                assert!(vm.step().is_err());
+                assert_eq!(vm.pc, 0xb0a2e);
+                assert!(vm.allocations[&0x60000000].iter().all(|&b| b == 0xa5));
+            } else {
+                vm.step()?;
+                assert_eq!(vm.pc, 0xb0a35);
+                let output = &vm.allocations[&0x60000000];
+                assert_eq!(&output[..16], &[0xa5; 16]);
+                assert_eq!(&output[output.len() - 16..], &[0xa5; 16]);
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&output[16..output.len() - 16])),
+                    "0bb94390c77516c6feac5317cf1f3eb1c1f9f0a2be1e7bf32210ce918f38ce4a"
+                );
+            }
+            assert_eq!(vm.allocations[&0x50000000], source);
+            assert_eq!(vm.banks, banks);
+            assert_eq!(vm.sp, stack);
+        }
+        Ok(())
     }
 
     #[test]

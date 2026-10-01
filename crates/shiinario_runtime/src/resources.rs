@@ -60,8 +60,9 @@ impl StreamVolume {
     // playback. Keep that value observable through opcode 06e3.
     pub(crate) fn set_fade_percent(&self, percent: u32) {
         self.percent.store(percent, Ordering::Relaxed);
-        self.output_percent
-            .store((percent as i32).clamp(0, 100) as u32, Ordering::Relaxed);
+        if percent <= 100 {
+            self.output_percent.store(percent, Ordering::Relaxed);
+        }
     }
     pub fn percent(&self) -> u32 {
         self.percent.load(Ordering::Relaxed)
