@@ -113,6 +113,17 @@ impl TextStyle {
                 // only the command byte is consumed. v2.47 uses it to switch
                 // text contexts (432466), which is still unresolved.
                 b'n' if version == EngineVersion::V2_36 => {}
+                // v2.49: 4385d4 parses a context index (437890 defaults an
+                // omitted number to zero), then swaps it with the active
+                // context via 437670. The VM currently only exposes context
+                // zero, so selecting zero preserves its style and cursor.
+                b'n' if version == EngineVersion::V2_49 => {
+                    let context = parse_number(bytes, &mut at, true)?;
+                    ensure!(
+                        context == 0,
+                        "nonzero inline text context _n{context} is unresolved"
+                    );
+                }
                 b'e' => result.effects = number(bytes, &mut at)?,
                 b'w' | b'W' => {
                     ensure!(
@@ -241,9 +252,18 @@ fn string_parameter(bytes: &[u8], at: &mut usize) -> Result<Vec<u8>> {
 }
 
 fn number(bytes: &[u8], at: &mut usize) -> Result<u32> {
+    parse_number(bytes, at, false)
+}
+
+fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) -> Result<u32> {
     while bytes.get(*at) == Some(&b' ') {
         *at += 1;
     }
+    ensure!(
+        bytes.get(*at) != Some(&b'{'),
+        "text-control number expressions are unresolved at byte {}",
+        *at
+    );
     let negative = bytes.get(*at) == Some(&b'-');
     if matches!(bytes.get(*at), Some(b'+' | b'-')) {
         *at += 1;
@@ -264,7 +284,11 @@ fn number(bytes: &[u8], at: &mut usize) -> Result<u32> {
         digits += 1;
         *at += 1;
     }
-    ensure!(digits != 0, "missing text-control number at byte {}", *at);
+    ensure!(
+        digits != 0 || allow_omitted,
+        "missing text-control number at byte {}",
+        *at
+    );
     if matches!(bytes.get(*at), Some(b',' | b'.' | b' ')) {
         *at += 1;
     }
