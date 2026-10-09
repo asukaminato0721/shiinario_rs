@@ -39,6 +39,8 @@ fn configuration_versions_and_wana_catalog_mapping() {
         ("2.47", EngineVersion::V2_47),
         ("2.48", EngineVersion::V2_48),
         ("2.49", EngineVersion::V2_49),
+        ("2.46", EngineVersion::Unverified(246)),
+        ("2.50", EngineVersion::Unverified(250)),
     ] {
         let text = format!(
             "[椎名里緒 v{version}]\r\nWindowWidth=800\r\nWindowHeight=600\r\nArc=fixture.war\r\nScn=start.scn\r\n"
@@ -46,9 +48,22 @@ fn configuration_versions_and_wana_catalog_mapping() {
         let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&text);
         let config = Config::parse("game.ini".into(), &bytes).unwrap();
         assert_eq!(config.version, expected);
+        assert_eq!(
+            serde_json::to_value(config.version).unwrap(),
+            format!("椎名里緒 v{version}")
+        );
     }
-    assert!(EngineVersion::from_config("椎名里緒 v2.35").is_none());
-    assert!(EngineVersion::from_scheme(2350).is_none());
+    assert_eq!(
+        EngineVersion::from_config("椎名里緒 v2.35"),
+        Some(EngineVersion::Unverified(235))
+    );
+    assert_eq!(
+        EngineVersion::from_scheme(2350),
+        Some(EngineVersion::Unverified(235))
+    );
+    assert!(EngineVersion::from_config("Other Engine v2.46").is_none());
+    assert!(EngineVersion::from_config("椎名里緒 v2.46garbage").is_none());
+    assert!(EngineVersion::from_scheme(-1).is_none());
     let t = Temp::new();
     std::fs::rename(t.0.join("RANDL_.exe"), t.0.join("WANA.EXE")).unwrap();
     let catalog = Catalog::builtin().unwrap();
@@ -82,6 +97,24 @@ fn reference_archive_and_malformed_headers() {
     bad[8..12].copy_from_slice(&(0xf182ad82u32 ^ u32::MAX).to_le_bytes());
     std::fs::write(&p, &bad).unwrap();
     assert!(Archive::open(&p).is_err());
+}
+
+#[test]
+fn unverified_configuration_reports_parse_failure_with_version() {
+    use shiinario_assets::project::Config;
+    let text =
+        "[椎名里緒 v2.46]\nWindowWidth=640\nWindowHeight=600\nArc=fixture.war\nScn=start.scn\n";
+    let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(text);
+    let error = Config::parse("game.ini".into(), &bytes).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("unsupported viewport 640x600"));
+    assert!(message.contains("unverified ShiinaRio v2.46"));
+    let temp = Temp::new();
+    std::fs::write(temp.0.join("game.ini"), &bytes).unwrap();
+    let error = Project::open(&temp.0).err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("unsupported viewport 640x600"));
+    assert!(message.contains("unverified ShiinaRio v2.46"));
 }
 #[test]
 fn project_lookup_and_cache_budget() {

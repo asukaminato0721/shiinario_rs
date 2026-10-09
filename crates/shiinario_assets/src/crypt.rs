@@ -1,5 +1,6 @@
 // Ported from GARbro WarcEncryption.cs, Copyright (C) 2015-2017 morkt (MIT).
 use crate::profile::Profile;
+#[cfg(test)]
 use shiinario_core::EngineVersion;
 use std::f64::consts::PI;
 struct Random(u32);
@@ -232,11 +233,11 @@ fn helper4(profile: &Profile, data: &mut [u8]) {
     }
     key[9] = ((key[2] as i32 as i64 * key[3] as i32 as i64) >> 8) as u32;
     let crc = region_crc(&profile.region, flags, buf[1] >> 8);
-    key[6] = match profile.version {
-        EngineVersion::V2_36 => crc,
-        EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
-            crc.wrapping_add(key[9])
-        }
+    // GARbro's helper changes at scheme version 2390, not at a supported-version whitelist.
+    key[6] = if profile.version.number() >= 239 {
+        crc.wrapping_add(key[9])
+    } else {
+        crc
     };
     for (chunk, k) in data[..40].as_chunks_mut::<4>().0.iter_mut().zip(key) {
         for (d, b) in chunk.iter_mut().zip(k.to_le_bytes()) {

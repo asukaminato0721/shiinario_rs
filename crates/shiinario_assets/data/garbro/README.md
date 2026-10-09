@@ -99,12 +99,21 @@ connects `wana.exe` to the existing `Wana ~Hakudaku Mamire no Houkago~` scheme,
 which the pinned catalog contains without a corresponding `GameMap` entry.
 The serialized upstream catalog remains unchanged.
 
-The full upstream catalog does not imply complete support for other games. The
-reader currently accepts v2.36/v2.47/v2.48/v2.49 schemes with 16- or 32-byte entry names and no
-extra crypt stage, and validates table sizes. An enum selects the version-specific
-helper transform; index size follows the scheme's entry-name size.
-Unsupported mapped schemes report their name
-and validation error. Interpreter compatibility is a separate constraint.
+The full upstream catalog does not imply complete support for other games.
+Recognized v2.xx versions now try the available parsers, including versions outside
+the verified v2.36/v2.47/v2.48/v2.49 set. The reported version remains unchanged.
+The reader still requires 16- or 32-byte entry names, valid table sizes, and no
+catalog extra crypt stage. The helper transform follows GARbro's scheme-2390
+threshold. Index size follows the catalog entry-name size.
+
+Unverified EXEs try the existing 32-byte entry layout and decoder recovery.
+Unverified scripts try the modern instruction layout. Their program-info reply
+retains the reported version and uses zero for the unknown build date.
+Failures retain the original parse error and add version compatibility information.
+Successful parsing does not establish complete interpreter compatibility.
+
+The supplied Chikan Circle v2.46 installation passed decoding of all 3170 entries
+in its 10 archives. Its native window and audio passed a five-second startup test.
 
 To update, copy the original file from an explicitly selected upstream revision,
 record its revision/version/hash here, and independently compare the selected

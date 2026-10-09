@@ -41,7 +41,9 @@ impl Archive {
         Self::open_with_profile(path, profile)
     }
     pub fn open_with_profile(path: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
-        let path = path.as_ref();
+        profile.parse_result(Self::parse_index(path.as_ref(), profile.clone()))
+    }
+    fn parse_index(path: &Path, profile: Arc<Profile>) -> Result<Self> {
         let mut file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let len = file.metadata()?.len();
         let mut header = [0; 12];
@@ -107,6 +109,9 @@ impl Archive {
         })
     }
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
+        self.profile.parse_result(self.read_entry(entry))
+    }
+    fn read_entry(&self, entry: &Entry) -> Result<Vec<u8>> {
         ensure!(
             entry.size as usize <= compression::MAX_OUTPUT,
             "stored entry exceeds cap"

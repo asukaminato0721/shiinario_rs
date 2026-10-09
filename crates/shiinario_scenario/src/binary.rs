@@ -1912,7 +1912,7 @@ impl BinaryVm {
                     .get(self.pc..self.pc + 2)
                     .map(|b| format!("0x{:04x}", u16::from_le_bytes([b[0], b[1]])))
                     .unwrap_or_else(|| "truncated".into());
-                let message = format!(
+                let mut message = format!(
                     "{}:{:#x}: {error:#}; opcode={opcode}, task={}, executed_steps={}, stack_pointer={}, thread_limit={}, mouse_button_mapping={:#x}, next_bytes={:02x?}",
                     self.name,
                     self.pc,
@@ -1923,6 +1923,10 @@ impl BinaryVm {
                     self.mouse_mapping.value,
                     &self.data[self.pc..self.data.len().min(self.pc + 24)]
                 );
+                if let Some(context) = self.version.failure_context() {
+                    message.push_str(". ");
+                    message.push_str(&context);
+                }
                 self.failure = Some(message.clone());
                 bail!("{message}");
             }
@@ -2512,9 +2516,10 @@ impl BinaryVm {
                             item.extra[1] = red | green << 8 | blue << 16;
                         }
                     }
-                    EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
-                        item.extra[1] = self.read(&mut cursor)?
-                    }
+                    EngineVersion::V2_47
+                    | EngineVersion::V2_48
+                    | EngineVersion::V2_49
+                    | EngineVersion::Unverified(_) => item.extra[1] = self.read(&mut cursor)?,
                 }
                 self.draw_list.push(item);
             }

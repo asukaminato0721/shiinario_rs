@@ -17,8 +17,8 @@ use std::{
 const MAX_DATABASE: usize = 16 * 1024 * 1024;
 const BUNDLED_DATABASE: &[u8] = include_bytes!("../data/garbro/Formats.dat");
 
-/// Validated WARC v2.36/v2.47/v2.48/v2.49 decryption data recovered from an executable or catalog.
-/// Loading does not execute .NET code. Other scheme versions are unsupported.
+/// Validated WARC decryption data recovered from an executable or catalog.
+/// Loading does not execute .NET code. Unverified versions can try the existing decoder.
 #[derive(Debug)]
 pub struct Profile {
     pub(crate) version: EngineVersion,
@@ -254,9 +254,19 @@ impl Profile {
     fn from_record(doc: &Document<'_>, scheme: &Value<'_>) -> Result<Self> {
         doc.class(scheme, "GameRes.Formats.ShiinaRio.EncryptionScheme")?;
         let version = doc.number(doc.field(scheme, "<Version>k__BackingField")?)?;
-        let version = EngineVersion::from_scheme(version).with_context(|| {
-            format!("unsupported scheme version {version} (only v2.36/v2.47/v2.48/v2.49 are implemented)")
-        })?;
+        let version = EngineVersion::from_scheme(version)
+            .with_context(|| format!("invalid ShiinaRio scheme version {version}"))?;
+        Self::parse_record(doc, scheme, version).map_err(|error| match version.failure_context() {
+            Some(context) => error.context(context),
+            None => error,
+        })
+    }
+
+    fn parse_record(
+        doc: &Document<'_>,
+        scheme: &Value<'_>,
+        version: EngineVersion,
+    ) -> Result<Self> {
         let entry_name_size = doc.number(doc.field(scheme, "EntryNameSize")?)?;
         ensure!(
             matches!(entry_name_size, 16 | 32),
@@ -320,6 +330,13 @@ impl Profile {
     pub(crate) fn max_index(&self) -> usize {
         (self.entry_name_size + 24) * 16384
     }
+
+    pub(crate) fn parse_result<T>(&self, result: Result<T>) -> Result<T> {
+        result.map_err(|error| match self.version.failure_context() {
+            Some(context) => error.context(context),
+            None => error,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -327,14 +344,15 @@ mod tests {
     use super::*;
     use crate::test_support;
 
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn detects_filenames_and_rejects_missing_or_ambiguous_games() {
-        struct Temp(std::path::PathBuf);
-        impl Drop for Temp {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
         let temp = Temp(
             std::env::temp_dir().join(format!("shiinario-catalog-test-{}", std::process::id())),
         );
@@ -405,7 +423,7 @@ mod tests {
             .windows(4)
             .position(|v| v == 2470i32.to_le_bytes())
             .unwrap();
-        unsupported[at..at + 4].copy_from_slice(&2500i32.to_le_bytes());
+        unsupported[at..at + 4].copy_from_slice(&(-1i32).to_le_bytes());
         let catalog = Catalog::from_bytes(&test_support::wrap(&unsupported)).unwrap();
         assert!(catalog.profile("Ran→Sem").is_ok());
         let error = catalog
@@ -413,6 +431,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("unsupported") && error.contains("Unrelated"));
+    }
+
+    #[test]
+    fn unverified_versions_parse_archives_before_reporting_compatibility() -> Result<()> {
+        let temp = Temp(
+            std::env::temp_dir().join(format!("shiinario-unverified-test-{}", std::process::id())),
+        );
+        fs::create_dir(&temp.0)?;
+        let path = temp.0.join("fixture.war");
+        fs::write(&path, include_bytes!("../tests/fixtures/minimal.war"))?;
+        for number in [2460i32, 2500] {
+            let mut raw = test_support::stream();
+            for at in 0..raw.len() - 3 {
+                if raw[at..at + 4] == 2470i32.to_le_bytes() {
+                    raw[at..at + 4].copy_from_slice(&number.to_le_bytes());
+                }
+            }
+            let catalog = Catalog::from_bytes(&test_support::wrap(&raw))?;
+            let profile = catalog.profile("Ran→Sem")?;
+            assert_eq!(profile.version.number(), (number / 10) as u16);
+            let archive = crate::Archive::open_with_profile(&path, profile.clone())?;
+            assert_eq!(
+                archive.read(&archive.entries[0])?,
+                b"synthetic asset fixture\n"
+            );
+            let mut bad_entry = archive.entries[0].clone();
+            bad_entry.offset = u32::MAX;
+            let error = archive.read(&bad_entry).unwrap_err();
+            assert!(format!("{error:#}").contains("unverified ShiinaRio"));
+            assert!(error.chain().count() > 1);
+            let broken = temp.0.join("broken.war");
+            fs::write(&broken, b"invalid archive")?;
+            let error = crate::Archive::open_with_profile(&broken, profile).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("unverified ShiinaRio"), "{message}");
+            assert!(
+                message.contains("unsupported archive signature"),
+                "{message}"
+            );
+
+            // Invalid tables still fail, and the structural error remains visible.
+            for at in 0..raw.len() - 7 {
+                if raw[at..at + 4] == number.to_le_bytes()
+                    && raw[at + 4..at + 8] == 32i32.to_le_bytes()
+                {
+                    raw[at + 4..at + 8].copy_from_slice(&7i32.to_le_bytes());
+                }
+            }
+            let error = Catalog::from_bytes(&test_support::wrap(&raw))?
+                .profile("Ran→Sem")
+                .unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("entry name size"), "{message}");
+            assert!(message.contains("unverified ShiinaRio"), "{message}");
+        }
+        assert_eq!(
+            Catalog::builtin()?
+                .profile("Chikan Circle")?
+                .version
+                .number(),
+            246
+        );
+        Ok(())
     }
 
     #[test]
@@ -480,7 +561,7 @@ mod tests {
         // Both schemes must be changed: the second one is the selected profile.
         for at in 0..bad.len() - 4 {
             if bad[at..at + 4] == version {
-                bad[at..at + 4].copy_from_slice(&2500i32.to_le_bytes());
+                bad[at..at + 4].copy_from_slice(&(-1i32).to_le_bytes());
             }
         }
         assert!(

@@ -194,21 +194,25 @@ fn unique<T>(mut values: impl Iterator<Item = T>, what: &str) -> Result<T> {
 fn recover(image: &PeImage<'_>) -> Result<Profile> {
     let bytes = image.bytes;
     let mut versions = matches(bytes, ENGINE_PREFIX).filter_map(|at| {
-        match bytes.get(at + ENGINE_PREFIX.len()..at + ENGINE_PREFIX.len() + 2)? {
-            b"36" => Some(EngineVersion::V2_36),
-            b"47" => Some(EngineVersion::V2_47),
-            b"48" => Some(EngineVersion::V2_48),
-            b"49" => Some(EngineVersion::V2_49),
-            _ => None,
-        }
+        let minor = bytes.get(at + ENGINE_PREFIX.len()..at + ENGINE_PREFIX.len() + 2)?;
+        let minor = std::str::from_utf8(minor).ok()?;
+        EngineVersion::from_config(&format!("椎名里緒 v2.{minor}"))
     });
     let version = versions
         .next()
-        .context("missing supported ShiinaRio version")?;
+        .context("missing ShiinaRio version banner")?;
     ensure!(
         versions.all(|v| v == version),
         "ambiguous ShiinaRio version"
     );
+    recover_version(image, version).map_err(|error| match version.failure_context() {
+        Some(context) => error.context(context),
+        None => error,
+    })
+}
+
+fn recover_version(image: &PeImage<'_>, version: EngineVersion) -> Result<Profile> {
+    let bytes = image.bytes;
     let key_at = unique(matches(bytes, KEY_PREFIX), "crypt key template")?;
     let mut key = slice(bytes, key_at, 64)?.to_vec();
     ensure!(
@@ -242,15 +246,19 @@ fn recover(image: &PeImage<'_>) -> Result<Profile> {
     )?;
     let decode = match version {
         EngineVersion::V2_36 => Vec::new(),
-        EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => {
-            recover_decoder(image)?
-        }
+        EngineVersion::V2_47
+        | EngineVersion::V2_48
+        | EngineVersion::V2_49
+        | EngineVersion::Unverified(_) => recover_decoder(image)?,
     };
     Ok(Profile {
         version,
         entry_name_size: match version {
             EngineVersion::V2_36 => 16,
-            EngineVersion::V2_47 | EngineVersion::V2_48 | EngineVersion::V2_49 => 32,
+            EngineVersion::V2_47
+            | EngineVersion::V2_48
+            | EngineVersion::V2_49
+            | EngineVersion::Unverified(_) => 32,
         },
         key,
         helper_key,
@@ -775,6 +783,19 @@ mod tests {
         let mut code = vec![0xff; 8192];
         code[0x12f0..0x12f4].copy_from_slice(&1u32.to_le_bytes());
         assert!(expand_decode(code).is_err());
+    }
+
+    #[test]
+    fn unverified_executable_reports_pattern_failure_after_recovery_attempt() {
+        let mut bytes = fixture(0x400, 0x800000, b"20260920");
+        let at = matches(&bytes, ENGINE_PREFIX).next().unwrap() + ENGINE_PREFIX.len();
+        bytes[at..at + 2].copy_from_slice(b"46");
+        let at = matches(&bytes, KEY_PREFIX).next().unwrap();
+        bytes[at] ^= 1;
+        let error = from_executable(&bytes).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("missing crypt key template"), "{message}");
+        assert!(message.contains("unverified ShiinaRio v2.46"), "{message}");
     }
 
     #[test]

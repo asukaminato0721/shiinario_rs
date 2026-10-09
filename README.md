@@ -2,6 +2,11 @@
 
 An in-progress Rust compatibility runtime for Shiina Rio v2.36 and v2.47, with initial v2.48 and v2.49 support.
 
+Other recognized v2.xx versions try the available parsers before any compatibility
+diagnostic. The runtime retains the reported version. A parse failure includes
+the original error and identifies an unverified version. Successful startup does
+not establish complete gameplay support.
+
 **Full-route gameplay is not complete yet but is mostly usable**
 
 ```

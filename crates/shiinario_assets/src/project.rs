@@ -37,7 +37,19 @@ impl Config {
             }
         }
         let version = EngineVersion::from_config(&version)
-            .with_context(|| format!("unsupported configuration section {version:?}"))?;
+            .with_context(|| format!("unrecognized ShiinaRio configuration section {version:?}"))?;
+        Self::parse_values(source, version, values).map_err(|error| {
+            match version.failure_context() {
+                Some(context) => error.context(context),
+                None => error,
+            }
+        })
+    }
+    fn parse_values(
+        source: PathBuf,
+        version: EngineVersion,
+        values: BTreeMap<String, String>,
+    ) -> Result<Self> {
         let get = |key: &str| {
             values
                 .get(key)
@@ -104,17 +116,24 @@ impl Project {
             .collect::<std::io::Result<Vec<_>>>()?;
         paths.sort();
         let mut configs = Vec::new();
+        let mut config_errors = Vec::new();
         for p in &paths {
             if p.extension().is_some_and(|s| s.eq_ignore_ascii_case("ini")) {
                 let data = crate::fs::read(p)?;
-                if let Ok(c) = Config::parse(p.clone(), &data) {
-                    configs.push(c);
+                match Config::parse(p.clone(), &data) {
+                    Ok(c) => configs.push(c),
+                    Err(error) => config_errors.push(format!("{}: {error:#}", p.display())),
                 }
             }
         }
         let config = configs
             .first()
-            .context("no supported Shiina Rio v2.36/v2.47/v2.48/v2.49 configuration found")?
+            .with_context(|| {
+                format!(
+                    "no valid ShiinaRio configuration found. {}",
+                    config_errors.join(". ")
+                )
+            })?
             .clone();
         ensure!(
             configs.iter().all(|c| c.version == config.version

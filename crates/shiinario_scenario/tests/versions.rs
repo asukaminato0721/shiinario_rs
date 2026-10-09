@@ -19,6 +19,7 @@ fn program_info_dispatches_by_version() {
         (EngineVersion::V2_47, [247, 20090401]),
         (EngineVersion::V2_48, [248, 20101101]),
         (EngineVersion::V2_49, [249, 20110301]),
+        (EngineVersion::Unverified(246), [246, 0]),
     ] {
         let mut code = instruction(0x3c0, &[12, 0, 0, 12, 1, 0]);
         for index in 0..2 {
@@ -47,6 +48,7 @@ fn image_draw_operands_preserve_the_next_instruction() {
         (EngineVersion::V2_47, 0, vec![123], 123),
         (EngineVersion::V2_48, 0, vec![123], 123),
         (EngineVersion::V2_49, 0, vec![123], 123),
+        (EngineVersion::Unverified(246), 0, vec![123], 123),
     ] {
         let args: Vec<u8> = [1, 2, flags, 3, 4, 5, 6]
             .into_iter()
@@ -70,6 +72,19 @@ fn image_draw_operands_preserve_the_next_instruction() {
         assert_eq!(items[0].extra, [6, extra]);
         assert_eq!([items[0].x, items[0].y], [4, 5]);
     }
+}
+
+#[test]
+fn unverified_vm_reports_version_only_after_instruction_failure() {
+    let mut code = instruction(0x49d, &immediate(7));
+    code.extend(instruction(0xffff, &[]));
+    let mut vm = BinaryVm::with_version("trial.scn", code, EngineVersion::Unverified(246)).unwrap();
+    vm.step().unwrap();
+    assert_eq!(vm.mouse_mapping().value, 7);
+    let error = vm.step().unwrap_err().to_string();
+    assert!(error.contains("opcode=0xffff"), "{error}");
+    assert!(error.contains("unverified ShiinaRio v2.46"), "{error}");
+    assert_eq!(vm.step().unwrap_err().to_string(), error);
 }
 
 #[test]
