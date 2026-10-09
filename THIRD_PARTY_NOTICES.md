@@ -6,7 +6,7 @@ sources are unchanged; desktop examples and their dependencies are excluded.
 See its [provenance](crates/na_mpeg2_decoder/README.md) and
 [license](crates/na_mpeg2_decoder/LICENSE-MPL-2.0).
 
-The WARC encryption/decompression and S25 decoder are Rust ports of GARbro
+The WARC, S25, MI4, CHD, OGV, and PAD resource readers are Rust ports of GARbro
 by morkt. The unchanged upstream format catalog is bundled as
 [`crates/shiinario_assets/data/garbro/Formats.dat`](crates/shiinario_assets/data/garbro/Formats.dat).
 The Rust catalog reader follows GARbro's serialized data layout to load the
@@ -38,3 +38,8 @@ IN THE SOFTWARE.
 
 Other Cargo dependencies retain their own licenses. The bundled GARbro catalog
 includes upstream decoder data, including the referenced ShiinaImage table.
+
+`range.rs` and `tools/garbro_oracle/range_fixtures.py` come from GARbro's
+`ArcFormats/KogadoCocotte.cs` at the same revision (GPL-2.0-only).
+Original code: juicy.gt; C# port: morkt (2014); QSModel: Michael Schindler
+(1997, 1998, 2000). [License](LICENSES/GPL-2.0-only.txt).

@@ -6,11 +6,28 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(about = "Inspect and trace game files in the current directory")]
 struct Args {
+    /// Use a named GARbro WARC scheme. Run `schemes` to list names.
+    #[arg(long, global = true)]
+    scheme: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 #[derive(Subcommand)]
 enum Command {
+    /// List all bundled GARbro ShiinaRio encryption schemes.
+    Schemes,
+    /// Decode a standalone S25, MI4, or CHD image to PNG.
+    ImageFile {
+        input: PathBuf,
+        #[arg(long, default_value_t = 0)]
+        frame: usize,
+        output: PathBuf,
+    },
+    /// Decode a standalone OGV, Ogg, or PAD stream to PCM WAV.
+    AudioFile {
+        input: PathBuf,
+        output: PathBuf,
+    },
     List {
         archive: PathBuf,
     },
@@ -72,9 +89,45 @@ enum Command {
     },
 }
 fn main() -> Result<()> {
-    match Args::parse().command {
+    let args = Args::parse();
+    let profile = args
+        .scheme
+        .as_deref()
+        .map(|name| shiinario_assets::profile::Catalog::builtin()?.profile(name))
+        .transpose()?;
+    let open_archive = |path: &std::path::Path| match &profile {
+        Some(profile) => Archive::open_with_profile(path, profile.clone()),
+        None => Archive::open(path),
+    };
+    let open_project = || match &profile {
+        Some(profile) => {
+            shiinario_assets::project::Project::open_with_profile(".", profile.clone())
+        }
+        None => shiinario_assets::project::Project::open("."),
+    };
+    match args.command {
+        Command::Schemes => {
+            let catalog = shiinario_assets::profile::Catalog::builtin()?;
+            for name in catalog.names() {
+                catalog.profile(name)?;
+                println!("{name}");
+            }
+        }
+        Command::ImageFile {
+            input,
+            frame,
+            output,
+        } => {
+            write_image(&std::fs::read(input)?, frame, output)?;
+        }
+        Command::AudioFile { input, output } => {
+            std::fs::write(
+                output,
+                shiinario_assets::audio::wav_stream(&std::fs::read(input)?)?,
+            )?;
+        }
         Command::Dump { name } => {
-            let p = shiinario_runtime::open(".")?;
+            let p = open_project()?;
             let data = p.read(&name)?;
             if name.to_ascii_lowercase().ends_with(".txt") {
                 println!(
@@ -93,7 +146,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Inventory => {
-            let p = shiinario_runtime::open(".")?;
+            let p = open_project()?;
             let mut commands = std::collections::BTreeMap::<String, usize>::new();
             let mut text_files = 0;
             let mut binary_files = 0;
@@ -130,7 +183,7 @@ fn main() -> Result<()> {
             tail_events,
         } => {
             anyhow::ensure!(tail_events <= 10000, "tail-events exceeds 10000");
-            let p = shiinario_runtime::open(".")?;
+            let p = open_project()?;
             let input = input
                 .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
                 .transpose()?
@@ -241,22 +294,38 @@ fn main() -> Result<()> {
             }
             result?;
         }
-        Command::List { archive } => println!(
-            "{}",
-            serde_json::to_string_pretty(&Archive::open(archive)?.entries)?
-        ),
+        Command::List { archive } => {
+            if is_s25(&archive)? {
+                let entries = s25_entries(&archive, &std::fs::read(&archive)?)?;
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&open_archive(&archive)?.entries)?
+                );
+            }
+        }
         Command::Extract {
             archive,
             name,
             output,
         } => {
-            let a = Archive::open(archive)?;
-            let e = a.find(&name).context("entry not found")?;
-            let d = a.read(e)?;
-            std::fs::write(output, d)?;
+            if is_s25(&archive)? {
+                let data = std::fs::read(&archive)?;
+                let entries = s25_entries(&archive, &data)?;
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .context("S25 entry not found")?;
+                std::fs::write(output, &data[entry.offset..entry.offset + entry.size])?;
+            } else {
+                let a = open_archive(&archive)?;
+                let e = a.find(&name).context("entry not found")?;
+                std::fs::write(output, a.read(e)?)?;
+            }
         }
         Command::Inspect => {
-            let p = shiinario_assets::project::Project::open(".")?;
+            let p = open_project()?;
             println!("{}", serde_json::to_string_pretty(&p.config)?);
         }
         Command::Icon { output } => {
@@ -275,15 +344,19 @@ fn main() -> Result<()> {
             frame,
             output,
         } => {
-            let a = Archive::open(archive)?;
-            let d = a.read(a.find(&name).context("entry not found")?)?;
-            let f = shiinario_assets::image::decode(&d, frame)?;
-            let mut e =
-                png::Encoder::new(std::fs::File::create(output)?, f.info.width, f.info.height);
-            e.set_color(png::ColorType::Rgba);
-            e.set_depth(png::BitDepth::Eight);
-            e.write_header()?.write_image_data(&f.rgba)?;
-            println!("{}", serde_json::to_string(&f.info)?);
+            if is_s25(&archive)? {
+                let data = std::fs::read(&archive)?;
+                let entries = s25_entries(&archive, &data)?;
+                let entry = entries
+                    .iter()
+                    .find(|entry| entry.name == name)
+                    .context("S25 entry not found")?;
+                write_image(&data, entry.index, output)?;
+            } else {
+                let a = open_archive(&archive)?;
+                let data = a.read(a.find(&name).context("entry not found")?)?;
+                write_image(&data, frame, output)?;
+            }
         }
         Command::Audio {
             archive,
@@ -291,7 +364,7 @@ fn main() -> Result<()> {
             output,
             pcm,
         } => {
-            let a = Archive::open(archive)?;
+            let a = open_archive(&archive)?;
             let d = a.read(a.find(&name).context("entry not found")?)?;
             if pcm {
                 use std::io::Write;
@@ -304,6 +377,8 @@ fn main() -> Result<()> {
                 })?;
                 file.flush()?;
                 println!("{}", serde_json::to_string(&info)?);
+            } else if d.starts_with(b"PAD\0") {
+                std::fs::write(output, shiinario_assets::audio::wav_stream(&d)?)?;
             } else {
                 std::fs::write(output, shiinario_assets::audio::ogg_stream(&d)?)?;
             }
@@ -320,7 +395,7 @@ fn main() -> Result<()> {
                 {
                     continue;
                 }
-                let a = Archive::open(&path)?;
+                let a = open_archive(&path)?;
                 let mut total = 0;
                 let mut hash = Sha256::new();
                 let mut frames = 0usize;
@@ -328,7 +403,10 @@ fn main() -> Result<()> {
                 for e in &a.entries {
                     let d = a.read(e)?;
                     if media {
-                        if e.name.to_ascii_lowercase().ends_with(".s25") {
+                        if [b"S25\0", b"MAI4", b"CHD\0"]
+                            .iter()
+                            .any(|sig| d.starts_with(*sig))
+                        {
                             for f in shiinario_assets::image::frames(&d)? {
                                 let frame = shiinario_assets::image::decode(&d, f.index)
                                     .with_context(|| format!("{} frame {}", e.name, f.index))?;
@@ -336,7 +414,10 @@ fn main() -> Result<()> {
                                 pixels.update((f.index as u64).to_le_bytes());
                                 pixels.update(frame.rgba);
                             }
-                        } else if e.name.to_ascii_lowercase().ends_with(".ogv") {
+                        } else if [b"OGV\0", b"OggS", b"PAD\0"]
+                            .iter()
+                            .any(|sig| d.starts_with(*sig))
+                        {
                             shiinario_assets::audio::decode(&d, |_| Ok(()))
                                 .with_context(|| e.name.clone())?;
                         }
@@ -363,5 +444,35 @@ fn main() -> Result<()> {
             }
         }
     }
+    Ok(())
+}
+
+fn is_s25(path: &std::path::Path) -> Result<bool> {
+    use std::io::Read;
+    let mut signature = [0; 4];
+    let count = std::fs::File::open(path)?.read(&mut signature)?;
+    Ok(count == 4 && &signature == b"S25\0")
+}
+fn s25_entries(
+    path: &std::path::Path,
+    data: &[u8],
+) -> Result<Vec<shiinario_assets::image::ImageEntry>> {
+    let basename = path
+        .file_stem()
+        .context("image has no filename")?
+        .to_string_lossy();
+    shiinario_assets::image::entries(data, &basename)
+}
+fn write_image(data: &[u8], index: usize, output: PathBuf) -> Result<()> {
+    let frame = shiinario_assets::image::decode(data, index)?;
+    let mut encoder = png::Encoder::new(
+        std::fs::File::create(output)?,
+        frame.info.width,
+        frame.info.height,
+    );
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    encoder.write_header()?.write_image_data(&frame.rgba)?;
+    println!("{}", serde_json::to_string(&frame.info)?);
     Ok(())
 }

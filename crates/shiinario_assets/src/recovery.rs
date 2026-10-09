@@ -84,6 +84,7 @@ fn same_profile(a: &Profile, b: &Profile) -> bool {
         && a.region == b.region
         && a.decode == b.decode
         && a.prefix_xor_key == b.prefix_xor_key
+        && a.extra_crypt == b.extra_crypt
 }
 
 struct PeImage<'a> {
@@ -252,6 +253,7 @@ fn recover_version(image: &PeImage<'_>, version: EngineVersion) -> Result<Profil
         | EngineVersion::Unverified(_) => recover_decoder(image)?,
     };
     Ok(Profile {
+        extra_crypt: None,
         version,
         entry_name_size: match version {
             EngineVersion::V2_36 => 16,

@@ -1,10 +1,12 @@
-//! Bounded, read-only access to 's original WARC 1.7 assets.
+//! Bounded, read-only access to ShiinaRio WARC 1.0–1.7 resources.
 mod compression;
 mod crypt;
+mod extra_crypt;
 pub mod fs;
 pub mod icon;
 mod nrbf;
 pub mod profile;
+mod range;
 mod recovery;
 use anyhow::{Context, Result, ensure};
 use fs::File;
@@ -30,6 +32,7 @@ pub struct Archive {
     pub path: PathBuf,
     pub entries: Vec<Entry>,
     pub(crate) profile: Arc<Profile>,
+    pub version: u16,
 }
 fn u32le(b: &[u8]) -> u32 {
     u32::from_le_bytes(b[..4].try_into().unwrap())
@@ -37,8 +40,22 @@ fn u32le(b: &[u8]) -> u32 {
 impl Archive {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let profile = Profile::for_archive(path)?;
+        let profile = if Self::probe_version(path)? <= 110 {
+            Profile::unencrypted()
+        } else {
+            Profile::for_archive(path)?
+        };
         Self::open_with_profile(path, profile)
+    }
+    pub(crate) fn probe_version(path: &Path) -> Result<u16> {
+        let mut header = [0; 8];
+        File::open(path)?.read_exact(&mut header)?;
+        ensure!(
+            &header[..7] == b"WARC 1." && (b'0'..=b'7').contains(&header[7]),
+            "unsupported archive signature in {}",
+            path.display()
+        );
+        Ok(100 + u16::from(header[7] - b'0') * 10)
     }
     pub fn open_with_profile(path: impl AsRef<Path>, profile: Arc<Profile>) -> Result<Self> {
         profile.parse_result(Self::parse_index(path.as_ref(), profile.clone()))
@@ -49,25 +66,50 @@ impl Archive {
         let mut header = [0; 12];
         file.read_exact(&mut header)?;
         ensure!(
-            &header[..8] == b"WARC 1.7",
+            &header[..7] == b"WARC 1." && (b'0'..=b'7').contains(&header[7]),
             "unsupported archive signature in {}",
             path.display()
         );
-        let offset = u32le(&header[8..]) ^ 0xf182ad82;
+        let version = 100 + u16::from(header[7] - b'0') * 10;
+        let profile = if version <= 110 {
+            Profile::unencrypted()
+        } else {
+            profile
+        };
+        let offset = u32le(&header[8..]) ^ if version == 100 { 0 } else { 0xf182ad82 };
         ensure!(
-            offset >= 12 && offset as u64 + 8 < len,
+            offset >= 12 && (offset as u64) < len,
             "invalid index offset"
         );
-        let max_index = profile.max_index();
+        let max_index = if version == 100 {
+            0xc000
+        } else {
+            profile.max_index(version)
+        };
         let n = (len - offset as u64).min(max_index as u64) as usize;
         let mut index = vec![0; max_index];
         file.seek(SeekFrom::Start(offset as u64))?;
         file.read_exact(&mut index[..n])?;
-        crypt::decrypt_index(&profile, offset, &mut index);
-        let index =
-            compression::zlib(&index[8..n], max_index).context("decoding WARC index ( profile)")?;
+        let index = if version == 100 {
+            index.truncate(n);
+            for (i, b) in index.iter_mut().enumerate() {
+                *b ^= [0xfe, 0xe5][i % 2];
+            }
+            index
+        } else {
+            crypt::decrypt_index(&profile, version, offset, &mut index)?;
+            if version >= 170 {
+                ensure!(n >= 8, "truncated WARC index header");
+                compression::zlib(&index[8..n], max_index).context("decoding WARC index")?
+            } else if version >= 120 {
+                crate::range::decode(&index[..n], max_index).context("decoding WARC range index")?
+            } else {
+                index.truncate(n);
+                index
+            }
+        };
         let name_size = profile.entry_name_size;
-        let record_size = name_size + 24;
+        let record_size = name_size + if version == 100 { 8 } else { 24 };
         ensure!(index.len() % record_size == 0, "partial WARC index record");
         let mut entries = Vec::new();
         let mut names = BTreeSet::new();
@@ -76,7 +118,7 @@ impl Archive {
                 .iter()
                 .position(|&b| b == 0)
                 .unwrap_or(name_size);
-            if end == 0 || record[0] >= 0x80 {
+            if end == 0 || (version != 100 && record[0] >= 0x80) {
                 continue;
             }
             let (name, _, bad) = encoding_rs::SHIFT_JIS.decode(&record[..end]);
@@ -85,18 +127,28 @@ impl Archive {
                 name: name.into_owned(),
                 offset: u32le(&record[name_size..]),
                 size: u32le(&record[name_size + 4..]),
-                unpacked_size: u32le(&record[name_size + 8..]),
-                filetime: u64::from_le_bytes(
-                    record[name_size + 12..name_size + 20].try_into().unwrap(),
-                ),
-                flags: u32le(&record[name_size + 20..]),
+                unpacked_size: if version == 100 {
+                    u32le(&record[name_size + 4..])
+                } else {
+                    u32le(&record[name_size + 8..])
+                },
+                filetime: if version == 100 {
+                    0
+                } else {
+                    u64::from_le_bytes(record[name_size + 12..name_size + 20].try_into().unwrap())
+                },
+                flags: if version == 100 {
+                    0
+                } else {
+                    u32le(&record[name_size + 20..])
+                },
             };
             ensure!(
-                e.offset >= 12 && e.offset as u64 + e.size as u64 <= offset as u64,
+                e.offset >= 12 && e.offset as u64 + e.size as u64 <= len,
                 "invalid placement for {}",
                 e.name
             );
-            if !names.insert(e.name.to_lowercase()) {
+            if version != 100 && !names.insert(e.name.clone()) {
                 continue;
             }
             entries.push(e);
@@ -106,6 +158,7 @@ impl Archive {
             path: path.to_owned(),
             entries,
             profile,
+            version,
         })
     }
     pub fn read(&self, entry: &Entry) -> Result<Vec<u8>> {
@@ -123,20 +176,42 @@ impl Archive {
         if data.len() <= 8 {
             return Ok(data);
         }
-        let size = u32le(&data[4..]);
-        let sig = u32le(&data) ^ ((size ^ 0x82ad82) & 0xffffff);
-        if entry.flags & 0x80000000 != 0 {
-            crypt::decrypt(&self.profile, &mut data[8..]);
+        if self.version == 100 {
+            return if data.starts_with(b"Ylz") {
+                compression::ylz16(&data[8..], u32le(&data[4..]) as usize)
+            } else {
+                Ok(data)
+            };
         }
-        crypt::decrypt_extra(&self.profile, &mut data[8..]);
-        if entry.flags & 0x20000000 != 0 {
-            crypt::decrypt2(&self.profile, &mut data[8..])?;
+        let size = u32le(&data[4..]);
+        let sig = u32le(&data)
+            ^ if self.version > 110 {
+                (size ^ 0x82ad82) & 0xffffff
+            } else {
+                0
+            };
+        if self.version > 110 {
+            if entry.flags & 0x80000000 != 0 {
+                crypt::decrypt(&self.profile, self.version, &mut data[8..])?;
+            }
+            crypt::decrypt_extra(&self.profile, &mut data[8..]);
+            if let Some(extra) = &self.profile.extra_crypt {
+                extra.decrypt(&mut data[8..], false)?;
+            }
+            if entry.flags & 0x20000000 != 0 {
+                crypt::decrypt2(&self.profile, &mut data[8..])?;
+            }
         }
         let compressed = matches!(sig & 0xffffff, 0x314859 | 0x4b5059 | 0x5a4c59);
         let mut output = compression::unpack(sig, &mut data, size as usize)
             .with_context(|| format!("{}:{}", self.path.display(), entry.name))?;
-        if compressed && entry.flags & 0x40000000 != 0 {
-            crypt::decrypt2(&self.profile, &mut output)?;
+        if compressed && self.version > 110 {
+            if entry.flags & 0x40000000 != 0 {
+                crypt::decrypt2(&self.profile, &mut output)?;
+            }
+            if let Some(extra) = &self.profile.extra_crypt {
+                extra.decrypt(&mut output, true)?;
+            }
         }
         Ok(output)
     }
@@ -153,3 +228,60 @@ pub mod project;
 #[cfg(test)]
 #[path = "../tests/support/mod.rs"]
 mod test_support;
+
+#[cfg(test)]
+mod archive_versions {
+    use super::*;
+    #[test]
+    fn original_garbro_encrypted_range_indexes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/garbro");
+        for version in [120, 130, 140, 150, 160] {
+            let path = root.join(format!("warc{version}.war"));
+            let archive =
+                Archive::open_with_profile(path, Arc::new(crate::profile::oracle_profile(2360)))
+                    .unwrap_or_else(|e| panic!("version {version}: {e:#}"));
+            assert_eq!(archive.version, version);
+            assert_eq!(archive.entries.len(), 1);
+            assert_eq!(archive.entries[0].name, "fixture.txt");
+            assert_eq!(
+                archive.read(&archive.entries[0]).unwrap(),
+                b"synthetic archive payload!!\n"
+            );
+        }
+    }
+    #[test]
+    fn legacy_archives_need_no_executable_or_scheme() {
+        for (version, payload) in [
+            (100, b"raw legacy asset".to_vec()),
+            (110, b"raw legacy asset".to_vec()),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "shiinario-legacy-{}-{version}.war",
+                std::process::id()
+            ));
+            let offset = 12 + payload.len() as u32;
+            let mut file = format!("WARC 1.{}", (version - 100) / 10).into_bytes();
+            file.extend((offset ^ if version == 100 { 0 } else { 0xf182ad82 }).to_le_bytes());
+            file.extend(&payload);
+            let mut index = vec![0; if version == 100 { 24 } else { 40 }];
+            index[..9].copy_from_slice(b"asset.bin");
+            index[16..20].copy_from_slice(&12u32.to_le_bytes());
+            index[20..24].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            if version == 110 {
+                index[24..28].copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            }
+            for (i, byte) in index.iter_mut().enumerate() {
+                *byte ^= if version == 100 {
+                    [0xfe, 0xe5][i % 2]
+                } else {
+                    offset.to_le_bytes()[i % 4]
+                };
+            }
+            file.extend(index);
+            std::fs::write(&path, file).unwrap();
+            let archive = Archive::open(&path).unwrap();
+            assert_eq!(archive.read(&archive.entries[0]).unwrap(), payload);
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}

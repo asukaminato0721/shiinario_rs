@@ -29,6 +29,7 @@ pub struct Profile {
     pub(crate) decode: Vec<u8>,
     pub(crate) helper_key: [u32; 5],
     pub(crate) prefix_xor_key: Option<[u8; 64]>,
+    pub(crate) extra_crypt: Option<crate::extra_crypt::ExtraCrypt>,
 }
 
 /// Embedded GARbro schemes and filename-to-game mappings.
@@ -126,6 +127,11 @@ impl Catalog {
                 .or_insert_with(|| wana.into());
         }
         Ok(Self { profiles, games })
+    }
+
+    /// All named schemes, including records that fail structural validation.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.profiles.keys().map(String::as_str)
     }
 
     pub fn profile(&self, name: &str) -> Result<Arc<Profile>> {
@@ -272,20 +278,21 @@ impl Profile {
             matches!(entry_name_size, 16 | 32),
             "unsupported selected scheme entry name size"
         );
-        ensure!(
-            matches!(doc.field(scheme, "ExtraCrypt")?, Value::Null),
-            "unsupported selected scheme extra crypt stage"
-        );
+        let extra_crypt =
+            crate::extra_crypt::ExtraCrypt::from_record(doc, doc.field(scheme, "ExtraCrypt")?)?;
         let key = doc.bytes(doc.field(scheme, "CryptKey")?)?;
         let region = doc.bytes(doc.field(scheme, "Region")?)?;
-        let decode = doc.bytes(doc.field(scheme, "DecodeBin")?)?;
+        let decode = match doc.field(scheme, "DecodeBin")? {
+            Value::Null => &[][..],
+            value => doc.bytes(value)?,
+        };
         ensure!(key.len() == 64, "invalid selected scheme CryptKey length");
         ensure!(
             region.len() == 48 * 48 * 4,
             "invalid selected scheme Region length"
         );
         ensure!(
-            decode.len() == 8192,
+            decode.is_empty() || decode.len() == 8192,
             "invalid selected scheme DecodeBin length"
         );
         let helpers = doc.array(doc.field(scheme, "HelperKey")?)?;
@@ -324,11 +331,31 @@ impl Profile {
             decode: decode.to_vec(),
             helper_key,
             prefix_xor_key: None,
+            extra_crypt,
         })
     }
 
-    pub(crate) fn max_index(&self) -> usize {
-        (self.entry_name_size + 24) * 16384
+    pub(crate) fn max_index(&self, warc_version: u16) -> usize {
+        let count = if warc_version < 150 || self.version.number() < 231 {
+            8192
+        } else {
+            16384
+        };
+        (self.entry_name_size + 24) * count
+    }
+
+    pub(crate) fn unencrypted() -> Arc<Self> {
+        Arc::new(Self {
+            version: EngineVersion::Unverified(200),
+            entry_name_size: 16,
+            key: Vec::new(),
+            image: Vec::new(),
+            region: Vec::new(),
+            decode: Vec::new(),
+            helper_key: [0; 5],
+            prefix_xor_key: None,
+            extra_crypt: None,
+        })
     }
 
     pub(crate) fn parse_result<T>(&self, result: Result<T>) -> Result<T> {
@@ -336,6 +363,22 @@ impl Profile {
             Some(context) => error.context(context),
             None => error,
         })
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn oracle_profile(version: u16) -> Profile {
+    let pattern = |n, multiplier, add| (0..n).map(|i| (i * multiplier + add) as u8).collect();
+    Profile {
+        version: EngineVersion::from_scheme(i128::from(version)).unwrap(),
+        entry_name_size: 16,
+        key: pattern(64, 17, 3),
+        image: pattern(1024, 29, 7),
+        region: pattern(9216, 13, 5),
+        decode: pattern(8192, 11, 1),
+        helper_key: [1, 2, 3, 4, 5],
+        prefix_xor_key: None,
+        extra_crypt: None,
     }
 }
 
@@ -348,6 +391,17 @@ mod tests {
     impl Drop for Temp {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn every_bundled_scheme_loads() {
+        let catalog = Catalog::builtin().unwrap();
+        assert_eq!(catalog.names().count(), 127);
+        for name in catalog.names() {
+            catalog
+                .profile(name)
+                .unwrap_or_else(|error| panic!("{name}: {error:#}"));
         }
     }
 

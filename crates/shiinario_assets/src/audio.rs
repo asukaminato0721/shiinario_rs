@@ -1,4 +1,6 @@
 //! Shiina Rio OGV is an Ogg/Vorbis stream in a RIFF-like wrapper.
+#[path = "audio_pad.rs"]
+mod pad;
 use anyhow::{Context, Result, ensure};
 pub fn ogg_stream(data: &[u8]) -> Result<&[u8]> {
     if data.starts_with(b"OggS") {
@@ -44,6 +46,9 @@ pub struct AudioInfo {
 /// Decode incrementally: callers can stream PCM into their host audio queue.
 /// The cap also bounds work for malicious streams with excessive packet counts.
 pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Result<AudioInfo> {
+    if data.starts_with(b"PAD\0") {
+        return pad::decode(data, output);
+    }
     let stream = ogg_stream(data)?;
     let wrapper = if data.starts_with(b"OGV\0") {
         let format_size = u32::from_le_bytes(data[16..20].try_into()?) as usize;
@@ -152,4 +157,34 @@ pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Resu
         sample_rate,
         samples_per_channel: emitted / channels as u64,
     })
+}
+
+/// Decode a supported stream and export standard 16-bit PCM WAV data.
+pub fn wav_stream(data: &[u8]) -> Result<Vec<u8>> {
+    let mut wav = vec![0; 44];
+    let info = decode(data, |samples| {
+        for sample in samples {
+            wav.extend(sample.to_le_bytes());
+        }
+        Ok(())
+    })?;
+    let size = u32::try_from(wav.len() - 44).context("WAV length overflow")?;
+    wav[..4].copy_from_slice(b"RIFF");
+    wav[4..8].copy_from_slice(&(size + 36).to_le_bytes());
+    wav[8..16].copy_from_slice(b"WAVEfmt ");
+    wav[16..20].copy_from_slice(&16u32.to_le_bytes());
+    wav[20..22].copy_from_slice(&1u16.to_le_bytes());
+    wav[22..24].copy_from_slice(&u16::from(info.channels).to_le_bytes());
+    wav[24..28].copy_from_slice(&info.sample_rate.to_le_bytes());
+    let alignment = u16::from(info.channels) * 2;
+    let byte_rate = info
+        .sample_rate
+        .checked_mul(u32::from(alignment))
+        .context("WAV byte rate overflow")?;
+    wav[28..32].copy_from_slice(&byte_rate.to_le_bytes());
+    wav[32..34].copy_from_slice(&alignment.to_le_bytes());
+    wav[34..36].copy_from_slice(&16u16.to_le_bytes());
+    wav[36..40].copy_from_slice(b"data");
+    wav[40..44].copy_from_slice(&size.to_le_bytes());
+    Ok(wav)
 }

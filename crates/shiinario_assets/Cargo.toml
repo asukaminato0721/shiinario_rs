@@ -2,7 +2,7 @@
 name = "shiinario_assets"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license = "MIT AND GPL-2.0-only"
 
 [dependencies]
 shiinario_core.workspace = true

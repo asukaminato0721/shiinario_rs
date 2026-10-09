@@ -245,24 +245,61 @@ fn helper4(profile: &Profile, data: &mut [u8]) {
         }
     }
 }
-pub fn decrypt(profile: &Profile, data: &mut [u8]) {
+pub fn decrypt(profile: &Profile, version: u16, data: &mut [u8]) -> anyhow::Result<()> {
     let len = data.len();
-    if len < 3 {
-        return;
+    if len < 3 || version < 120 {
+        return Ok(());
     }
+    anyhow::ensure!(!profile.key.is_empty(), "missing WARC crypt key");
     let mut effective = len.min(1024);
     let mut offset = 0;
-    let a = (data[0] as i8 ^ len as i8) as i32;
-    let b = (data[1] as i8 ^ (len / 2) as i8) as i32;
+    let a = if version > 120 {
+        (data[0] as i8 ^ len as i8) as i32
+    } else {
+        i32::from(data[0])
+    };
+    let b = if version > 120 {
+        (data[1] as i8 ^ (len / 2) as i8) as i32
+    } else {
+        i32::from(data[1])
+    };
     let mut rng = Random(len as u32);
     let mut fac = 0;
-    if len != profile.max_index() {
+    if version > 120
+        && len != profile.max_index(version)
+        && (version > 130 || profile.version.number() > 215)
+    {
+        anyhow::ensure!(!profile.image.is_empty(), "missing WARC crypt image");
         let idx = (rng.next() as f64 * (profile.image.len() as f64 / 4294967296.0)) as usize;
-        fac = helper3(rng.0.wrapping_add(profile.image[idx] as u32)) & 0xfffffff;
-        if effective > 128 {
-            helper4(profile, &mut data[4..]);
-            offset = 128;
-            effective -= 128;
+        if version >= 160 {
+            fac = helper3(rng.0.wrapping_add(profile.image[idx] as u32)) & 0xfffffff;
+            if effective > 128 && profile.version.number() > 235 {
+                anyhow::ensure!(
+                    profile.region.len() == 48 * 48 * 4,
+                    "missing WARC region table"
+                );
+                helper4(profile, &mut data[4..]);
+                offset = 128;
+                effective -= 128;
+            }
+        } else if version == 150 {
+            let mut value = rng.0.wrapping_add(u32::from(profile.image[idx]));
+            value ^= (value & 0xfff).wrapping_mul(value & 0xfff);
+            for _ in 0..32 {
+                let bit = value & 1;
+                value >>= 1;
+                if bit != 0 {
+                    fac = fac.wrapping_add(value);
+                }
+            }
+        } else if version == 140 {
+            fac = u32::from(profile.image[idx]);
+        } else {
+            anyhow::ensure!(
+                (idx & 0xff) < profile.image.len(),
+                "WARC crypt image is too short"
+            );
+            fac = u32::from(profile.image[idx & 0xff]);
         }
     }
     // C#'s signed floating point conversion followed by unsigned wrap.
@@ -275,25 +312,43 @@ pub fn decrypt(profile: &Profile, data: &mut [u8]) {
     if b < 0 {
         token = 360.0 - token;
     }
-    let mut x =
-        (fac.wrapping_add(rng.helper2(token) as u8 as u32) % profile.key.len() as u32) as usize;
+    let sample = rng.helper2(token);
+    let sample = if version > 120 {
+        sample as u8
+    } else {
+        (rng.unit()) as u8
+    };
+    let mut x = (fac.wrapping_add(u32::from(sample)) % profile.key.len() as u32) as usize;
     for i in 2..effective {
-        let d = (data[offset + i] ^ (rng.next() >> 24) as u8).rotate_right(1)
+        let d = (data[offset + i]
+            ^ if version > 120 {
+                (rng.next() >> 24) as u8
+            } else {
+                0
+            })
+        .rotate_right(1)
             ^ profile.key[(i - 2) % profile.key.len()]
             ^ profile.key[x];
         data[offset + i] = d;
         x = d as usize % profile.key.len();
     }
+    Ok(())
 }
-pub fn decrypt_index(profile: &Profile, offset: u32, data: &mut [u8]) {
-    decrypt(profile, data);
+pub fn decrypt_index(
+    profile: &Profile,
+    version: u16,
+    offset: u32,
+    data: &mut [u8],
+) -> anyhow::Result<()> {
+    decrypt(profile, version, data)?;
     let key = offset.to_le_bytes();
     for (i, d) in data.iter_mut().enumerate() {
-        *d ^= key[i % 4] ^ !170u8;
+        *d ^= key[i % 4] ^ if version >= 170 { !(version as u8) } else { 0 };
     }
+    Ok(())
 }
 pub fn decrypt2(profile: &Profile, data: &mut [u8]) -> anyhow::Result<()> {
-    if data.len() < 1024 {
+    if data.len() < 1024 || profile.decode.is_empty() {
         return Ok(());
     }
     anyhow::ensure!(
@@ -338,8 +393,26 @@ pub fn decrypt_extra(profile: &Profile, data: &mut [u8]) {
 mod tests {
     use super::*;
     #[test]
+    fn original_garbro_decryption_vectors() {
+        use sha2::{Digest, Sha256};
+        for line in include_str!("../tests/fixtures/garbro/crypt.tsv").lines() {
+            let fields: Vec<_> = line.split('\t').collect();
+            let version = fields[0].parse().unwrap();
+            let scheme = fields[1].parse().unwrap();
+            let length: usize = fields[2].parse().unwrap();
+            let mut data: Vec<_> = (0..length).map(|i| (i * 37 + 11) as u8).collect();
+            decrypt(&crate::profile::oracle_profile(scheme), version, &mut data).unwrap();
+            assert_eq!(
+                format!("{:x}", Sha256::digest(&data)),
+                fields[3],
+                "WARC={version} scheme={scheme} length={length}"
+            );
+        }
+    }
+    #[test]
     fn extra_crypt_respects_minimum_length_and_prefix_boundaries() {
         let mut profile = Profile {
+            extra_crypt: None,
             prefix_xor_key: Some(std::array::from_fn(|i| i as u8 + 1)),
             version: EngineVersion::V2_49,
             entry_name_size: 32,
@@ -386,8 +459,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_second_stage_table_is_an_error() {
+    fn absent_second_stage_table_is_optional() {
         let profile = Profile {
+            extra_crypt: None,
             prefix_xor_key: None,
             version: EngineVersion::V2_36,
             entry_name_size: 16,
@@ -397,7 +471,7 @@ mod tests {
             decode: vec![],
             helper_key: [0; 5],
         };
-        assert!(decrypt2(&profile, &mut [0; 1024]).is_err());
+        assert!(decrypt2(&profile, &mut [0; 1024]).is_ok());
         assert!(decrypt2(&profile, &mut [0; 1023]).is_ok());
     }
 }

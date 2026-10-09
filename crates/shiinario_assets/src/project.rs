@@ -468,6 +468,7 @@ mod tests {
             },
             archives: vec![
                 Archive {
+                    version: 170,
                     path: root.join("first.war"),
                     entries: vec![entry(17, 25)],
                     profile: Catalog::from_bytes(&crate::test_support::database())
@@ -476,6 +477,7 @@ mod tests {
                         .unwrap(),
                 },
                 Archive {
+                    version: 170,
                     path: root.join("second.war"),
                     entries: vec![entry(100, 64)],
                     profile: Catalog::from_bytes(&crate::test_support::database())

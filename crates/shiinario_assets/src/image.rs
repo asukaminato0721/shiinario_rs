@@ -1,5 +1,7 @@
 //! Checked S25 frame decoder, including incremental shared rows.
 // Based on GARbro ImageS25.cs, Copyright (C) 2015 morkt (MIT).
+#[path = "image_legacy.rs"]
+mod legacy;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -29,6 +31,9 @@ fn word(data: &[u8], p: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes(data, p, 4)?.try_into()?))
 }
 pub fn frames(data: &[u8]) -> Result<Vec<FrameInfo>> {
+    if !data.starts_with(b"S25\0") {
+        return Ok(vec![legacy::info(data)?]);
+    }
     ensure!(data.starts_with(b"S25\0"), "not an S25 image");
     let count = word(data, 4)? as usize;
     ensure!(count <= 1_000_000, "S25 frame count exceeds cap");
@@ -70,6 +75,9 @@ pub fn frames(data: &[u8]) -> Result<Vec<FrameInfo>> {
     Ok(frames)
 }
 pub fn decode(data: &[u8], index: usize) -> Result<Frame> {
+    if !data.starts_with(b"S25\0") {
+        return legacy::decode(data, index);
+    }
     let all = frames(data)?;
     let info = all
         .iter()
@@ -112,6 +120,10 @@ pub fn decode(data: &[u8], index: usize) -> Result<Frame> {
 /// Original button hit testing uses the RLE method, not the decoded alpha.
 /// In particular, an alpha-zero literal and a method-1 run are both hits.
 pub fn hit_test(data: &[u8], index: usize, x: u32, y: u32) -> Result<bool> {
+    if !data.starts_with(b"S25\0") {
+        let frame = legacy::decode(data, index)?;
+        return Ok(x < frame.info.width && y < frame.info.height);
+    }
     let all = frames(data)?;
     let frame = all
         .iter()
@@ -212,9 +224,64 @@ fn decode_row(row: &mut [u8], out: &mut [u8], repeat: usize, methods: &mut [u8])
     }
     Ok(())
 }
+/// A raw S25 image entry. Row offsets still refer to the complete S25 file.
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageEntry {
+    pub name: String,
+    pub index: usize,
+    pub offset: usize,
+    pub size: usize,
+}
+/// GARbro ArcS25 listing order and names, including shared image offsets.
+pub fn entries(data: &[u8], basename: &str) -> Result<Vec<ImageEntry>> {
+    ensure!(data.starts_with(b"S25\0"), "not an S25 archive");
+    let count = word(data, 4)? as usize;
+    ensure!(count > 0 && count <= 0xfffff, "invalid S25 entry count");
+    bytes(data, 8, count * 4)?;
+    let mut entries = Vec::new();
+    for index in 0..count {
+        let offset = word(data, 8 + index * 4)? as usize;
+        if offset > 0 && offset <= data.len() {
+            entries.push(ImageEntry {
+                name: format!("{basename}@{index:04}"),
+                index,
+                offset,
+                size: 0,
+            });
+        }
+    }
+    entries.sort_by_key(|entry| entry.offset);
+    for i in 0..entries.len() {
+        let end = entries.get(i + 1).map_or(data.len(), |entry| entry.offset);
+        entries[i].size = end - entries[i].offset;
+    }
+    Ok(entries)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn archive_entries_keep_frame_numbers_and_offset_order() {
+        let mut data = b"S25\0".to_vec();
+        for word in [5u32, 64, 0, 32, 32, 200] {
+            data.extend(word.to_le_bytes());
+        }
+        data.resize(96, 0);
+        let entries = entries(&data, "images").unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|e| (e.name.as_str(), e.offset, e.size))
+                .collect::<Vec<_>>(),
+            [
+                ("images@0002", 32, 0),
+                ("images@0003", 32, 32),
+                ("images@0000", 64, 32)
+            ]
+        );
+        assert!(super::entries(&data[..20], "images").is_err());
+    }
     #[test]
     fn hit_test_checks_row_bounds_and_rejects_zero_runs() {
         let mut data = b"S25\0".to_vec();

@@ -21,15 +21,15 @@ a runnable unpacked EXE. The embedded v2.47/v2.49 `DecodeBin` is located through
 initialization call and rebuilt from both Huffman layers, including runtime tree
 and bit-counter state.
 
-Currently the decryption algorithms and instruction patterns support v2.36,
+Currently the executable recovery instruction patterns support v2.36,
 v2.47, and the tested v2.49 layout. The v2.49 path also recovers the crypt-image
 length from its helper and recognizes an embedded, compressed KM6532 extra-crypt
 program. It extracts the program's 64-byte key and applies its bounded prefix
 and length XOR before decompression; it does not execute the plugin.
 Other compiler layouts, extra-crypt programs, engine versions or packer transforms can fail
 extraction even when the game uses WARC. The supplied v2.36 archives never use the
-second stage, so that recovered profile has no `DecodeBin`; entries requiring it
-report an error. The original optional external `decode.bin` override is not
+second stage, so that recovered profile has no `DecodeBin`. As in GARbro, an absent
+`DecodeBin` makes the second-stage transform a no-op. The original optional external `decode.bin` override is not
 implemented.
 
 The supplied NUKI100 installation passed decoding of every entry in all 103
@@ -102,9 +102,8 @@ The serialized upstream catalog remains unchanged.
 The full upstream catalog does not imply complete support for other games.
 Recognized v2.xx versions now try the available parsers, including versions outside
 the verified v2.36/v2.47/v2.48/v2.49 set. The reported version remains unchanged.
-The reader still requires 16- or 32-byte entry names, valid table sizes, and no
-catalog extra crypt stage. The helper transform follows GARbro's scheme-2390
-threshold. Index size follows the catalog entry-name size.
+All 127 bundled schemes and 16 extra decryptors are supported. Index size and
+transforms follow the WARC version and scheme version.
 
 Unverified EXEs try the existing 32-byte entry layout and decoder recovery.
 Unverified scripts try the modern instruction layout. Their program-info reply

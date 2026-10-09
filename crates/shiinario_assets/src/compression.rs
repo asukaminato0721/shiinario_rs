@@ -1,6 +1,118 @@
 // Ported from GARbro ArcWARC.cs, Copyright (C) 2015-2017 morkt (MIT).
 use anyhow::{Result, bail, ensure};
 
+/// Control words and literals share one cursor. Refill occurs before the next literal.
+pub(crate) struct InterleavedBits<'a> {
+    input: &'a [u8],
+    pos: usize,
+    cache: u32,
+    left: u32,
+    width: u32,
+    lsb: bool,
+}
+impl<'a> InterleavedBits<'a> {
+    pub(crate) fn new(input: &'a [u8], pos: usize, width: u32, lsb: bool) -> Result<Self> {
+        let mut bits = Self {
+            input,
+            pos,
+            cache: 0,
+            left: 0,
+            width,
+            lsb,
+        };
+        bits.fill()?;
+        Ok(bits)
+    }
+    pub(crate) fn position(&self) -> usize {
+        self.pos
+    }
+    pub(crate) fn byte(&mut self) -> Result<u8> {
+        let b = *self
+            .input
+            .get(self.pos)
+            .ok_or_else(|| anyhow::anyhow!("truncated interleaved stream"))?;
+        self.pos += 1;
+        Ok(b)
+    }
+    fn fill(&mut self) -> Result<()> {
+        self.cache = 0;
+        for shift in (0..self.width).step_by(8) {
+            self.cache |= u32::from(self.byte()?) << shift;
+        }
+        self.left = self.width;
+        Ok(())
+    }
+    pub(crate) fn bit(&mut self) -> Result<u32> {
+        self.left -= 1;
+        let bit = if self.lsb {
+            let bit = self.cache & 1;
+            self.cache >>= 1;
+            bit
+        } else {
+            (self.cache >> self.left) & 1
+        };
+        if self.left == 0 {
+            self.fill()?;
+        }
+        Ok(bit)
+    }
+}
+
+pub(crate) fn copy_match(
+    output: &mut [u8],
+    dst: &mut usize,
+    offset: i32,
+    count: usize,
+) -> Result<()> {
+    ensure!(
+        offset < 0 && (-offset) as usize <= *dst,
+        "invalid LZ match offset"
+    );
+    ensure!(
+        count <= output.len().saturating_sub(*dst),
+        "LZ match exceeds output"
+    );
+    let source = *dst - (-offset) as usize;
+    for i in 0..count {
+        output[*dst + i] = output[source + i];
+    }
+    *dst += count;
+    Ok(())
+}
+
+pub(crate) fn ylz16(input: &[u8], length: usize) -> Result<Vec<u8>> {
+    ensure!(length <= MAX_OUTPUT, "YLZ16 output exceeds cap");
+    let input: Vec<_> = input.iter().map(|b| b ^ 0xe6).collect();
+    let mut bits = InterleavedBits::new(&input, 0, 16, true)?;
+    let mut output = vec![0; length];
+    let mut dst = 0;
+    while dst < length {
+        if bits.bit()? != 0 {
+            output[dst] = bits.byte()?;
+            dst += 1;
+        } else {
+            let (offset, count) = if bits.bit()? == 0 {
+                let count = (bits.bit()? * 2 + bits.bit()? + 2) as usize;
+                (i32::from(bits.byte()?) - 0x100, count)
+            } else {
+                let lo = bits.byte()?;
+                let hi = bits.byte()?;
+                let offset = i32::from(lo) | i32::from(hi & !7) << 5 | -0x2000;
+                let count = if hi & 7 == 0 {
+                    let count = bits.byte()? as usize;
+                    ensure!(count != 0, "YLZ16 stream ended before declared output");
+                    count + 9
+                } else {
+                    usize::from(hi & 7) + 2
+                };
+                (offset, count)
+            };
+            copy_match(&mut output, &mut dst, offset, count)?;
+        }
+    }
+    Ok(output)
+}
+
 pub const MAX_OUTPUT: usize = 256 * 1024 * 1024;
 pub fn zlib(input: &[u8], limit: usize) -> Result<Vec<u8>> {
     ensure!(
@@ -226,6 +338,17 @@ pub fn unpack(sig: u32, input: &mut [u8], size: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn forest_ylz16_literal_and_overlapping_matches() {
+        // LSB control: literal A, short match length 5 with distance 1.
+        let data: Vec<_> = [0x19, 0, b'A', 255].iter().map(|b| b ^ 0xe6).collect();
+        assert_eq!(ylz16(&data, 6).unwrap(), b"AAAAAA");
+        assert!(ylz16(&data, 5).is_err());
+        // Literal A, long match length 3 with distance 1.
+        let data: Vec<_> = [5, 0, b'A', 255, 249].iter().map(|b| b ^ 0xe6).collect();
+        assert_eq!(ylz16(&data, 4).unwrap(), b"AAAA");
+        assert!(ylz16(&[0xe6, 0xe6, 0xe6], 2).is_err());
+    }
     #[test]
     fn ylz_literals_and_overlapping_match() {
         let mut encoded = 0xc0000000u32.to_le_bytes().to_vec();

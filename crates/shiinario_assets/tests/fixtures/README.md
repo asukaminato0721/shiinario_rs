@@ -12,3 +12,6 @@ It is synthetic audio generated with:
 ffmpeg -f lavfi -i 'sine=frequency=440:sample_rate=8000:duration=0.05' \
   -c:a libvorbis sine.ogg
 ```
+
+`garbro/` contains synthetic outputs from GARbro revision
+`b09ee4570ccb1daf6ac56710ee8934dc0b8baeb0`. Generators: `tools/garbro_oracle/`.
