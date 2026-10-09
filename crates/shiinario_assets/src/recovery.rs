@@ -46,15 +46,7 @@ pub(crate) struct RecoveredGame {
 pub(crate) fn in_directory(directory: &Path) -> Result<Option<RecoveredGame>> {
     let mut executables = Vec::new();
     let mut profile: Option<Arc<Profile>> = None;
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if !path
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
-            || !fs::is_file(&path)
-        {
-            continue;
-        }
+    for path in fs::executable_paths(directory)? {
         let file = fs::File::open(&path)?;
         if file.metadata()?.len() > MAX_EXE as u64 {
             continue;
@@ -654,6 +646,86 @@ mod tests {
             fixture(0x300, 0x900000, b"20260921"),
         )?;
         assert!(in_directory(&temp.0).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn discovers_nested_executables_and_rejects_conflicting_profiles() -> Result<()> {
+        let temp = Temp::new("nested-discovery")?;
+        let nested = temp.0.join("解析素材&起動用ファイル").join("originals");
+        fs::create_dir_all(&nested)?;
+        fs::write(temp.0.join("SETUP.EXE"), b"unrelated launcher")?;
+        fs::create_dir(temp.0.join("directory.exe"))?;
+        let exe = nested.join("renamed.ExE");
+        let bytes = fixture(0x400, 0x800000, b"20260920");
+        fs::write(&exe, &bytes)?;
+        let expected = from_executable(&bytes)?;
+        assert!(same_profile(
+            &expected,
+            Profile::for_directory(&temp.0)?.as_ref()
+        ));
+        assert!(same_profile(
+            &expected,
+            Profile::for_archive(temp.0.join("anything.WAR"))?.as_ref()
+        ));
+        assert_eq!(in_directory(&temp.0)?.unwrap().executables, vec![exe]);
+        fs::write(temp.0.join("copy.exe"), &bytes)?;
+        assert_eq!(in_directory(&temp.0)?.unwrap().executables.len(), 2);
+        fs::write(
+            nested.join("conflict.exe"),
+            fixture(0x300, 0x900000, b"20260921"),
+        )?;
+        assert!(
+            in_directory(&temp.0)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("ambiguous")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn executable_discovery_skips_directory_symlinks() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let temp = Temp::new("discovery-links")?;
+        let outside = Temp::new("discovery-outside")?;
+        let nested = temp.0.join("nested");
+        fs::create_dir(&nested)?;
+        let exe = temp.0.join("game.exe");
+        fs::write(&exe, fixture(0x400, 0x800000, b"20260920"))?;
+        fs::write(
+            outside.0.join("conflict.exe"),
+            fixture(0x300, 0x900000, b"20260921"),
+        )?;
+        symlink(&temp.0, nested.join("loop"))?;
+        symlink(&outside.0, nested.join("outside.exe"))?;
+        symlink(&exe, nested.join("copy.EXE"))?;
+        symlink(temp.0.join("missing"), nested.join("broken.exe"))?;
+        assert_eq!(
+            in_directory(&temp.0)?.unwrap().executables,
+            vec![exe, nested.join("copy.EXE")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn executable_discovery_limits_directory_depth() -> Result<()> {
+        let temp = Temp::new("discovery-depth")?;
+        let mut nested = temp.0.clone();
+        for _ in 0..31 {
+            nested.push("child");
+        }
+        fs::create_dir_all(&nested)?;
+        assert!(fs::executable_paths(&temp.0)?.is_empty());
+        fs::create_dir(nested.join("child"))?;
+        assert!(
+            fs::executable_paths(&temp.0)
+                .unwrap_err()
+                .to_string()
+                .contains("nesting exceeds limit")
+        );
         Ok(())
     }
 

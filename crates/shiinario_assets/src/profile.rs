@@ -142,7 +142,7 @@ impl Catalog {
         self.profiles.contains_key(title).then_some(title.as_str())
     }
 
-    /// Uses a mapped archive filename first, as GARbro does, then nearby EXEs.
+    /// Uses a mapped archive filename first, then EXEs in the directory tree.
     pub fn for_archive(&self, path: impl AsRef<Path>) -> Result<Arc<Profile>> {
         let path = path.as_ref();
         if let Some(name) = path
@@ -159,7 +159,7 @@ impl Catalog {
         self.detect(directory, false)
     }
 
-    /// Matches archive and executable filenames without reading or executing EXEs.
+    /// Matches root archive names and recursive EXE names without executing EXEs.
     pub fn for_directory(&self, directory: impl AsRef<Path>) -> Result<Arc<Profile>> {
         self.detect(directory.as_ref(), true)
     }
@@ -169,15 +169,7 @@ impl Catalog {
     pub fn game_executables(&self, directory: &Path) -> Result<Vec<std::path::PathBuf>> {
         let selected = self.for_directory(directory)?;
         let mut paths = Vec::new();
-        for entry in fs::read_dir(directory)? {
-            let path = entry?.path();
-            if !fs::is_file(&path)
-                || !path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
-            {
-                continue;
-            }
+        for path in fs::executable_paths(directory)? {
             if let Some(name) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -193,17 +185,20 @@ impl Catalog {
 
     fn detect(&self, directory: &Path, archives: bool) -> Result<Arc<Profile>> {
         let mut matches = BTreeSet::new();
-        for entry in fs::read_dir(directory)
-            .with_context(|| format!("identifying game in {}", directory.display()))?
-        {
-            let path = entry?.path();
-            if !fs::is_file(&path)
-                || !path.extension().is_some_and(|ext| {
-                    ext.eq_ignore_ascii_case("exe") || (archives && ext.eq_ignore_ascii_case("war"))
-                })
-            {
-                continue;
+        let mut paths = fs::executable_paths(directory)?;
+        if archives {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                if fs::is_file(&path)
+                    && path
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("war"))
+                {
+                    paths.push(path);
+                }
             }
+        }
+        for path in paths {
             if let Some(name) = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -214,7 +209,7 @@ impl Catalog {
         }
         ensure!(
             !matches.is_empty(),
-            "cannot identify WARC decryption scheme in {}; keep the original game EXE filenames beside the archives",
+            "cannot identify WARC decryption scheme in {} or its subdirectories. Keep the original game EXE with its original filename in this directory tree",
             directory.display()
         );
         ensure!(
@@ -380,6 +375,31 @@ mod tests {
             &expected,
             &catalog.for_directory(&temp.0).unwrap()
         ));
+        fs::remove_file(temp.0.join("MaPpEd.WaR")).unwrap();
+        let nested = temp.0.join("解析素材&起動用ファイル").join("originals");
+        fs::create_dir_all(&nested).unwrap();
+        // Nested WAR names do not select a scheme for the root archives.
+        fs::write(nested.join("MaPpEd.WaR"), []).unwrap();
+        assert!(catalog.for_directory(&temp.0).is_err());
+        let nested_exe = nested.join("gAmE.eXe");
+        fs::write(&nested_exe, []).unwrap();
+        assert!(Arc::ptr_eq(
+            &expected,
+            &catalog.for_directory(&temp.0).unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            &expected,
+            &catalog.for_archive(temp.0.join("unknown.war")).unwrap()
+        ));
+        assert_eq!(catalog.game_executables(&temp.0).unwrap(), vec![nested_exe]);
+        fs::write(temp.0.join("OTHER.EXE"), []).unwrap();
+        assert!(
+            catalog
+                .for_directory(&temp.0)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous")
+        );
         let mut unsupported = test_support::stream();
         let at = unsupported
             .windows(4)

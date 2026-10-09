@@ -1,8 +1,8 @@
 # Executable recovery and GARbro fallback
 
-The default archive/project loaders first try static recovery from the original
-game EXEs beside the archives. This path does not read `Formats.dat`, use a
-memory dump, launch Wine, or execute/emulate x86 code. It also identifies the EXE
+The default loaders first try static recovery from game EXEs in the game directory
+and its subdirectories. This path does not read `Formats.dat`, use a memory dump,
+launch Wine, or execute/emulate x86 code. It also identifies the EXE
 used for icon lookup. The EXE basename may change; its `.exe` extension is needed
 for directory discovery.
 
@@ -44,16 +44,19 @@ cargo test -p shiinario_assets --release --locked \
 Its title screen and native audio have also been smoke-tested. This establishes
 startup compatibility, not complete gameplay support.
 
-Directory discovery tries every `.exe` (case-insensitive, up to 128 MiB), including
-renamed or patched files. Unsupported candidates are skipped. If none can be
+Directory discovery recursively tries every `.exe` (case-insensitive, up to 128 MiB),
+including renamed or patched files. It skips directory symlinks and allows file
+symlinks. It rejects directory nesting at 32 levels below the game root.
+Unsupported candidates are skipped. If none can be
 extracted, the existing catalog filename detection described below is used.
 Multiple EXEs with identical recovered profiles are accepted; different profiles
 produce an ambiguity error. Direct `Catalog` APIs still explicitly use the
 catalog; `Profile::from_executable` explicitly requires recovery.
 
 Tests use synthetic PEs with different raw offsets and image bases, changed key
-data, unrelated EXEs and conflicting profiles. The original-game regression
-compares every archive entry against the catalog path, then checks detection
+data, unrelated EXEs and conflicting profiles. Discovery tests cover nested EXEs,
+directory symlink loops, file symlinks and the directory depth limit.
+The original-game regression compares every archive entry against the catalog path, then checks detection
 with arbitrary EXE names, modified timestamps and appended overlays. No original
 game bytes are committed.
 Run it locally with paths to the original EXEs:
@@ -86,10 +89,11 @@ data only and does not instantiate .NET classes. Validated profiles are cached
 and shared between archives; other formats are discarded. No external catalog, Python, .NET runtime,
 or GARbro installation is required to build or run the engine.
 
-In the fallback path, the game directory is identified from its original `.exe` and `.war` filenames
-using `GameMap`, without reading or executing the EXEs. Direct archive access
-checks the archive filename first, then EXEs beside it, as GARbro does. Matching
-is case-insensitive. Missing or ambiguous matches produce an error. Keep the
+In the fallback path, `GameMap` identifies the game from original `.exe` filenames
+in the directory tree and `.war` filenames in the game directory. This path does
+not read or execute the EXEs. Direct archive access checks the archive filename
+first, then EXEs in its directory and subdirectories. Matching is case-insensitive.
+Missing or ambiguous matches produce an error. Keep the
 original filenames; there is no fallback game. One explicit mapping correction
 connects `wana.exe` to the existing `Wana ~Hakudaku Mamire no Houkago~` scheme,
 which the pinned catalog contains without a corresponding `GameMap` entry.

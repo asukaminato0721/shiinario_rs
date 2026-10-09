@@ -15,12 +15,13 @@ plus FreeBSD x86_64. The GitHub Actions workflow uploads archives containing
 `shiinario_engine` and `shiinario_tool` and refreshes the rolling `pre-release`
 GitHub release after all builds succeed. Tag pushes do not run the workflow.
 
-The runtime first tries to recover WARC decryption data from every EXE beside
-the archives, regardless of its basename, hash or exact file size. It recognizes
+The runtime first tries to recover WARC decryption data from EXEs in the game
+directory and its subdirectories. It does not require a specific basename, hash,
+or file size. It recognizes
 supported PE/code patterns, including the verified Crackproof byte transform,
-without executing Windows code or loading `Formats.dat`. Keep the game EXE beside
-the archives. If extraction fails, the bundled GARbro catalog and its filename
-mappings are used. See the
+without executing Windows code or loading `Formats.dat`. Directory symlinks are
+not followed. If extraction fails, the bundled GARbro catalog matches EXE filenames
+in the same directory tree and archive filenames in the game directory. See the
 [recovery and catalog documentation](crates/shiinario_assets/data/garbro/README.md)
 for supported patterns and limitations.
 
