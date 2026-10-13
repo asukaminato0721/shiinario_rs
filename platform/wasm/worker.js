@@ -38,8 +38,15 @@ function tick() {
       audioFrames += count;
     }
     if (!running) { stop(); return; }
-    timer = setTimeout(tick, 1);
+    const now = Math.floor(performance.now() - started - paused);
+    // Audio needs regular refills even when the script waits for a long timer.
+    timer = setTimeout(tick, Math.max(1, Math.min(20, player.next_wake_delay_ms(now))));
   } catch (error) { stop(error); }
+}
+function wake() {
+  if (!visible || !player) return;
+  clearTimeout(timer);
+  timer = setTimeout(tick, 0);
 }
 onmessage = async ({ data }) => {
   try {
@@ -59,10 +66,10 @@ onmessage = async ({ data }) => {
         tick();
         break;
       }
-      case 'pointer': player?.pointer(data.x, data.y, data.button, data.pressed); break;
-      case 'key': player?.key(data.scan, data.vk, data.pressed, data.text); break;
+      case 'pointer': player?.pointer(data.x, data.y, data.button, data.pressed); wake(); break;
+      case 'key': player?.key(data.scan, data.vk, data.pressed, data.text); wake(); break;
       case 'clock': audioClock = data.time; break;
-      case 'focus': player?.focus(data.focused); break;
+      case 'focus': player?.focus(data.focused); wake(); break;
       case 'visibility':
         if (visible === data.visible) break;
         visible = data.visible;

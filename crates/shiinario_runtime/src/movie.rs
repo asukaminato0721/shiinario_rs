@@ -346,6 +346,21 @@ pub struct Movies {
     slots: BTreeMap<u32, Movie>,
 }
 impl Movies {
+    /// Return the next frame or playback completion delay for active movies.
+    pub fn next_wake_delay_ms(&self, now: u32) -> Option<u32> {
+        self.slots
+            .values()
+            .filter(|movie| movie.state == PLAYING)
+            .map(|movie| {
+                let position = movie.position_ms + u64::from(now.wrapping_sub(movie.clock_ms));
+                let deadline = movie.video.next.as_ref().map_or_else(
+                    || movie.video.end_us.div_ceil(1000).max(movie.audio_end_ms()),
+                    |(time, _)| time.div_ceil(1000),
+                );
+                deadline.saturating_sub(position).min(u64::from(u32::MAX)) as u32
+            })
+            .min()
+    }
     pub fn update(&mut self, host: &mut impl Host, resources: &mut Resources) -> Result<()> {
         if !self.slots.values().any(|m| m.state == PLAYING) {
             return Ok(());

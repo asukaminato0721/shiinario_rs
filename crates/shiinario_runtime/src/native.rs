@@ -4,7 +4,7 @@ use crate::{
     input::{AsyncKeys, ControlState},
     presentation::Presentation,
     resources::{AudioStream, Sound},
-    session::{Host, Session},
+    session::{Host, Session, SessionState},
     viewport::ViewportTransform,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -508,19 +508,7 @@ impl ApplicationHandler for App<'_> {
         // Bound interpreter work so input and close events stay responsive.
         let deadline = Instant::now() + Duration::from_millis(4);
         for _ in 0..10000 {
-            let mut timer_wait = false;
-            let result = self.session.step(self.project, host, |event| {
-                if matches!(
-                    event,
-                    Event::Platform {
-                        request: PlatformRequest::WaitTaskTimer { .. },
-                        ..
-                    }
-                ) {
-                    timer_wait = true;
-                } else if matches!(event, Event::PlatformReply { value: 1, .. }) {
-                    timer_wait = false;
-                }
+            let result = self.session.resume(self.project, host, |event| {
                 if matches!(
                     event,
                     Event::BinaryInstruction { .. }
@@ -534,8 +522,9 @@ impl ApplicationHandler for App<'_> {
                 Ok(())
             });
             match result {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(SessionState::Runnable) => {}
+                Ok(SessionState::Waiting { .. }) => break,
+                Ok(SessionState::Ended) => {
                     event_loop.exit();
                     return;
                 }
@@ -544,16 +533,21 @@ impl ApplicationHandler for App<'_> {
                     return;
                 }
             }
-            if timer_wait || Instant::now() >= deadline {
+            if Instant::now() >= deadline {
                 break;
             }
         }
         if host.dirty {
             host.window.request_redraw();
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(
-            Instant::now() + Duration::from_millis(1),
-        ));
+        let now = Instant::now();
+        let elapsed = host.started.elapsed().as_millis() as u32;
+        let delay = self.session.next_wake_delay_ms(elapsed).unwrap_or(0).max(1);
+        let mut wake = now + Duration::from_millis(u64::from(delay));
+        if let Some(limit) = self.options.run_for {
+            wake = wake.min(host.started + limit);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
     }
 }
 

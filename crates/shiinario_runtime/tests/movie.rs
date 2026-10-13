@@ -81,6 +81,47 @@ fn command(m: &mut Movies, r: &mut Resources, h: &mut TestHost, c: Cmd) -> u32 {
 }
 
 #[test]
+fn movie_deadlines_advance_frames_and_completion_without_millisecond_polling() {
+    let (mut movies, mut resources, mut host) = setup(false);
+    let first = resources
+        .surface_memory(13)
+        .unwrap()
+        .read(0, 32 * 24 * 3)
+        .unwrap();
+    let mut updates = 0;
+    while let Some(delay) = movies.next_wake_delay_ms(host.clock) {
+        assert!(delay > 0, "the previous update must consume all due frames");
+        assert!(updates < 100, "the movie must reach completion");
+        host.clock = host.clock.wrapping_add(delay);
+        movies.update(&mut host, &mut resources).unwrap();
+        updates += 1;
+    }
+    assert!(updates > 0 && updates < 30);
+    assert_eq!(
+        command(&mut movies, &mut resources, &mut host, Cmd::Status),
+        0x20d
+    );
+    assert_ne!(
+        resources
+            .surface_memory(13)
+            .unwrap()
+            .read(0, 32 * 24 * 3)
+            .unwrap(),
+        first
+    );
+
+    host.clock = u32::MAX - 10;
+    command(&mut movies, &mut resources, &mut host, Cmd::Play);
+    let delay = movies.next_wake_delay_ms(host.clock).unwrap();
+    host.clock = host.clock.wrapping_add(delay);
+    assert_eq!(movies.next_wake_delay_ms(host.clock), Some(0));
+    movies.update(&mut host, &mut resources).unwrap();
+    assert!(movies.next_wake_delay_ms(host.clock).unwrap() > 0);
+    command(&mut movies, &mut resources, &mut host, Cmd::Pause);
+    assert_eq!(movies.next_wake_delay_ms(host.clock), None);
+}
+
+#[test]
 fn decode_audio_present_pause_seek_restart_and_stop() {
     let (mut m, mut r, mut h) = setup(false);
     assert_eq!(m.dimensions(0).unwrap(), [32, 24]);

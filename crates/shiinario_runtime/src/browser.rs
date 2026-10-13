@@ -3,12 +3,12 @@ use crate::{
     audio::Mixer,
     input::{AsyncKeys, ControlState},
     resources::{AudioStream, Sound},
-    session::{Host, Session},
+    session::{Host, Session, SessionState},
     viewport::ViewportTransform,
 };
 use anyhow::{Result, bail};
 use shiinario_assets::project::Project;
-use shiinario_scenario::{Event, MouseButtonMapping, PlatformRequest, SoundCommand};
+use shiinario_scenario::{MouseButtonMapping, PlatformRequest, SoundCommand};
 use std::sync::Arc;
 use wasm_bindgen::prelude::*;
 
@@ -197,26 +197,22 @@ impl BrowserPlayer {
             return Ok(false);
         }
         self.host.elapsed = elapsed_ms;
+        if self
+            .session
+            .next_wake_delay_ms(elapsed_ms)
+            .is_some_and(|delay| delay > 0)
+        {
+            return Ok(true);
+        }
         let deadline = browser_now() + 4.0;
         for _ in 0..10000 {
-            let mut waiting = false;
-            let result = self.session.step(&self.project, &mut self.host, |event| {
-                if matches!(
-                    event,
-                    Event::Platform {
-                        request: PlatformRequest::WaitTaskTimer { .. },
-                        ..
-                    }
-                ) {
-                    waiting = true;
-                } else if matches!(event, Event::PlatformReply { value: 1, .. }) {
-                    waiting = false;
-                }
-                Ok(())
-            });
+            let result = self
+                .session
+                .resume(&self.project, &mut self.host, |_| Ok(()));
             match result {
-                Ok(true) => {}
-                Ok(false) => {
+                Ok(SessionState::Runnable) => {}
+                Ok(SessionState::Waiting { .. }) => break,
+                Ok(SessionState::Ended) => {
                     self.stopped = true;
                     return Ok(false);
                 }
@@ -229,11 +225,15 @@ impl BrowserPlayer {
                     ))));
                 }
             }
-            if waiting || browser_now() >= deadline {
+            if browser_now() >= deadline {
                 break;
             }
         }
         Ok(true)
+    }
+    /// The worker can sleep until this delay, subject to its audio deadline.
+    pub fn next_wake_delay_ms(&self, elapsed_ms: u32) -> u32 {
+        self.session.next_wake_delay_ms(elapsed_ms).unwrap_or(0)
     }
     pub fn frame(&mut self) -> Vec<u8> {
         if !self.host.dirty {

@@ -28,10 +28,19 @@ pub trait Host {
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()>;
 }
 
+/// A session resumes until one event completes or a timer blocks execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionState {
+    Runnable,
+    Waiting { epoch: u32, duration: u32 },
+    Ended,
+}
+
 pub struct Session {
     vm: BinaryVm,
     resources: Resources,
     movies: crate::movie::Movies,
+    state: SessionState,
 }
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
@@ -53,6 +62,7 @@ impl Session {
             vm,
             resources: Resources::for_project(project)?,
             movies: Default::default(),
+            state: SessionState::Runnable,
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -76,6 +86,33 @@ impl Session {
         }
         Ok(())
     }
+    /// Resume the session without changing the VM's task order or quantum.
+    pub fn resume(
+        &mut self,
+        project: &Project,
+        host: &mut impl Host,
+        emit: impl FnMut(&Event) -> Result<()>,
+    ) -> Result<SessionState> {
+        self.step(project, host, emit)?;
+        Ok(self.state)
+    }
+    /// Return the delay until script or movie execution can advance.
+    /// The clock uses the host's wrapping u32 millisecond time.
+    /// Input loops remain runnable because bytecode can inspect shared state.
+    pub fn next_wake_delay_ms(&self, now: u32) -> Option<u32> {
+        match self.state {
+            SessionState::Runnable => Some(0),
+            SessionState::Waiting { epoch, duration } => {
+                let delay = duration.saturating_sub(now.wrapping_sub(epoch));
+                Some(
+                    self.movies
+                        .next_wake_delay_ms(now)
+                        .map_or(delay, |movie| delay.min(movie)),
+                )
+            }
+            SessionState::Ended => None,
+        }
+    }
     /// Execute one scheduler event. False means the game has ended.
     pub fn step(
         &mut self,
@@ -83,6 +120,7 @@ impl Session {
         host: &mut impl Host,
         mut emit: impl FnMut(&Event) -> Result<()>,
     ) -> Result<bool> {
+        self.state = SessionState::Runnable;
         let vm = &mut self.vm;
         for [message, wparam, lparam] in host.take_window_messages() {
             vm.window_message(message, wparam, lparam);
@@ -135,6 +173,7 @@ impl Session {
         }
         if matches!(event, Event::End) {
             self.movies.stop_all(host)?;
+            self.state = SessionState::Ended;
             return Ok(false);
         }
         if let Event::Platform { location, request } = event {
@@ -578,6 +617,11 @@ impl Session {
                 simulated: resource_reply.is_none() && host.simulated(),
             })?;
             vm.respond(value)?;
+            if let PlatformRequest::WaitTaskTimer { epoch, duration } = request
+                && value == 0
+            {
+                self.state = SessionState::Waiting { epoch, duration };
+            }
         }
         Ok(true)
     }
