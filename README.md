@@ -50,10 +50,12 @@ while compressed input and decoded audio are retained under a memory budget.
 The independent movie regression suite runs with
 `cargo test -p shiinario_runtime --test movie --locked` and uses a synthetic clip.
 
-Native and browser hosts resume the shared session with explicit runnable,
-timer-wait and ended states. During a timer wait, the next script or movie
-deadline determines when execution resumes. VM task order and dispatch quantum
-remain explicit. Each host limits an execution slice to 4 ms or 10,000 events.
+Native and browser hosts resume a shared main coroutine through `resume_main`.
+The coroutine advances the session and yields on timer waits or execution
+budgets. It ends when the game ends. Each slice permits 4 ms or 10,000 events.
+During a timer wait, the next script or movie deadline determines the next wake.
+Early timer wakes do not execute the VM. Input wakes deliver window messages
+before the deadline. VM task order and dispatch quantum remain explicit.
 The browser also refills audio at intervals of at most 20 ms and schedules an
 early wake when input arrives. Bytecode input loops remain runnable.
 Scheduler regressions run with

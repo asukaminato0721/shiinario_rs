@@ -2297,6 +2297,7 @@ dependencies = [
 name = "shiinario_core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde",
 ]
 
@@ -2320,6 +2321,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shiinario_assets",
+ "shiinario_core",
  "shiinario_scenario",
  "wasm-bindgen",
  "wgpu",

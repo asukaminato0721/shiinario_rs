@@ -10,16 +10,16 @@ use std::{
 };
 
 #[derive(Debug)]
-pub(crate) enum Resume<Y> {
+pub enum Resume<Y> {
     Yielded(Y),
     Complete,
 }
 
-pub(crate) struct Co<Y> {
+pub struct Co<Y> {
     yielded: Rc<RefCell<Option<Y>>>,
 }
 impl<Y> Co<Y> {
-    pub(crate) async fn yield_(&self, value: Y) {
+    pub async fn yield_(&self, value: Y) {
         let mut value = Some(value);
         poll_fn(|_| {
             if let Some(value) = value.take() {
@@ -33,14 +33,12 @@ impl<Y> Co<Y> {
     }
 }
 
-pub(crate) struct Coroutine<Y> {
+pub struct Coroutine<Y> {
     future: Option<Pin<Box<dyn Future<Output = Result<()>>>>>,
     yielded: Rc<RefCell<Option<Y>>>,
 }
 impl<Y: 'static> Coroutine<Y> {
-    pub(crate) fn new<F: Future<Output = Result<()>> + 'static>(
-        body: impl FnOnce(Co<Y>) -> F,
-    ) -> Self {
+    pub fn new<F: Future<Output = Result<()>> + 'static>(body: impl FnOnce(Co<Y>) -> F) -> Self {
         let yielded = Rc::new(RefCell::new(None));
         let future = body(Co {
             yielded: yielded.clone(),
@@ -51,7 +49,7 @@ impl<Y: 'static> Coroutine<Y> {
         }
     }
 
-    pub(crate) fn resume(&mut self) -> Result<Resume<Y>> {
+    pub fn resume(&mut self) -> Result<Resume<Y>> {
         let future = self
             .future
             .as_mut()

@@ -30,7 +30,7 @@ async function worker(delay) {
     FileReaderSync: class {},
     DirectoryFs: class { install() {} },
     BrowserPlayer: class {
-      step() { steps++; return true; }
+      resume() { steps++; return true; }
       next_wake_delay_ms() { return delay; }
       frame() { return new Uint8Array(); }
       audio(count) { return new Float32Array(count * 2); }

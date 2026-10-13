@@ -1,5 +1,8 @@
 //! Shared scenario execution and resource handling for traces and native hosts.
-use crate::resources::{AudioStream, Resources, Sound, Surface};
+use crate::{
+    main_loop::{MainLoop, StepReply},
+    resources::{AudioStream, Resources, Sound, Surface},
+};
 use anyhow::{Context, Result, bail, ensure};
 use sha2::{Digest, Sha256};
 use shiinario_assets::project::Project;
@@ -36,11 +39,19 @@ pub enum SessionState {
     Ended,
 }
 
+/// Input wakes may run before a timer expires to deliver window messages.
+#[derive(Clone, Copy, Debug)]
+pub enum Wake {
+    Deadline(u32),
+    Input,
+}
+
 pub struct Session {
     vm: BinaryVm,
     resources: Resources,
     movies: crate::movie::Movies,
     state: SessionState,
+    main_loop: Option<MainLoop>,
 }
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
@@ -63,6 +74,7 @@ impl Session {
             resources: Resources::for_project(project)?,
             movies: Default::default(),
             state: SessionState::Runnable,
+            main_loop: Some(MainLoop::new()),
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -95,6 +107,36 @@ impl Session {
     ) -> Result<SessionState> {
         self.step(project, host, emit)?;
         Ok(self.state)
+    }
+    /// Resume the main coroutine until a timer, execution budget or end yields.
+    /// Check the host's time budget after each runnable event.
+    /// Deadline wakes leave the VM untouched until a script or movie is due.
+    pub fn resume_main(
+        &mut self,
+        project: &Project,
+        host: &mut impl Host,
+        wake: Wake,
+        mut emit: impl FnMut(&Event) -> Result<()>,
+        mut budget_expired: impl FnMut() -> bool,
+    ) -> Result<SessionState> {
+        if self.state == SessionState::Ended {
+            return Ok(SessionState::Ended);
+        }
+        if let Wake::Deadline(now) = wake
+            && self.next_wake_delay_ms(now).is_some_and(|delay| delay > 0)
+        {
+            return Ok(self.state);
+        }
+        let mut main_loop = self.main_loop.take().context("missing main coroutine")?;
+        let result = main_loop.resume(|| {
+            let state = self.resume(project, host, &mut emit)?;
+            Ok(StepReply {
+                state,
+                budget_expired: state == SessionState::Runnable && budget_expired(),
+            })
+        });
+        self.main_loop = Some(main_loop);
+        result
     }
     /// Return the delay until script or movie execution can advance.
     /// The clock uses the host's wrapping u32 millisecond time.

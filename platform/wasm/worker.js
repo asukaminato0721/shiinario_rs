@@ -26,7 +26,7 @@ function tick() {
   try {
     if (!visible || !player) return;
     const elapsed = performance.now() - started - paused;
-    const running = player.step(Math.floor(elapsed));
+    const running = player.resume(Math.floor(elapsed));
     const frame = player.frame();
     if (frame.length) postMessage({ type: 'frame', frame }, [frame.buffer]);
     // Keep at most 80 ms queued, bounded independently of interpreter speed.

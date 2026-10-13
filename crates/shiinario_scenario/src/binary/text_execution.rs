@@ -1,9 +1,7 @@
 //! A coroutine for the original flag-8 text scheduler path.
 use super::*;
-use crate::{
-    coroutine::{Co, Coroutine, Resume},
-    text_layout::TextLayout,
-};
+use crate::text_layout::TextLayout;
+use shiinario_core::coroutine::{Co, Coroutine, Resume};
 use std::{cell::RefCell, rc::Rc};
 
 type VmOperation = Box<dyn FnOnce(&mut BinaryVm)>;
@@ -43,7 +41,9 @@ impl AsyncText {
     }
 }
 
-impl Co<TextYield> {
+struct TextCo(Co<TextYield>);
+
+impl TextCo {
     // VM access ends before the coroutine suspends. No VM borrow spans an await.
     async fn with_vm<T: 'static>(
         &self,
@@ -51,10 +51,11 @@ impl Co<TextYield> {
     ) -> Result<T> {
         let result = Rc::new(RefCell::new(None));
         let reply = result.clone();
-        self.yield_(TextYield::WithVm(Box::new(move |vm| {
-            *reply.borrow_mut() = Some(operation(vm));
-        })))
-        .await;
+        self.0
+            .yield_(TextYield::WithVm(Box::new(move |vm| {
+                *reply.borrow_mut() = Some(operation(vm));
+            })))
+            .await;
         result
             .borrow_mut()
             .take()
@@ -72,15 +73,16 @@ impl Co<TextYield> {
     ) -> Result<u32> {
         let result = Rc::new(RefCell::new(None));
         let reply = result.clone();
-        self.yield_(TextYield::Platform {
-            request: Box::new(request),
-            reply: Box::new(move |vm, value| {
-                commit(vm, value)?;
-                *reply.borrow_mut() = Some(value);
-                Ok(())
-            }),
-        })
-        .await;
+        self.0
+            .yield_(TextYield::Platform {
+                request: Box::new(request),
+                reply: Box::new(move |vm, value| {
+                    commit(vm, value)?;
+                    *reply.borrow_mut() = Some(value);
+                    Ok(())
+                }),
+            })
+            .await;
         let value = result
             .borrow_mut()
             .take()
@@ -92,6 +94,7 @@ impl Co<TextYield> {
 // The compiler retains local variables and the execution position across awaits.
 // Each outer iteration is one original text scheduler pass.
 async fn run_text(co: Co<TextYield>) -> Result<()> {
+    let co = TextCo(co);
     let mut timed = true;
     loop {
         if co.with_vm(|vm| Ok(vm.text_style.skip_mask != 0)).await? {
@@ -135,7 +138,7 @@ async fn run_text(co: Co<TextYield>) -> Result<()> {
                     })
                     .await?;
                 if waiting {
-                    co.yield_(TextYield::Tick).await;
+                    co.0.yield_(TextYield::Tick).await;
                     break;
                 }
                 co.request_with_reply(PlatformRequest::ClockMilliseconds, |vm, now| {
@@ -167,7 +170,7 @@ async fn run_text(co: Co<TextYield>) -> Result<()> {
                     .with_vm(|vm| Ok(vm.text_style.character_delay != 0))
                     .await?
             {
-                co.yield_(TextYield::Tick).await;
+                co.0.yield_(TextYield::Tick).await;
                 break;
             }
         }

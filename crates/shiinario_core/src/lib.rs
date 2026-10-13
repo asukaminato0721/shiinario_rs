@@ -1,4 +1,6 @@
 //! Version selection shared by configuration, archive decoding and the VM.
+pub mod coroutine;
+
 use serde::{Serialize, Serializer};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]

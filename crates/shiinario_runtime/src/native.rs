@@ -4,7 +4,7 @@ use crate::{
     input::{AsyncKeys, ControlState},
     presentation::Presentation,
     resources::{AudioStream, Sound},
-    session::{Host, Session, SessionState},
+    session::{Host, Session, SessionState, Wake},
     viewport::ViewportTransform,
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -118,6 +118,7 @@ struct NativeHost {
     streams_started: usize,
     text_key: bool,
     window_messages: Vec<[u32; 3]>,
+    wake_input: bool,
 }
 impl NativeHost {
     fn key(&mut self, virtual_key: usize, pressed: bool) {
@@ -353,6 +354,7 @@ impl App<'_> {
             streams_started: 0,
             text_key: false,
             window_messages: Vec::new(),
+            wake_input: false,
         });
         self.presentation = Some(presentation);
         Ok(())
@@ -400,6 +402,15 @@ impl ApplicationHandler for App<'_> {
         let Some(presentation) = &mut self.presentation else {
             return;
         };
+        if matches!(
+            &event,
+            WindowEvent::Focused(_)
+                | WindowEvent::PointerMoved { .. }
+                | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::PointerButton { .. }
+        ) {
+            host.wake_input = true;
+        }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::SurfaceResized(size) => {
@@ -505,10 +516,18 @@ impl ApplicationHandler for App<'_> {
             event_loop.exit();
             return;
         }
-        // Bound interpreter work so input and close events stay responsive.
+        // The shared coroutine bounds interpreter work and yields to the host.
         let deadline = Instant::now() + Duration::from_millis(4);
-        for _ in 0..10000 {
-            let result = self.session.resume(self.project, host, |event| {
+        let wake = if std::mem::take(&mut host.wake_input) {
+            Wake::Input
+        } else {
+            Wake::Deadline(host.started.elapsed().as_millis() as u32)
+        };
+        let result = self.session.resume_main(
+            self.project,
+            host,
+            wake,
+            |event| {
                 if matches!(
                     event,
                     Event::BinaryInstruction { .. }
@@ -520,21 +539,18 @@ impl ApplicationHandler for App<'_> {
                     self.instructions += 1;
                 }
                 Ok(())
-            });
-            match result {
-                Ok(SessionState::Runnable) => {}
-                Ok(SessionState::Waiting { .. }) => break,
-                Ok(SessionState::Ended) => {
-                    event_loop.exit();
-                    return;
-                }
-                Err(error) => {
-                    self.fail(event_loop, error);
-                    return;
-                }
+            },
+            || Instant::now() >= deadline,
+        );
+        match result {
+            Ok(SessionState::Runnable | SessionState::Waiting { .. }) => {}
+            Ok(SessionState::Ended) => {
+                event_loop.exit();
+                return;
             }
-            if Instant::now() >= deadline {
-                break;
+            Err(error) => {
+                self.fail(event_loop, error);
+                return;
             }
         }
         if host.dirty {

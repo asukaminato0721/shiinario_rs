@@ -2,7 +2,7 @@ use anyhow::{Result, bail};
 use shiinario_assets::project::Project;
 use shiinario_runtime::{
     resources::{AudioStream, Sound},
-    session::{Host, Session, SessionState},
+    session::{Host, Session, SessionState, Wake},
 };
 use shiinario_scenario::{Event, PlatformRequest, SoundCommand};
 use std::{
@@ -50,18 +50,27 @@ impl Drop for Game {
     }
 }
 
+#[derive(Default)]
 struct TestHost {
     now: u32,
     invalidates: usize,
+    requests: usize,
+    polls: usize,
+    messages: Vec<[u32; 3]>,
 }
 impl Host for TestHost {
+    fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
+        std::mem::take(&mut self.messages)
+    }
     fn simulated(&self) -> bool {
         true
     }
     fn poll(&mut self) -> Result<()> {
+        self.polls += 1;
         Ok(())
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
+        self.requests += 1;
         match request {
             PlatformRequest::ClockMilliseconds => Ok(self.now),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {
@@ -102,7 +111,7 @@ fn resume_preserves_timer_blocking_and_execution_across_clock_wrap() {
         let mut session = Session::new(&project, "wait.scn").unwrap();
         let mut host = TestHost {
             now: epoch,
-            invalidates: 0,
+            ..Default::default()
         };
         let mut mapped = false;
         assert_eq!(session.next_wake_delay_ms(epoch), Some(0));
@@ -184,7 +193,7 @@ fn movies_continue_while_script_waits_without_releasing_the_task() {
     let mut session = Session::new(&project, "wait.scn").unwrap();
     let mut host = TestHost {
         now: 0,
-        invalidates: 0,
+        ..Default::default()
     };
     let mut mapped = false;
     let mut ended = false;
@@ -192,13 +201,19 @@ fn movies_continue_while_script_waits_without_releasing_the_task() {
     for _ in 0..100 {
         let now = host.now;
         let state = session
-            .resume(&project, &mut host, |event| {
-                if matches!(event, Event::MouseButtonMapping { value: 42, .. }) {
-                    assert_eq!(now, 1000);
-                    mapped = true;
-                }
-                Ok(())
-            })
+            .resume_main(
+                &project,
+                &mut host,
+                Wake::Deadline(now),
+                |event| {
+                    if matches!(event, Event::MouseButtonMapping { value: 42, .. }) {
+                        assert_eq!(now, 1000);
+                        mapped = true;
+                    }
+                    Ok(())
+                },
+                || false,
+            )
             .unwrap();
         if state == SessionState::Ended {
             ended = true;
@@ -217,4 +232,148 @@ fn movies_continue_while_script_waits_without_releasing_the_task() {
     assert!(mapped && ended);
     assert!(wakes > 1 && wakes < 30);
     assert!(host.invalidates > 1);
+}
+
+#[test]
+fn main_coroutine_preserves_single_step_events_with_different_slice_budgets() {
+    let game = Game::new();
+    let project = Project::open(&game.0).unwrap();
+    for epoch in [50, u32::MAX - 49] {
+        let trace = |slice_budget: Option<usize>| {
+            let mut session = Session::new(&project, "wait.scn").unwrap();
+            let mut host = TestHost {
+                now: epoch,
+                ..Default::default()
+            };
+            let mut events = Vec::new();
+            for _ in 0..100 {
+                let state = if let Some(budget) = slice_budget {
+                    let now = host.now;
+                    let mut processed = 0;
+                    session
+                        .resume_main(
+                            &project,
+                            &mut host,
+                            Wake::Deadline(now),
+                            |event| {
+                                events.push(event.clone());
+                                Ok(())
+                            },
+                            || {
+                                processed += 1;
+                                processed >= budget
+                            },
+                        )
+                        .unwrap()
+                } else {
+                    session
+                        .resume(&project, &mut host, |event| {
+                            events.push(event.clone());
+                            Ok(())
+                        })
+                        .unwrap()
+                };
+                match state {
+                    SessionState::Ended => return events,
+                    SessionState::Waiting { .. } => {
+                        host.now = host
+                            .now
+                            .wrapping_add(session.next_wake_delay_ms(host.now).unwrap());
+                    }
+                    SessionState::Runnable => {}
+                }
+            }
+            panic!("session did not end");
+        };
+        let reference = trace(None);
+        for budget in [1, 3, 10_000] {
+            assert_eq!(trace(Some(budget)), reference, "slice budget {budget}");
+        }
+    }
+}
+
+#[test]
+fn main_coroutine_skips_early_deadlines_but_delivers_input_messages() {
+    let game = Game::new();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost {
+        now: 50,
+        ..Default::default()
+    };
+    let waiting = SessionState::Waiting {
+        epoch: 50,
+        duration: 100,
+    };
+    assert_eq!(
+        session
+            .resume_main(
+                &project,
+                &mut host,
+                Wake::Deadline(50),
+                |_| Ok(()),
+                || false,
+            )
+            .unwrap(),
+        waiting
+    );
+
+    let calls = (host.polls, host.requests);
+    for now in [51, 99, 149] {
+        host.now = now;
+        let state = session
+            .resume_main(
+                &project,
+                &mut host,
+                Wake::Deadline(now),
+                |_| panic!("early timer executed the VM"),
+                || panic!("early timer checked the execution budget"),
+            )
+            .unwrap();
+        assert_eq!(state, waiting);
+        assert_eq!((host.polls, host.requests), calls);
+    }
+    // The message must reach the VM even though the task timer is not due.
+    host.messages.push([0x10, 0, 0]);
+    session
+        .resume_main(&project, &mut host, Wake::Input, |_| Ok(()), || false)
+        .unwrap();
+    assert!(host.messages.is_empty());
+    assert!(host.requests > calls.1);
+
+    host.now = 150;
+    let mut mapped = false;
+    assert_eq!(
+        session
+            .resume_main(
+                &project,
+                &mut host,
+                Wake::Deadline(150),
+                |event| {
+                    mapped |= matches!(event, Event::MouseButtonMapping { .. });
+                    Ok(())
+                },
+                || false,
+            )
+            .unwrap(),
+        SessionState::Ended
+    );
+    assert!(
+        !mapped,
+        "the queued close must end the session before the next instruction"
+    );
+    let calls = (host.polls, host.requests);
+    assert_eq!(
+        session
+            .resume_main(
+                &project,
+                &mut host,
+                Wake::Input,
+                |_| panic!("ended session emitted another event"),
+                || false,
+            )
+            .unwrap(),
+        SessionState::Ended
+    );
+    assert_eq!((host.polls, host.requests), calls);
 }

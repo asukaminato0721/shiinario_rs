@@ -3,7 +3,7 @@ use crate::{
     audio::Mixer,
     input::{AsyncKeys, ControlState},
     resources::{AudioStream, Sound},
-    session::{Host, Session, SessionState},
+    session::{Host, Session, SessionState, Wake},
     viewport::ViewportTransform,
 };
 use anyhow::{Result, bail};
@@ -37,6 +37,7 @@ struct BrowserHost {
     audio: Mixer,
     text_key: bool,
     window_messages: Vec<[u32; 3]>,
+    wake_input: bool,
 }
 impl Host for BrowserHost {
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
@@ -186,50 +187,45 @@ impl BrowserPlayer {
                     audio: Mixer::default(),
                     text_key: false,
                     window_messages: Vec::new(),
+                    wake_input: false,
                 },
             })
         };
         create().map_err(js_error)
     }
-    /// Advance a bounded slice; the worker schedules another slice after yielding.
-    pub fn step(&mut self, elapsed_ms: u32) -> std::result::Result<bool, JsValue> {
+    /// Resume the main coroutine. The worker schedules its next wake.
+    pub fn resume(&mut self, elapsed_ms: u32) -> std::result::Result<bool, JsValue> {
         if self.stopped {
             return Ok(false);
         }
         self.host.elapsed = elapsed_ms;
-        if self
-            .session
-            .next_wake_delay_ms(elapsed_ms)
-            .is_some_and(|delay| delay > 0)
-        {
-            return Ok(true);
-        }
         let deadline = browser_now() + 4.0;
-        for _ in 0..10000 {
-            let result = self
-                .session
-                .resume(&self.project, &mut self.host, |_| Ok(()));
-            match result {
-                Ok(SessionState::Runnable) => {}
-                Ok(SessionState::Waiting { .. }) => break,
-                Ok(SessionState::Ended) => {
-                    self.stopped = true;
-                    return Ok(false);
-                }
-                Err(error) => {
-                    self.stopped = true;
-                    return Err(js_error(error.context(format!(
-                        "{}:{:#x}",
-                        self.session.location().scenario,
-                        self.session.location().offset
-                    ))));
-                }
+        let wake = if std::mem::take(&mut self.host.wake_input) {
+            Wake::Input
+        } else {
+            Wake::Deadline(elapsed_ms)
+        };
+        match self.session.resume_main(
+            &self.project,
+            &mut self.host,
+            wake,
+            |_| Ok(()),
+            || browser_now() >= deadline,
+        ) {
+            Ok(SessionState::Runnable | SessionState::Waiting { .. }) => Ok(true),
+            Ok(SessionState::Ended) => {
+                self.stopped = true;
+                Ok(false)
             }
-            if browser_now() >= deadline {
-                break;
+            Err(error) => {
+                self.stopped = true;
+                Err(js_error(error.context(format!(
+                    "{}:{:#x}",
+                    self.session.location().scenario,
+                    self.session.location().offset
+                ))))
             }
         }
-        Ok(true)
     }
     /// The worker can sleep until this delay, subject to its audio deadline.
     pub fn next_wake_delay_ms(&self, elapsed_ms: u32) -> u32 {
@@ -257,6 +253,7 @@ impl BrowserPlayer {
         Ok(samples)
     }
     pub fn pointer(&mut self, x: i32, y: i32, button: u8, pressed: bool) {
+        self.host.wake_input = true;
         self.host.cursor = [x, y];
         if !(1..=3).contains(&button) {
             return;
@@ -280,6 +277,7 @@ impl BrowserPlayer {
         if scan >= 256 || vk >= 256 {
             return;
         }
+        self.host.wake_input = true;
         self.host.text_key |= pressed && text;
         self.host.controls.keys[scan as usize] = pressed;
         self.host.async_keys.set(vk as usize, pressed);
@@ -294,6 +292,7 @@ impl BrowserPlayer {
         }
     }
     pub fn focus(&mut self, focused: bool) {
+        self.host.wake_input = true;
         self.host.controls.focused = focused;
         if !focused {
             self.host.controls.keys.fill(false);

@@ -11,6 +11,7 @@ crate-type = ["rlib", "cdylib"]
 na_mpeg2_decoder = { path = "../na_mpeg2_decoder" }
 anyhow.workspace = true
 shiinario_assets.workspace = true
+shiinario_core.workspace = true
 shiinario_scenario.workspace = true
 serde.workspace = true
 sha2.workspace = true

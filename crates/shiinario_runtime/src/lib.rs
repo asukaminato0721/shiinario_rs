@@ -7,6 +7,7 @@ mod browser;
 mod buffer_audio;
 mod calendar;
 pub mod input;
+mod main_loop;
 pub mod movie;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod native;
