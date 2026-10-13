@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod native_helper;
 mod text_execution;
-use text_execution::{AsyncText, TextPhase};
+use text_execution::AsyncText;
 
 /// The original engine stores the full operand and treats every nonzero value as
 /// swapped. Input bits 0, 1 and 2 represent the first three physical mouse buttons.
@@ -864,7 +864,6 @@ impl BinaryVm {
                     "shared concurrent text contexts are unresolved"
                 );
                 text.ticking = true;
-                text.phase = TextPhase::Begin;
                 return self.text_step();
             }
             self.scheduler.dispatching = true;

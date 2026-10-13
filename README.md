@@ -61,6 +61,15 @@ Scheduler regressions run with
 Browser worker and filesystem tests run with
 `node --test platform/wasm/worker.test.mjs platform/wasm/vfs.test.mjs`.
 
+Binary text output uses a coroutine built from stable Rust `async/await`.
+The coroutine yields host requests and text scheduler ticks. The compiler
+retains its execution position and local variables. Scoped operations access
+VM state without keeping a VM borrow across a yield. Glyph replies commit
+layout before execution resumes. The original task order remains explicit.
+Regression tests compare 96 event traces with digests recorded before the
+coroutine change, including skip input, clock wrap and image text.
+Run them with `cargo test -p shiinario_scenario --test text_coroutine --locked`.
+
 Graphics operations include image affine transforms, block pixelation,
 image-frame text and portable drawing surfaces.
 292 synthetic cases compare affine, pixelation and image-text pixels with the

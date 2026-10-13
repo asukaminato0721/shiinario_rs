@@ -1,6 +1,7 @@
 //! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
 //! are distinct formats. Unsupported operations return errors.
 mod binary;
+mod coroutine;
 mod expression;
 mod format;
 mod memory;
