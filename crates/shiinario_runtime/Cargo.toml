@@ -10,8 +10,8 @@ crate-type = ["rlib", "cdylib"]
 [dependencies]
 na_mpeg2_decoder = { path = "../na_mpeg2_decoder" }
 anyhow.workspace = true
+async-executor = { version = "1.14", default-features = false }
 shiinario_assets.workspace = true
-shiinario_core.workspace = true
 shiinario_scenario.workspace = true
 serde.workspace = true
 sha2.workspace = true

@@ -61,6 +61,8 @@ pub(crate) fn run_with_event_loop(
         None
     };
     let session = Session::new(project, &project.config.startup)?;
+    let proxy = event_loop.create_proxy();
+    session.set_wake_callback(move || proxy.wake_up());
     let mut app = App {
         project,
         session,

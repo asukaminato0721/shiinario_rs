@@ -51,11 +51,17 @@ The independent movie regression suite runs with
 `cargo test -p shiinario_runtime --test movie --locked` and uses a synthetic clip.
 
 Native and browser hosts resume a shared main coroutine through `resume_main`.
-The coroutine advances the session and yields on timer waits or execution
+The coroutine runs on `async-executor::LocalExecutor`. The host polls ready
+futures on its own thread. Futures can retain non-`Send` state. A standard
+`Waker` schedules a native event-loop wake or a browser worker tick.
+The host retains a pending executor `tick()` future to receive queue wakes,
+including task cancellation. Ready tasks use the executor's direct poll.
+The coroutine advances the session and awaits timer waits or execution
 budgets. It ends when the game ends. Each slice permits 4 ms or 10,000 events.
 During a timer wait, the next script or movie deadline determines the next wake.
 Early timer wakes do not execute the VM. Input wakes deliver window messages
-before the deadline. VM task order and dispatch quantum remain explicit.
+before the deadline. Ready async tasks do not release a pending script timer.
+VM task order and dispatch quantum remain explicit.
 The browser also refills audio at intervals of at most 20 ms and schedules an
 early wake when input arrives. Bytecode input loops remain runnable.
 Scheduler regressions run with

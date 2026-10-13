@@ -9,6 +9,7 @@ let audioClock = 0;
 let sequence = 0;
 let stopping = false;
 globalThis.shiinarioNow = () => performance.now();
+globalThis.shiinarioWake = wake;
 globalThis.shiinarioTitle = title => postMessage({ type: 'title', title });
 globalThis.shiinarioFullscreen = enabled => postMessage({ type: 'fullscreen', enabled });
 
@@ -40,6 +41,8 @@ function tick() {
     if (!running) { stop(); return; }
     const now = Math.floor(performance.now() - started - paused);
     // Audio needs regular refills even when the script waits for a long timer.
+    // Merge any executor wake raised during resume into this next deadline.
+    clearTimeout(timer);
     timer = setTimeout(tick, Math.max(1, Math.min(20, player.next_wake_delay_ms(now))));
   } catch (error) { stop(error); }
 }

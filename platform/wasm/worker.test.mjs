@@ -7,7 +7,7 @@ import vm from 'node:vm';
 const source = readFileSync(new URL('./worker.js', import.meta.url), 'utf8')
   .replace(/^import .*;\n/gm, '');
 
-async function worker(delay) {
+async function worker(delay, wakeDuringResume = false) {
   let now = 0;
   let steps = 0;
   let nextId = 0;
@@ -30,7 +30,11 @@ async function worker(delay) {
     FileReaderSync: class {},
     DirectoryFs: class { install() {} },
     BrowserPlayer: class {
-      resume() { steps++; return true; }
+      resume() {
+        steps++;
+        if (wakeDuringResume) context.shiinarioWake();
+        return true;
+      }
       next_wake_delay_ms() { return delay; }
       frame() { return new Uint8Array(); }
       audio(count) { return new Float32Array(count * 2); }
@@ -45,6 +49,7 @@ async function worker(delay) {
   await send({ type: 'start', files: [], font: [], rate: 48000 });
   return {
     timers, messages, send,
+    wake: () => context.shiinarioWake(),
     steps: () => steps,
     advance(ms) {
       now += ms;
@@ -85,14 +90,36 @@ test('refills audio during a long script wait', async () => {
   assert.equal(w.timers.values().next().value.ms, 20);
 });
 
+test('executor wakes replace the timer and retain one scheduled tick', async () => {
+  const w = await worker(1000);
+  w.wake();
+  w.wake();
+  assert.equal(w.timers.size, 1);
+  assert.equal(w.timers.values().next().value.ms, 0);
+  w.advance(0);
+  assert.equal(w.steps(), 2);
+  assert.equal(w.timers.size, 1);
+});
+
+test('executor wakes during resume merge into the next deadline', async () => {
+  const w = await worker(0, true);
+  assert.equal(w.timers.size, 1);
+  assert.equal(w.timers.values().next().value.ms, 1);
+  w.advance(1);
+  assert.equal(w.steps(), 2);
+  assert.equal(w.timers.size, 1);
+});
+
 test('hidden and stopped workers do not schedule input wakeups', async () => {
   const w = await worker(1000);
   await w.send({ type: 'visibility', visible: false });
   await w.send({ type: 'key' });
+  w.wake();
   assert.equal(w.timers.size, 0);
   await w.send({ type: 'visibility', visible: true });
   assert.equal(w.timers.size, 1);
   await w.send({ type: 'stop' });
   await w.send({ type: 'pointer' });
+  w.wake();
   assert.equal(w.timers.size, 0);
 });

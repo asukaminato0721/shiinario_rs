@@ -20,6 +20,8 @@ extern "C" {
     fn browser_fullscreen(enabled: bool);
     #[wasm_bindgen(js_name = shiinarioNow)]
     fn browser_now() -> f64;
+    #[wasm_bindgen(js_name = shiinarioWake)]
+    fn browser_wake();
 }
 fn js_error(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
@@ -166,6 +168,7 @@ impl BrowserPlayer {
             crate::text_render::set_browser_font(font)?;
             let project = crate::open(".")?;
             let session = Session::new(&project, &project.config.startup)?;
+            session.set_wake_callback(browser_wake);
             let size = [project.config.width, project.config.height];
             Ok(Self {
                 project,

@@ -6,6 +6,7 @@ pub mod audio;
 mod browser;
 mod buffer_audio;
 mod calendar;
+pub mod executor;
 pub mod input;
 mod main_loop;
 pub mod movie;

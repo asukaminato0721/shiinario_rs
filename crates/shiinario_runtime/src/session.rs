@@ -1,6 +1,6 @@
 //! Shared scenario execution and resource handling for traces and native hosts.
 use crate::{
-    main_loop::{MainLoop, StepReply},
+    main_loop::MainLoop,
     resources::{AudioStream, Resources, Sound, Surface},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -117,31 +117,45 @@ impl Session {
         host: &mut impl Host,
         wake: Wake,
         mut emit: impl FnMut(&Event) -> Result<()>,
-        mut budget_expired: impl FnMut() -> bool,
+        budget_expired: impl FnMut() -> bool,
     ) -> Result<SessionState> {
         if self.state == SessionState::Ended {
             return Ok(SessionState::Ended);
         }
-        if let Wake::Deadline(now) = wake
-            && self.next_wake_delay_ms(now).is_some_and(|delay| delay > 0)
-        {
+        let release_waiter = match wake {
+            Wake::Input => true,
+            Wake::Deadline(now) => self.execution_delay_ms(now) == Some(0),
+        };
+        if !release_waiter && !self.main_loop.as_ref().is_some_and(MainLoop::is_notified) {
             return Ok(self.state);
         }
         let mut main_loop = self.main_loop.take().context("missing main coroutine")?;
-        let result = main_loop.resume(|| {
-            let state = self.resume(project, host, &mut emit)?;
-            Ok(StepReply {
-                state,
-                budget_expired: state == SessionState::Runnable && budget_expired(),
-            })
-        });
+        let result = main_loop.resume(
+            release_waiter,
+            || self.resume(project, host, &mut emit),
+            budget_expired,
+        );
         self.main_loop = Some(main_loop);
         result
     }
-    /// Return the delay until script or movie execution can advance.
+    /// Connect ready async tasks to a native proxy or a browser worker wake.
+    pub fn set_wake_callback(&self, callback: impl Fn() + Send + Sync + 'static) {
+        if let Some(main_loop) = &self.main_loop {
+            main_loop.set_wake_callback(callback);
+        }
+    }
+    /// Return the delay until a ready task or script/movie deadline needs work.
     /// The clock uses the host's wrapping u32 millisecond time.
     /// Input loops remain runnable because bytecode can inspect shared state.
     pub fn next_wake_delay_ms(&self, now: u32) -> Option<u32> {
+        if self.state != SessionState::Ended
+            && self.main_loop.as_ref().is_some_and(MainLoop::is_notified)
+        {
+            return Some(0);
+        }
+        self.execution_delay_ms(now)
+    }
+    fn execution_delay_ms(&self, now: u32) -> Option<u32> {
         match self.state {
             SessionState::Runnable => Some(0),
             SessionState::Waiting { epoch, duration } => {
