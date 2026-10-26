@@ -314,6 +314,9 @@ pub enum PlatformRequest {
     LoadAsset {
         name: String,
     },
+    BeginAssetLoad {
+        name: String,
+    },
     LoadScenario {
         id: u32,
         name: String,
@@ -638,6 +641,7 @@ pub struct BinaryVm {
     registry_path: String,
     ini_path: String,
     pending_bytes: Option<u32>,
+    asset_load_address: u32,
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
     pending_sizes: Option<[Destination; 2]>,
@@ -738,6 +742,7 @@ impl BinaryVm {
             registry_path: String::new(),
             ini_path: String::new(),
             pending_bytes: None,
+            asset_load_address: 0,
             pending_bounds: None,
             pending_point: None,
             pending_sizes: None,
@@ -1053,6 +1058,7 @@ impl BinaryVm {
                         | PlatformRequest::ReadFlags { .. }
                         | PlatformRequest::LoadScenario { .. }
                         | PlatformRequest::LoadAsset { .. }
+                        | PlatformRequest::BeginAssetLoad { .. }
                         | PlatformRequest::ReadAssetInto { .. }
                         | PlatformRequest::SurfacePixels { .. }
                 ),
@@ -1336,10 +1342,10 @@ impl BinaryVm {
     pub fn respond_asset(&mut self, data: Vec<u8>) -> Result<u32> {
         let Some((
             Event::Platform {
-                request: PlatformRequest::LoadAsset { .. },
+                request: PlatformRequest::LoadAsset { .. } | PlatformRequest::BeginAssetLoad { .. },
                 ..
             },
-            Some(destination),
+            destination,
         )) = self.pending.as_ref()
         else {
             bail!("no pending asset load");
@@ -1351,7 +1357,11 @@ impl BinaryVm {
         );
         let address = self.allocation_address(data.len())?;
         self.allocations.insert(address, data);
-        self.write(destination, address)?;
+        if let Some(destination) = destination {
+            self.write(destination, address)?;
+        } else {
+            self.asset_load_address = address;
+        }
         self.pending = None;
         Ok(address)
     }
@@ -2941,6 +2951,20 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::LoadAsset { name });
             }
+            0x00ce => {
+                let name = self.string(self.read(&mut cursor)?)?;
+                request = Some(PlatformRequest::BeginAssetLoad { name });
+            }
+            0x00cf => {
+                // The portable host completes the read before replying to CE.
+                writes.push((self.destination(&mut cursor)?, 0));
+            }
+            0x00d0 => {
+                writes.push((self.destination(&mut cursor)?, self.asset_load_address));
+            }
+            0x00d1 => {
+                // Join the completed job. Its result remains script-owned.
+            }
             0x00d2 => {
                 // 424793 -> 405ba0 writes these bytes verbatim. The scenario
                 // owns the slot format; 0136 does not transform raw file writes.
@@ -4293,6 +4317,36 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_asset_result_survives_join_and_remains_script_owned() {
+        let mut code = instruction(0x00ce, b"\x10scene.txt\0");
+        code.extend(instruction(0x00cf, &[12, 0, 0]));
+        code.extend(instruction(0x00d0, &[12, 1, 0]));
+        code.extend(instruction(0x00d1, &[]));
+        code.extend(instruction(0x00d0, &[12, 2, 0]));
+        code.extend(instruction(0x0304, &[12, 1, 0, 12, 3, 0]));
+        code.extend(instruction(0x02bd, &[12, 1, 0]));
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("loader.scn", code).unwrap();
+        let mut result = 0;
+        loop {
+            match vm.step().unwrap() {
+                Event::Platform {
+                    request: PlatformRequest::BeginAssetLoad { name },
+                    ..
+                } => {
+                    assert_eq!(name, "scene.txt");
+                    assert!(vm.respond(1).is_err());
+                    result = vm.respond_asset(vec![42, 0]).unwrap();
+                }
+                Event::End => break,
+                _ => {}
+            }
+        }
+        assert_ne!(result, 0);
+        assert_eq!(&vm.banks[&12][..4], &[0, result, result, 42]);
+        assert!(vm.memory_read(result, 1).is_err());
+    }
     #[test]
     fn direct_word_access_is_unaligned_unsigned_and_bounded() {
         let address = 0x2000_0000u32;
