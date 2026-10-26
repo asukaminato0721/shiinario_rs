@@ -271,7 +271,7 @@ impl Host for TracePlatform {
                 }
                 Ok(u32::from(ready))
             }
-            PlatformRequest::InvalidateRect { .. } => Ok(1),
+            PlatformRequest::InvalidateRect { .. } | PlatformRequest::UpdateWindow => Ok(1),
             PlatformRequest::PumpMessages => {
                 self.poll()?;
                 Ok(1)

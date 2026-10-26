@@ -205,6 +205,7 @@ pub enum PlatformRequest {
     InvalidateRect {
         rect: [i32; 4],
     },
+    UpdateWindow,
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
     BitBlt {
@@ -2371,6 +2372,10 @@ impl BinaryVm {
                     self.read(&mut cursor)? as i32,
                 ];
                 request = Some(PlatformRequest::InvalidateRect { rect });
+            }
+            0x07d1 => {
+                // v2.48 4205e0 calls UpdateWindow without operands.
+                request = Some(PlatformRequest::UpdateWindow);
             }
             0x0568 => {
                 let destination = self.read(&mut cursor)?;

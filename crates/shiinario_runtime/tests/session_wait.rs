@@ -54,6 +54,7 @@ impl Drop for Game {
 struct TestHost {
     now: u32,
     invalidates: usize,
+    updates: usize,
     requests: usize,
     polls: usize,
     messages: Vec<[u32; 3]>,
@@ -80,6 +81,10 @@ impl Host for TestHost {
                 self.invalidates += 1;
                 Ok(1)
             }
+            PlatformRequest::UpdateWindow => {
+                self.updates += 1;
+                Ok(1)
+            }
             _ => bail!("unexpected request: {request:?}"),
         }
     }
@@ -101,6 +106,44 @@ impl Host for TestHost {
     fn play_stream(&mut self, _: u32, _: Arc<AudioStream>, _: u32) -> Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn window_update_retains_the_committed_damage_and_has_no_operands() {
+    let game = Game::new();
+    let mut code = Vec::new();
+    for (opcode, values) in [
+        (0x04d8u16, vec![0u32, 0, 0, 1, 1, 10, 20, 30]),
+        (0x07d1, vec![]),
+        (0x07d0, vec![0, 0, 1, 1]),
+        (0x07d1, vec![]),
+        (0, vec![0]),
+    ] {
+        code.extend(opcode.to_le_bytes());
+        for value in values {
+            code.push(4);
+            code.extend(value.to_le_bytes());
+        }
+    }
+    std::fs::write(game.0.join("wait.scn"), code).unwrap();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost::default();
+    let mut ended = false;
+    for _ in 0..100 {
+        let state = session.resume(&project, &mut host, |_| Ok(())).unwrap();
+        if host.updates == 1 && host.invalidates == 0 {
+            assert_eq!(&session.surface(0).unwrap().rgba[..4], &[10, 20, 30, 255]);
+            assert_eq!(&session.display().unwrap().rgba[..4], &[0, 0, 0, 255]);
+        }
+        if state == SessionState::Ended {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended);
+    assert_eq!((host.updates, host.invalidates), (2, 1));
+    assert_eq!(&session.display().unwrap().rgba[..4], &[10, 20, 30, 255]);
 }
 
 #[test]
