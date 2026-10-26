@@ -70,37 +70,49 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
         let mut value = self.atom(depth)?;
         loop {
             self.spaces();
-            let op = self.bytes.get(self.at).copied();
-            let shift =
-                matches!(op, Some(b'<' | b'>')) && self.bytes.get(self.at + 1).copied() == op;
-            if !shift && !matches!(op, Some(b'*' | b'/' | b'|' | b'%')) {
+            // Native 4027c0 evaluates these operators at one precedence level.
+            // It reads the right operand even for logical AND and OR.
+            let remaining = &self.bytes[self.at..];
+            let Some(op) = [
+                "<<", ">>", "==", "!=", "<=", ">=", "||", "&&", "*", "/", "%", "|", "&", "^", "<",
+                ">",
+            ]
+            .into_iter()
+            .find(|op| remaining.starts_with(op.as_bytes())) else {
                 return Ok(value);
-            }
-            self.at += if shift { 2 } else { 1 };
+            };
+            self.at += op.len();
             let rhs = self.atom(depth)?;
-            value = Self::checked(if shift {
-                let left = value as i64 as i32;
-                let count = rhs as i64 as u32;
-                f64::from(if op == Some(b'<') {
-                    left.wrapping_shl(count)
-                } else {
-                    left.wrapping_shr(count)
-                })
-            } else if op == Some(b'|') {
-                f64::from((value as i64 as i32) | (rhs as i64 as i32))
-            } else if op == Some(b'%') {
-                let divisor = rhs as i64 as i32;
-                ensure!(divisor != 0, "expression remainder by zero");
-                f64::from(
-                    (value as i64 as i32)
-                        .checked_rem(divisor)
-                        .context("expression remainder overflow")?,
-                )
-            } else if op == Some(b'*') {
-                value * rhs
-            } else {
-                ensure!(rhs != 0.0, "expression division by zero");
-                value / rhs
+            let integer = value as i64 as i32;
+            let rhs_integer = rhs as i64 as i32;
+            value = Self::checked(match op {
+                "<<" => f64::from(integer.wrapping_shl(rhs_integer as u32)),
+                ">>" => f64::from(integer.wrapping_shr(rhs_integer as u32)),
+                "|" => f64::from(integer | rhs_integer),
+                "&" => f64::from(integer & rhs_integer),
+                "^" => f64::from(integer ^ rhs_integer),
+                "==" => f64::from(u32::from(value == rhs)),
+                "!=" => f64::from(u32::from(value != rhs)),
+                "<" => f64::from(u32::from(value < rhs)),
+                ">" => f64::from(u32::from(value > rhs)),
+                "<=" => f64::from(u32::from(value <= rhs)),
+                ">=" => f64::from(u32::from(value >= rhs)),
+                "||" => f64::from(u32::from(value != 0.0 || rhs != 0.0)),
+                "&&" => f64::from(u32::from(value != 0.0 && rhs != 0.0)),
+                "%" => {
+                    ensure!(rhs_integer != 0, "expression remainder by zero");
+                    f64::from(
+                        integer
+                            .checked_rem(rhs_integer)
+                            .context("expression remainder overflow")?,
+                    )
+                }
+                "*" => value * rhs,
+                "/" => {
+                    ensure!(rhs != 0.0, "expression division by zero");
+                    value / rhs
+                }
+                _ => unreachable!(),
             })?;
         }
     }
@@ -276,6 +288,49 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn comparisons_and_logical_operators_use_native_precedence_and_eager_operands() {
+        for value in [0, 100, 50] {
+            assert_eq!(
+                evaluate(b"({z}==0)||({z}==100)", |_| Ok(value)).unwrap(),
+                u32::from(value != 50)
+            );
+        }
+        for (expression, expected) in [
+            ("1+2==3", 1),
+            ("2==2*4", 4),
+            ("0||2+3", 4),
+            ("1||0&&0", 0),
+            ("2!=3", 1),
+            ("2<=2", 1),
+            ("2>=3", 0),
+            ("-1<0", 1),
+            ("3>2", 1),
+            ("3&1", 1),
+            ("3^1", 2),
+            ("1|2", 3),
+            ("4>>1", 2),
+            ("1<<2", 4),
+        ] {
+            assert_eq!(
+                evaluate(expression.as_bytes(), |_| Ok(0)).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+        let reads = std::cell::Cell::new(0);
+        assert_eq!(
+            evaluate(b"1||{rhs}", |_| {
+                reads.set(reads.get() + 1);
+                Ok(0)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(reads.get(), 1);
+        assert!(evaluate(b"1||(1/0)", |_| Ok(0)).is_err());
+        assert!(evaluate(b"0&&{missing}", |_| bail!("undefined variable")).is_err());
+    }
     #[test]
     fn rejects_unsupported_syntax_missing_variables_and_unbounded_work() {
         for bytes in [
