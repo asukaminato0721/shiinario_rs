@@ -58,6 +58,53 @@ fn delete_file_joins_both_operands_and_preserves_the_next_instruction() {
 }
 
 #[test]
+fn drawing_lists_keep_separate_slots_and_expose_their_memory() {
+    let mut code = instruction(0x4b5, &[immediate(1), immediate(2)].concat());
+    code.extend(instruction(0x4b8, &immediate(1)));
+    code.extend(instruction(
+        0x4bd,
+        &(1..=8).flat_map(immediate).collect::<Vec<_>>(),
+    ));
+    code.extend(instruction(0x4b9, &[immediate(1), vec![12, 0, 0]].concat()));
+    code.extend(instruction(
+        0x309,
+        &[vec![12, 0, 0], immediate(16), immediate(123)].concat(),
+    ));
+    code.extend(instruction(0x4c4, &immediate(0)));
+    code.extend(instruction(0x4b8, &immediate(0)));
+    code.extend(instruction(0x4c4, &immediate(0)));
+    code.extend(instruction(0x4b8, &immediate(1)));
+    code.extend(instruction(0x4ba, &[]));
+    code.extend(instruction(0x4bb, &immediate(1)));
+    code.extend(instruction(0x4c4, &immediate(0)));
+    code.extend(instruction(0x4b6, &immediate(1)));
+    code.extend(instruction(0x4b9, &[immediate(1), vec![12, 1, 0]].concat()));
+    code.extend(instruction(0x49d, &[12, 1, 0]));
+    let length = code.len();
+    let mut vm = BinaryVm::with_version("lists.scn", code, EngineVersion::V2_48).unwrap();
+    let mut lists = Vec::new();
+    let mut pointer = None;
+    while vm.location().offset < length {
+        match vm.step().unwrap() {
+            Event::Platform {
+                request: PlatformRequest::DrawImages { items, .. },
+                ..
+            } => {
+                lists.push(items);
+                vm.respond(1).unwrap();
+            }
+            Event::MouseButtonMapping { value, .. } => pointer = Some(value),
+            _ => {}
+        }
+    }
+    assert_eq!(lists.iter().map(Vec::len).collect::<Vec<_>>(), [1, 0, 1]);
+    assert_eq!(lists[0][0].x, 123);
+    assert_eq!(lists[0][0].extra, [7, 8]);
+    assert_eq!(lists[0], lists[2]);
+    assert_eq!(pointer, Some(0));
+}
+
+#[test]
 fn minimize_button_commands_have_no_operands() {
     for (opcode, enabled) in [(0x79e, true), (0x79f, false)] {
         let mut code = instruction(opcode, &[]);

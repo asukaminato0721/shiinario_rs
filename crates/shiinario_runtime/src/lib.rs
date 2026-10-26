@@ -253,7 +253,9 @@ impl Host for TracePlatform {
             PlatformRequest::ReadControls => Ok(self.replay.controls()),
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
-            PlatformRequest::ReleaseGraphics | PlatformRequest::SetFullscreen { .. } => Ok(1),
+            PlatformRequest::ReleaseGraphics
+            | PlatformRequest::SetFullscreen { .. }
+            | PlatformRequest::SetMinimizeButton { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
             PlatformRequest::ClockMilliseconds => Ok(self.clock_ms),

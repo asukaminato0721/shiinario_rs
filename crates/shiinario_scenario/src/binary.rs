@@ -310,6 +310,16 @@ pub enum PlatformRequest {
     SetFullscreen {
         enabled: bool,
     },
+    SetMinimizeButton {
+        enabled: bool,
+    },
+    SetWindowTimer {
+        id: u32,
+        milliseconds: u32,
+    },
+    KillWindowTimer {
+        id: u32,
+    },
     CreateSurface {
         id: u32,
         width: u32,
@@ -568,7 +578,9 @@ pub struct BinaryVm {
     sp: usize,
     thread_limit: u32,
     thread_limit_override: u32,
-    draw_list: Vec<ImageDraw>,
+    // Each entry contains the allocation address, used count, and capacity.
+    draw_lists: std::collections::BTreeMap<u32, (u32, usize, usize)>,
+    draw_list_id: u32,
     file_read_marker: u32,
     file_write_marker: u32,
     input_latches: [u32; 2],
@@ -652,7 +664,8 @@ impl BinaryVm {
             sp: CELLS,
             thread_limit: 1,
             thread_limit_override: 0,
-            draw_list: Vec::new(),
+            draw_lists: Default::default(),
+            draw_list_id: 0,
             file_read_marker: 0,
             file_write_marker: 0,
             input_latches: [0; 2],
@@ -775,7 +788,19 @@ impl BinaryVm {
     /// Original 4355b0 pushes hwnd/message/wparam/lparam; 42bf60 runs the
     /// registered entry synchronously. Queue it until any pending reply is done.
     pub fn window_message(&mut self, message: u32, wparam: u32, lparam: u32) {
-        if message == 0x10 || self.callback_tasks.contains_key(&0x07e4) {
+        if message == 0x10
+            || self.callback_tasks.contains_key(&0x07e4)
+            || (message == 0x104 && wparam == 0x0d && self.callback_tasks.contains_key(&0x0794))
+            || (message == 0x113 && self.callback_tasks.contains_key(&0x0af0))
+        {
+            if message == 0x113
+                && self
+                    .window_messages
+                    .iter()
+                    .any(|args| args[1] == message && args[2] == wparam)
+            {
+                return;
+            }
             self.window_messages.push_back([0, message, wparam, lparam]);
         }
     }
@@ -797,9 +822,21 @@ impl BinaryVm {
         }
         if self.window_callback.is_none() {
             while let Some(arguments) = self.window_messages.pop_front() {
+                // v2.48 4365e9 handles WM_SYSKEYDOWN/VK_RETURN by running
+                // the 0794 task synchronously, without window-message arguments.
+                let alt_enter = arguments[1] == 0x104
+                    && arguments[2] == 0x0d
+                    && self.callback_tasks.contains_key(&0x0794);
+                let timer = arguments[1] == 0x113 && self.callback_tasks.contains_key(&0x0af0);
                 let callback = self
                     .callback_tasks
-                    .get(&0x07e4)
+                    .get(&if alt_enter {
+                        0x0794
+                    } else if timer {
+                        0x0af0
+                    } else {
+                        0x07e4
+                    })
                     .and_then(|&id| self.task_entries.get(&id).map(|&(base, pc)| (id, base, pc)));
                 let Some((id, base, pc)) = callback else {
                     if arguments[1] == 0x10 {
@@ -811,10 +848,12 @@ impl BinaryVm {
                 ensure!(id != self.current_task, "recursive window callback");
                 let previous = self.current_task;
                 self.select_task(id);
-                ensure!(self.sp >= 4, "window callback stack overflow");
+                let count = if alt_enter || timer { 0 } else { 4 };
+                ensure!(self.sp >= count, "window callback stack overflow");
                 self.window_callback = Some((previous, self.sp, arguments[1]));
-                self.sp -= 4;
-                self.banks.get_mut(&8).unwrap()[self.sp..self.sp + 4].copy_from_slice(&arguments);
+                self.sp -= count;
+                self.banks.get_mut(&8).unwrap()[self.sp..self.sp + count]
+                    .copy_from_slice(&arguments[..count]);
                 self.switch_scenario(base);
                 self.pc = pc;
                 self.context_flags = 1;
@@ -1132,6 +1171,47 @@ impl BinaryVm {
             .get(&address)
             .map(Vec::as_slice)
             .context("resource address is not an allocation base")
+    }
+    /// Read the active list from VM memory, including changes made through 04b9.
+    fn draw_list(&self) -> Result<Vec<ImageDraw>> {
+        let Some(&(address, count, _)) = self.draw_lists.get(&self.draw_list_id) else {
+            return Ok(Vec::new());
+        };
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let bytes = self.memory_read(address, count * 32)?;
+        Ok(bytes
+            .chunks_exact(32)
+            .map(|record| {
+                let values: [u32; 8] = std::array::from_fn(|i| {
+                    u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap())
+                });
+                ImageDraw {
+                    image: values[0],
+                    frame: values[1],
+                    flags: values[2],
+                    layer: values[3],
+                    x: values[4] as i32,
+                    y: values[5] as i32,
+                    extra: [values[6], values[7]],
+                }
+            })
+            .collect())
+    }
+    fn create_draw_list(&mut self, id: u32, capacity: usize) -> Result<()> {
+        ensure!(id < 256, "draw list slot out of bounds");
+        let capacity = if capacity == 0 { 1024 } else { capacity };
+        ensure!(
+            capacity <= 65536,
+            "draw list capacity exceeds 65536 entries"
+        );
+        let address = self.allocation_address(capacity * 32)?;
+        self.allocations.insert(address, vec![0; capacity * 32]);
+        if let Some((previous, _, _)) = self.draw_lists.insert(id, (address, 0, capacity)) {
+            self.allocations.remove(&previous);
+        }
+        Ok(())
     }
     /// First-fit placement among live allocations. Each has a trailing guard
     /// page; released local scopes must not consume virtual addresses forever.
@@ -1952,6 +2032,8 @@ impl BinaryVm {
         let mut calendar_destinations = None;
         let mut collect_scopes = false;
         let mut released_scopes = Vec::new();
+        let mut new_draw_list = None;
+        let mut draw_item = None;
         let mut file_destinations = None;
         let mut timer_reply = None;
         let mut delay = None;
@@ -2474,7 +2556,7 @@ impl BinaryVm {
                 request = Some(PlatformRequest::HitTestImages {
                     x,
                     y,
-                    items: self.draw_list.clone(),
+                    items: self.draw_list()?,
                 });
             }
             0x04c8 => {
@@ -2489,12 +2571,62 @@ impl BinaryVm {
                 ]);
                 request = Some(PlatformRequest::ImageBounds { id, frame });
             }
-            0x04ba => self.draw_list.clear(),
+            0x04b5 => {
+                let id = self.read(&mut cursor)?;
+                let capacity = self.read(&mut cursor)? as usize;
+                new_draw_list = Some((id, capacity));
+            }
+            0x04b6 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "draw list slot out of bounds");
+                if let Some((address, _, _)) = self.draw_lists.insert(id, (0, 0, 0)) {
+                    self.allocations.remove(&address);
+                }
+            }
+            0x04b7 => writes.push((self.destination(&mut cursor)?, self.draw_list_id)),
+            0x04b8 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "draw list slot out of bounds");
+                self.draw_list_id = id;
+            }
+            0x04b9 => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "draw list slot out of bounds");
+                let address = self
+                    .draw_lists
+                    .get(&id)
+                    .map_or(0, |&(address, _, _)| address);
+                writes.push((self.destination(&mut cursor)?, address));
+            }
+            0x04ba => {
+                if let Some((_, count, _)) = self.draw_lists.get_mut(&self.draw_list_id) {
+                    *count = 0;
+                }
+            }
+            0x04bb => {
+                let count = self.read(&mut cursor)? as usize;
+                let list = self
+                    .draw_lists
+                    .get_mut(&self.draw_list_id)
+                    .context("draw list is not allocated")?;
+                ensure!(count <= list.2, "draw list count exceeds capacity");
+                list.1 = count;
+            }
+            0x04bc => {
+                let count = self
+                    .draw_lists
+                    .get(&self.draw_list_id)
+                    .map_or(0, |list| list.1);
+                writes.push((self.destination(&mut cursor)?, count as u32));
+            }
             0x04bd => {
-                ensure!(
-                    self.draw_list.len() < 1024,
-                    "draw list exceeds 1024 entries"
-                );
+                let (_, count, capacity) = self
+                    .draw_lists
+                    .get(&self.draw_list_id)
+                    .copied()
+                    .or_else(|| (self.draw_list_id == 0).then_some((0, 0, 1024)))
+                    .context("draw list is not allocated")?;
+                ensure!(count < capacity, "draw list exceeds {capacity} entries");
                 let mut item = ImageDraw {
                     image: self.read(&mut cursor)?,
                     frame: self.read(&mut cursor)?,
@@ -2523,7 +2655,7 @@ impl BinaryVm {
                     | EngineVersion::V2_49
                     | EngineVersion::Unverified(_) => item.extra[1] = self.read(&mut cursor)?,
                 }
-                self.draw_list.push(item);
+                draw_item = Some(item);
             }
             0x04c4 | 0x04c5 => {
                 let id = self.read(&mut cursor)?;
@@ -2540,7 +2672,7 @@ impl BinaryVm {
                 };
                 request = Some(PlatformRequest::DrawImages {
                     id,
-                    items: self.draw_list.clone(),
+                    items: self.draw_list()?,
                     clip,
                 });
             }
@@ -2919,6 +3051,21 @@ impl BinaryVm {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "surface release slot out of bounds");
                 request = Some(PlatformRequest::ReleaseSurface { id });
+            }
+            0x0123 => {
+                // v2.48 420f40 joins directory and filename (414310), then
+                // calls DeleteFileA. The script receives no result operand.
+                let mut path = self.string(self.read(&mut cursor)?)?;
+                let name = self.string(self.read(&mut cursor)?)?;
+                if !path.is_empty() && !path.ends_with(['\\', '/']) {
+                    path.push('\\');
+                }
+                path.push_str(&name);
+                ensure!(
+                    encoding_rs::SHIFT_JIS.encode(&path).0.len() < 260,
+                    "file deletion path exceeds engine buffer"
+                );
+                request = Some(PlatformRequest::DeleteFile { path });
             }
             0x010e => {
                 let path = self.string(self.read(&mut cursor)?)?;
@@ -3452,7 +3599,7 @@ impl BinaryVm {
                 );
                 definition = Some((task, self.script_base, target));
             }
-            0x076c | 0x076d | 0x078a | 0x07e4 => {
+            0x076c | 0x076d | 0x078a | 0x0794 | 0x07e4 | 0x0af0 => {
                 let task = self.read(&mut cursor)?;
                 self.callback_tasks.insert(opcode, task);
             }
@@ -3786,6 +3933,23 @@ impl BinaryVm {
                     lparam: self.read(&mut cursor)?,
                 });
             }
+            0x0afa => {
+                let id = self.read(&mut cursor)?;
+                let milliseconds = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::SetWindowTimer { id, milliseconds });
+            }
+            0x0afb => {
+                request = Some(PlatformRequest::KillWindowTimer {
+                    id: self.read(&mut cursor)?,
+                })
+            }
+            0x079e | 0x079f => {
+                // v2.48 420770/4207f0 set/clear WS_MINIMIZEBOX. No operands.
+                request = Some(PlatformRequest::SetMinimizeButton {
+                    enabled: opcode == 0x079e,
+                });
+            }
             0x07b3 => {
                 // v2.48: 4200e0 returns the main window. The portable host
                 // represents this window with token zero.
@@ -3805,6 +3969,31 @@ impl BinaryVm {
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
         let next_pc = cursor.pc;
+        if let Some((id, capacity)) = new_draw_list {
+            self.create_draw_list(id, capacity)?;
+        }
+        if let Some(item) = draw_item {
+            if self.draw_list_id == 0 && !self.draw_lists.contains_key(&0) {
+                self.create_draw_list(0, 1024)?;
+            }
+            let (address, count, _) = self.draw_lists[&self.draw_list_id];
+            let bytes: Vec<u8> = [
+                item.image,
+                item.frame,
+                item.flags,
+                item.layer,
+                item.x as u32,
+                item.y as u32,
+                item.extra[0],
+                item.extra[1],
+            ]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect();
+            let range = self.memory_range(address + (count * 32) as u32, 32)?;
+            self.memory_write(range, &bytes);
+            self.draw_lists.get_mut(&self.draw_list_id).unwrap().1 += 1;
+        }
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
@@ -4375,14 +4564,14 @@ mod tests {
         for _ in 0..1024 {
             vm.step().unwrap();
         }
-        assert_eq!(vm.draw_list.len(), 1024);
+        assert_eq!(vm.draw_list().unwrap().len(), 1024);
         vm.step().unwrap();
-        assert!(vm.draw_list.is_empty());
+        assert!(vm.draw_list().unwrap().is_empty());
         for _ in 0..1024 {
             vm.step().unwrap();
         }
         assert!(vm.step().unwrap_err().to_string().contains("draw list"));
-        assert_eq!(vm.draw_list.len(), 1024);
+        assert_eq!(vm.draw_list().unwrap().len(), 1024);
     }
 
     #[test]

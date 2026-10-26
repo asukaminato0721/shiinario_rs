@@ -126,6 +126,7 @@ pub struct Resources {
     resident: usize,
     archives: Vec<String>,
     transient_files: BTreeMap<String, Vec<u8>>,
+    deleted_files: std::collections::BTreeSet<String>,
     transient_directories: std::collections::BTreeSet<String>,
     files: BTreeMap<u32, OpenFile>,
 }
@@ -206,7 +207,14 @@ impl Resources {
         {
             return Ok([0, bytes.len() as u32]);
         }
-        project.sizes_with_archives(name, &self.archives)
+        if self
+            .deleted_files
+            .contains(&shiinario_assets::project::normalize(name)?)
+        {
+            project.sizes_in_archives(name, &self.archives)
+        } else {
+            project.sizes_with_archives(name, &self.archives)
+        }
     }
     pub fn read_asset(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
         // SCN asset reads also load saves. Match asset_sizes: simulated writes
@@ -217,12 +225,22 @@ impl Resources {
         {
             return Ok(bytes.clone());
         }
-        if let Some(bytes) = project.read_loose(name)? {
+        if !self
+            .deleted_files
+            .contains(&shiinario_assets::project::normalize(name)?)
+            && let Some(bytes) = project.read_loose(name)?
+        {
             return Ok(bytes);
         }
         project.read_with_archives(name, &self.archives)
     }
     pub fn read_file_contents(&self, project: &Project, name: &str) -> Result<Vec<u8>> {
+        ensure!(
+            !self
+                .deleted_files
+                .contains(&shiinario_assets::project::normalize(name)?),
+            "file not found"
+        );
         if let Some(bytes) = self
             .transient_files
             .get(&shiinario_assets::project::normalize(name)?)
@@ -238,10 +256,7 @@ impl Resources {
         );
         ensure!(self.files.len() < 256, "too many open files");
         let key = shiinario_assets::project::normalize(name)?;
-        let bytes = match self.transient_files.get(&key) {
-            Some(bytes) => bytes.clone(),
-            None => project.read_loose(name)?.context("file not found")?,
-        };
+        let bytes = self.read_file_contents(project, name)?;
         let total: usize = self.files.values().map(|file| file.bytes.len()).sum();
         ensure!(
             bytes.len() <= 16 * 1024 * 1024 && total + bytes.len() <= 64 * 1024 * 1024,

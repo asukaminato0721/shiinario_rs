@@ -85,6 +85,48 @@ fn close_callback_can_consume_message_or_allow_normal_exit() {
 }
 
 #[test]
+fn alt_enter_and_timer_callbacks_resume_the_interrupted_task() {
+    for (register, message, wparam) in [(0x794, 0x104, 0x0d), (0xaf0, 0x113, 123)] {
+        for result in [0, 1] {
+            let mut code = instruction(0xc, &[10]);
+            code.push(0x84);
+            let patch = code.len();
+            code.extend([0; 4]);
+            code.extend(instruction(register, &[10]));
+            code.extend(instruction(0x49d, &[42]));
+            code.extend(instruction(0, &[0]));
+            let callback = code.len() as u32;
+            code[patch..patch + 4].copy_from_slice(&callback.to_le_bytes());
+            code.extend(instruction(0x49d, &[17]));
+            code.extend(instruction(0, &[result]));
+            let mut vm =
+                BinaryVm::with_version("callback.scn", code, EngineVersion::V2_48).unwrap();
+            vm.step().unwrap();
+            vm.step().unwrap();
+            vm.window_message(message, wparam, 0);
+            assert!(matches!(
+                vm.scheduled_step().unwrap(),
+                Event::MouseButtonMapping { value: 17, .. }
+            ));
+            vm.scheduled_step().unwrap();
+            let mut resumed = false;
+            for _ in 0..20 {
+                match vm.scheduled_step().unwrap() {
+                    Event::SchedulerPoll => vm.respond(1).unwrap(),
+                    Event::MouseButtonMapping { value: 42, .. } => {
+                        resumed = true;
+                        break;
+                    }
+                    Event::End => break,
+                    _ => {}
+                }
+            }
+            assert!(resumed);
+        }
+    }
+}
+
+#[test]
 fn truncated_post_preserves_pc_and_reports_error() {
     let mut bytes = instruction(0x7bc, &[0, 0x10, 0, 0]);
     bytes.pop();
