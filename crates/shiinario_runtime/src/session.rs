@@ -681,6 +681,16 @@ impl Session {
                 )
             })?;
             // Bulk drawing modifies the working DIB until SCN invalidates it.
+            if matches!(&request, PlatformRequest::ClearSurface { id: 0 }) {
+                let rect = [
+                    0,
+                    0,
+                    project.config.width as i32,
+                    project.config.height as i32,
+                ];
+                resources.commit_display(rect);
+                host.respond(&PlatformRequest::InvalidateRect { rect })?;
+            }
             // Text also submits its own glyph rectangles at TextTick, matching
             // the native text renderer without exposing the rest of the DIB.
             if let PlatformRequest::LoadSound { id, .. } = &request {

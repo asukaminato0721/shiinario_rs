@@ -1,18 +1,27 @@
 //! Bounded subset of ANSI wsprintf used by the verified SCN instructions.
 use anyhow::{Context, Result, bail, ensure};
 
-pub(crate) fn integer_format(format: &[u8], arguments: &[u32]) -> Result<Vec<u8>> {
-    integer_format_with(format, |index| {
-        arguments
-            .get(index)
-            .copied()
-            .context("missing format argument")
-    })
+pub(crate) fn ansi_format(
+    format: &[u8],
+    arguments: &[u32],
+    string_at: impl FnMut(u32) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    ansi_format_with(
+        format,
+        |index| {
+            arguments
+                .get(index)
+                .copied()
+                .context("missing format argument")
+        },
+        string_at,
+    )
 }
 
-pub(crate) fn integer_format_with(
+pub(crate) fn ansi_format_with(
     format: &[u8],
     mut argument_at: impl FnMut(usize) -> Result<u32>,
+    mut string_at: impl FnMut(u32) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
     let mut output = Vec::new();
     let mut pos = 0;
@@ -39,20 +48,23 @@ pub(crate) fn integer_format_with(
             let value = argument_at(argument)?;
             argument += 1;
             let text = match conversion {
-                b'd' | b'i' => (value as i32).to_string(),
-                b'u' => value.to_string(),
-                b'x' => format!("{value:x}"),
-                b'X' => format!("{value:X}"),
+                b'd' | b'i' => (value as i32).to_string().into_bytes(),
+                b'u' => value.to_string().into_bytes(),
+                b'x' => format!("{value:x}").into_bytes(),
+                b'X' => format!("{value:X}").into_bytes(),
+                b's' => string_at(value)?,
+                b'c' => vec![value as u8],
                 _ => bail!("unresolved wsprintf conversion {conversion:#x}"),
             };
             let padding = width.saturating_sub(text.len());
-            if zero && text.starts_with('-') {
+            let zero = zero && !matches!(conversion, b's' | b'c');
+            if zero && text.starts_with(b"-") {
                 output.push(b'-');
                 output.extend(std::iter::repeat_n(b'0', padding));
-                output.extend_from_slice(&text.as_bytes()[1..]);
+                output.extend_from_slice(&text[1..]);
             } else {
                 output.extend(std::iter::repeat_n(if zero { b'0' } else { b' ' }, padding));
-                output.extend_from_slice(text.as_bytes());
+                output.extend_from_slice(&text);
             }
         }
         ensure!(output.len() <= 1023, "formatted string exceeds 1023 bytes");
@@ -66,9 +78,28 @@ mod tests {
     #[test]
     fn rejects_missing_arguments_unsupported_conversions_and_large_output() {
         for format in [b"%".as_slice(), b"%s", b"%999999999999d", b"%d%d"] {
-            assert!(integer_format(format, &[0]).is_err());
+            assert!(ansi_format(format, &[0], |_| bail!("invalid string address")).is_err());
         }
-        assert!(integer_format(&[b'a'; 1024], &[]).is_err());
-        assert_eq!(integer_format(b"%d/%u", &[u32::MAX, 7]).unwrap(), b"-1/7");
+        assert!(ansi_format(&[b'a'; 1024], &[], |_| unreachable!()).is_err());
+        assert_eq!(
+            ansi_format(b"%d/%u", &[u32::MAX, 7], |_| unreachable!()).unwrap(),
+            b"-1/7"
+        );
+    }
+    #[test]
+    fn string_fields_preserve_ansi_bytes_and_enforce_the_output_limit() {
+        assert_eq!(
+            ansi_format(b"_F%s/", &[123], |address| {
+                assert_eq!(address, 123);
+                Ok(b"\x82l\x82r".to_vec())
+            })
+            .unwrap(),
+            b"_F\x82l\x82r/"
+        );
+        assert_eq!(
+            ansi_format(b"%05s/%c", &[123, 65], |_| Ok(b"AB".to_vec())).unwrap(),
+            b"   AB/A"
+        );
+        assert!(ansi_format(b"%s", &[123], |_| Ok(vec![b'x'; 1024])).is_err());
     }
 }

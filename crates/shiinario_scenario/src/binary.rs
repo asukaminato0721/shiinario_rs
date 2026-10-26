@@ -222,6 +222,9 @@ pub enum PlatformRequest {
         rect: [i32; 4],
         color: [u8; 3],
     },
+    ClearSurface {
+        id: u32,
+    },
     SetAudioStreamVolume {
         handle: u32,
         percent: u32,
@@ -633,7 +636,6 @@ pub struct BinaryVm {
     text_context: u32,
     text_contexts: std::collections::BTreeMap<u32, TextContext>,
     text_style: crate::text::TextStyle,
-    text_image: [u32; 2],
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the selected text context.
     text_cursor: [u32; 3],
@@ -643,7 +645,6 @@ pub struct BinaryVm {
 }
 struct TextContext {
     style: crate::text::TextStyle,
-    image: [u32; 2],
     image_offset: [u32; 2],
     cursor: [u32; 3],
     layout: crate::text_layout::TextLayout,
@@ -652,7 +653,6 @@ impl Default for TextContext {
     fn default() -> Self {
         Self {
             style: Default::default(),
-            image: [u32::MAX, 0],
             image_offset: [0; 2],
             cursor: [0; 3],
             layout: crate::text_layout::TextLayout::new([0; 3]),
@@ -731,7 +731,6 @@ impl BinaryVm {
             text_style: Default::default(),
             text_context: 0,
             text_contexts: Default::default(),
-            text_image: [u32::MAX, 0],
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
             text_layout: crate::text_layout::TextLayout::new([0; 3]),
@@ -814,7 +813,6 @@ impl BinaryVm {
         let next = self.text_contexts.remove(&id).unwrap_or_default();
         let previous = TextContext {
             style: std::mem::replace(&mut self.text_style, next.style),
-            image: std::mem::replace(&mut self.text_image, next.image),
             image_offset: std::mem::replace(&mut self.text_image_offset, next.image_offset),
             cursor: std::mem::replace(&mut self.text_cursor, next.cursor),
             layout: std::mem::replace(&mut self.text_layout, next.layout),
@@ -2720,6 +2718,12 @@ impl BinaryVm {
                     clip,
                 });
             }
+            0x04ce => {
+                // v2.48 426154 clears the surface and invalidates window zero.
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "clear surface slot out of bounds");
+                request = Some(PlatformRequest::ClearSurface { id });
+            }
             0x0500 => {
                 // v2.48 4261ba -> 412770 updates surface zero from surface one.
                 // 256 preserves the current pixels. Repeated levels do no work.
@@ -2951,7 +2955,9 @@ impl BinaryVm {
                     "format needs destination and format string"
                 );
                 let format = self.string_bytes(arguments[1])?;
-                let mut bytes = crate::format::integer_format(&format, &arguments[2..])?;
+                let mut bytes = crate::format::ansi_format(&format, &arguments[2..], |address| {
+                    self.string_bytes(address)
+                })?;
                 bytes.push(0);
                 memory_write = Some((self.memory_range(arguments[0], bytes.len())?, bytes));
             }
@@ -2961,15 +2967,19 @@ impl BinaryVm {
                 let format = self.string_bytes(format_address)?;
                 let arguments = self.read(&mut cursor)?;
                 let mut argument_bytes = 0;
-                let mut bytes = crate::format::integer_format_with(&format, |index| {
-                    argument_bytes = (index + 1) * 4;
-                    let address = arguments
-                        .checked_add(index as u32 * 4)
-                        .context("format argument address overflow")?;
-                    Ok(u32::from_le_bytes(
-                        self.memory_read(address, 4)?.as_slice().try_into()?,
-                    ))
-                })?;
+                let mut bytes = crate::format::ansi_format_with(
+                    &format,
+                    |index| {
+                        argument_bytes = (index + 1) * 4;
+                        let address = arguments
+                            .checked_add(index as u32 * 4)
+                            .context("format argument address overflow")?;
+                        Ok(u32::from_le_bytes(
+                            self.memory_read(address, 4)?.as_slice().try_into()?,
+                        ))
+                    },
+                    |address| self.string_bytes(address),
+                )?;
                 bytes.push(0);
                 for (source, length) in [
                     (format_address, format.len() + 1),
@@ -3045,14 +3055,14 @@ impl BinaryVm {
                         values[0] == u32::MAX || values[0] < 256,
                         "image text slot out of bounds"
                     );
-                    self.text_image = values;
+                    self.text_style.image = values;
                 } else {
                     self.text_image_offset = values;
                 }
             }
             0x00b5 | 0x00b7 => {
                 let values = if opcode == 0x00b5 {
-                    self.text_image
+                    self.text_style.image
                 } else {
                     self.text_image_offset
                 };
@@ -3116,15 +3126,41 @@ impl BinaryVm {
                     surface == u32::MAX,
                     "text drawing to surfaces is unresolved"
                 );
-                let controls = self.string_bytes(self.read(&mut cursor)?)?;
-                let (style, clock_read) = self
-                    .text_style
-                    .configure_for_version(&controls, self.version)?;
-                if let Some(clock) = clock_read {
-                    self.pending_text_style = Some((style, clock));
-                    request = Some(PlatformRequest::ClockMilliseconds);
+                let address = self.read(&mut cursor)?;
+                let controls = self.string_bytes(address)?;
+                let mut checked = self.text_style.clone();
+                let mut at = 0;
+                while at < controls.len()
+                    && controls[at] == b'_'
+                    && controls.get(at + 1) != Some(&b'_')
+                {
+                    let (style, _, consumed) = checked.prefix(&controls[at..], self.version)?;
+                    checked = style;
+                    at += consumed;
+                }
+                if at < controls.len() {
+                    // 0084 also processes glyphs without character delays.
+                    // Surface -1 measures text without drawing it.
+                    ensure!(
+                        self.async_text.is_none(),
+                        "shared concurrent text contexts are unresolved"
+                    );
+                    self.text_layout.begin(self.text_cursor);
+                    let mut text =
+                        AsyncText::new(self.current_task, surface, address, location.clone());
+                    text.immediate = true;
+                    self.async_text = Some(text);
+                    self.context_flags |= 8;
                 } else {
-                    self.text_style = style;
+                    let (style, clock_read) = self
+                        .text_style
+                        .configure_for_version(&controls, self.version)?;
+                    if let Some(clock) = clock_read {
+                        self.pending_text_style = Some((style, clock));
+                        request = Some(PlatformRequest::ClockMilliseconds);
+                    } else {
+                        self.text_style = style;
+                    }
                 }
             }
             0x0547 => {
@@ -4637,6 +4673,42 @@ mod tests {
         vm.define_task(10, vm.script_base, 0, true);
         assert_eq!(vm.tasks[&10].locals[0], 77);
         assert_eq!(vm.tasks[&10].sp, CELLS);
+    }
+
+    #[test]
+    fn selected_text_context_retains_state_across_context_and_task_switches() {
+        let mut code = instruction(0x96, &immediate(1));
+        code.extend(instruction(
+            0x84,
+            &[immediate(u32::MAX), b"\x10_c4,5,6_t/-1\0".to_vec()].concat(),
+        ));
+        code.extend(instruction(0x78, &[immediate(10), immediate(20)].concat()));
+        code.extend(instruction(0xb4, &[immediate(7), immediate(8)].concat()));
+        code.extend(instruction(0x96, &immediate(2)));
+        code.extend(instruction(
+            0x84,
+            &[immediate(u32::MAX), b"\x10_c7,8,9\0".to_vec()].concat(),
+        ));
+        code.extend(instruction(0x78, &[immediate(30), immediate(40)].concat()));
+        code.extend(instruction(0x96, &immediate(1)));
+        let mut vm = BinaryVm::with_version("context.scn", code, EngineVersion::V2_48).unwrap();
+        for _ in 0..8 {
+            vm.step().unwrap();
+        }
+        assert_eq!(vm.text_style.color, [4, 5, 6]);
+        assert_eq!(vm.text_cursor, [10, 10, 20]);
+        assert_eq!(vm.text_style.image, [7, 8]);
+        vm.define_task(10, vm.script_base, 0, false);
+        vm.select_task(10);
+        assert_eq!(vm.text_context, 0);
+        assert_eq!(vm.text_style, crate::TextStyle::default());
+        vm.select_task(0);
+        assert_eq!(vm.text_context, 1);
+        assert_eq!(vm.text_style.color, [4, 5, 6]);
+        assert_eq!(vm.text_cursor, [10, 10, 20]);
+        vm.select_text_context(2);
+        assert_eq!(vm.text_style.color, [7, 8, 9]);
+        assert_eq!(vm.text_cursor, [30, 30, 40]);
     }
 
     #[test]

@@ -48,9 +48,7 @@ pub fn frames(data: &[u8]) -> Result<Vec<FrameInfo>> {
         let width = word(data, offset)?;
         let height = word(data, offset + 4)?;
         ensure!(
-            width > 0
-                && height > 0
-                && width <= 16384
+            width <= 16384
                 && height <= 16384
                 && width as u64 * height as u64 <= 16_777_216,
             "S25 invalid dimensions {width}x{height}"
@@ -261,6 +259,20 @@ pub fn entries(data: &[u8], basename: &str) -> Result<Vec<ImageEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn empty_glyph_frames_retain_their_index_and_origin() {
+        let mut data = b"S25\0".to_vec();
+        for word in [1u32, 12, 0, 0, 4, 9, 0] {
+            data.extend(word.to_le_bytes());
+        }
+        let frame = decode(&data, 0).unwrap();
+        assert_eq!((frame.info.index, frame.info.width, frame.info.height), (0, 0, 0));
+        assert_eq!((frame.info.x, frame.info.y), (4, 9));
+        assert!(frame.rgba.is_empty());
+        assert!(frame.methods.is_empty());
+        assert!(!hit_test(&data, 0, 0, 0).unwrap());
+        assert!(frames(&data[..data.len() - 1]).is_err());
+    }
     #[test]
     fn archive_entries_keep_frame_numbers_and_offset_order() {
         let mut data = b"S25\0".to_vec();

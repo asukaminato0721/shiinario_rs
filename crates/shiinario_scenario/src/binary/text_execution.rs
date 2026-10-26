@@ -23,6 +23,7 @@ pub(super) struct AsyncText {
     pub offset: usize,
     pub location: Location,
     pub ticking: bool,
+    pub immediate: bool,
     coroutine: Option<Coroutine<TextYield>>,
     reply: Option<PlatformReply>,
 }
@@ -35,6 +36,7 @@ impl AsyncText {
             offset: 0,
             location,
             ticking: false,
+            immediate: false,
             coroutine: Some(Coroutine::new(run_text)),
             reply: None,
         }
@@ -95,9 +97,16 @@ impl TextCo {
 // Each outer iteration is one original text scheduler pass.
 async fn run_text(co: Co<TextYield>) -> Result<()> {
     let co = TextCo(co);
-    let mut timed = true;
+    let mut timed = co
+        .with_vm(|vm| Ok(!vm.async_text.as_ref().unwrap().immediate))
+        .await?;
     loop {
-        if co.with_vm(|vm| Ok(vm.text_style.skip_mask != 0)).await? {
+        if co
+            .with_vm(|vm| {
+                Ok(!vm.async_text.as_ref().unwrap().immediate && vm.text_style.skip_mask != 0)
+            })
+            .await?
+        {
             let input = co
                 .request(PlatformRequest::TextInput { clear: false })
                 .await?;
@@ -219,8 +228,12 @@ impl BinaryVm {
             Err(error) => {
                 let text = self.async_text.as_ref().unwrap();
                 let message = format!(
-                    "{}:{:#x}: {error:#}; opcode=0x0083, task={}, text_byte={:#x}",
-                    text.location.scenario, text.location.offset, text.owner, text.offset
+                    "{}:{:#x}: {error:#}; opcode=0x{:04x}, task={}, text_byte={:#x}",
+                    text.location.scenario,
+                    text.location.offset,
+                    if text.immediate { 0x84 } else { 0x83 },
+                    text.owner,
+                    text.offset
                 );
                 self.failure = Some(message.clone());
                 bail!("{message}")
@@ -377,10 +390,10 @@ impl BinaryVm {
             self.text_style.line_limit,
             &self.text_style.punctuation,
         )?;
-        let request = if self.text_image[0] != u32::MAX {
+        let request = if self.text_style.image[0] != u32::MAX {
             Some(PlatformRequest::DrawImageGlyph {
-                image: self.text_image[0],
-                frame: self.text_image[1],
+                image: self.text_style.image[0],
+                frame: self.text_style.image[1],
                 position: [
                     position[0].wrapping_add(self.text_image_offset[0]) as i32,
                     position[1].wrapping_add(self.text_image_offset[1]) as i32,
