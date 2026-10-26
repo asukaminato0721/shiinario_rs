@@ -63,7 +63,7 @@ impl BufferVoice {
                 self.playing = true;
                 self.looping = flags == 1;
             }
-            SoundCommand::Stop => {
+            SoundCommand::Stop | SoundCommand::Release => {
                 self.playing = false;
                 self.frame = 0;
                 self.fraction = 0;

@@ -1350,6 +1350,11 @@ impl Resources {
         );
         Ok(())
     }
+    pub(crate) fn release_sound(&mut self, id: u32) {
+        if let Some(sound) = self.sounds.remove(&id) {
+            self.resident -= sound.samples.len() * 2;
+        }
+    }
     fn create_image(
         &mut self,
         id: u32,
@@ -1829,6 +1834,10 @@ mod tests {
         assert_eq!(resources.sound_buffer(1).unwrap().samples, samples);
         assert_eq!(sound.samples, samples);
         assert!(!samples.is_empty());
+        resources.release_sound(1);
+        assert!(resources.sound_buffer(1).is_none());
+        assert_eq!(resources.resident_bytes(), 0);
+        resources.release_sound(1);
     }
     #[test]
     fn image_origins_affect_bounds_rendering_and_reset_on_replacement() {
