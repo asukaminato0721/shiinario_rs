@@ -3,18 +3,21 @@
 use anyhow::{Result, ensure};
 use sha2::{Digest, Sha256};
 
-pub(super) const THUMBNAIL_CODE_SIZES: [usize; 2] = [115, 117];
+pub(super) const THUMBNAIL_CODE_SIZES: [usize; 3] = [114, 115, 117];
 pub(super) const SOURCE_SIZE: usize = 800 * 600 * 3;
 pub(super) const TARGET_SIZE: usize = 100 * 75 * 3;
 
-pub(super) fn is_thumbnail(code: &[u8]) -> bool {
-    matches!(
-        (code.len(), format!("{:x}", Sha256::digest(code)).as_str()),
+/// Return the source and destination indices in the current local bank.
+pub(super) fn thumbnail_arguments(code: &[u8]) -> Option<[usize; 2]> {
+    match (code.len(), format!("{:x}", Sha256::digest(code)).as_str()) {
         (117, "ed8a0da1014b470c7985b88fe30ce1b45e669cb363be7180cfb0538d5a143443")
             // TANEGAME start.SCN:0xb1eeb: same 8x8 box average and local-bank
             // source/destination pointers, with a shorter native wrapper.
-            | (115, "af9acc9addb1bb970d17c4daf12c127540463195d4b153d90629e6a293027a38")
-    )
+        | (115, "af9acc9addb1bb970d17c4daf12c127540463195d4b153d90629e6a293027a38") => Some([0, 1]),
+        // HANAOTO start.SCN:0x489b0 reads destination at +0 and source at +16.
+        (114, "fbd189cc011d4369a56d8fca63b6e77696b6121db35cde2fceea93555df2a8f2") => Some([4, 0]),
+        _ => None,
+    }
 }
 
 pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {

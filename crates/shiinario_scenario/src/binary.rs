@@ -2244,15 +2244,16 @@ impl BinaryVm {
             }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
-                ensure!(
-                    native_helper::THUMBNAIL_CODE_SIZES.iter().any(|&size| {
+                let [source_index, target_index] = native_helper::THUMBNAIL_CODE_SIZES
+                    .iter()
+                    .find_map(|&size| {
                         self.memory_read(address, size)
-                            .is_ok_and(|code| native_helper::is_thumbnail(&code))
-                    }),
-                    "unsupported native SCN helper at {address:#x}"
-                );
-                let source = self.banks[&12][0];
-                let target = self.banks[&12][1];
+                            .ok()
+                            .and_then(|code| native_helper::thumbnail_arguments(&code))
+                    })
+                    .with_context(|| format!("unsupported native SCN helper at {address:#x}"))?;
+                let source = self.banks[&12][source_index];
+                let target = self.banks[&12][target_index];
                 ensure!(
                     u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
                         || u64::from(target) + native_helper::TARGET_SIZE as u64
@@ -4638,9 +4639,24 @@ mod tests {
     #[test]
     #[ignore = "requires extracted TANEGAME start.SCN; set SHIINARIO_TANE_START_SCN"]
     fn original_v248_save_thumbnail_consumes_helper_and_preserves_buffers() -> Result<()> {
+        check_original_thumbnail("SHIINARIO_TANE_START_SCN", 0xb1eeb, 115, 0xb0a2e, [0, 1])
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_thumbnail_uses_local_four_as_source() -> Result<()> {
+        check_original_thumbnail("SHIINARIO_HANAOTO_START_SCN", 0x489b0, 114, 0x247e9, [4, 0])
+    }
+
+    fn check_original_thumbnail(
+        variable: &str,
+        helper: usize,
+        size: usize,
+        call: usize,
+        arguments: [usize; 2],
+    ) -> Result<()> {
         use sha2::{Digest, Sha256};
-        let path =
-            std::env::var_os("SHIINARIO_TANE_START_SCN").context("set SHIINARIO_TANE_START_SCN")?;
+        let path = std::env::var_os(variable).with_context(|| format!("set {variable}"))?;
         let original = std::fs::read(path)?;
         let source: Vec<_> = (0..native_helper::SOURCE_SIZE)
             .map(|i| (i * 37 + (i / 97) * 13) as u8)
@@ -4653,28 +4669,28 @@ mod tests {
         ] {
             let mut code = original.clone();
             if truncate {
-                // The 115-byte helper also works at the exact end of a script.
-                code.truncate(0xb1eeb + 115);
+                code.truncate(helper + size);
             }
             if corrupt {
-                code[0xb1eeb + 50] ^= 1;
+                code[helper + 50] ^= 1;
             }
             let mut vm = BinaryVm::with_version("start.SCN", code, EngineVersion::V2_48)?;
-            vm.pc = 0xb0a2e;
+            vm.pc = call;
             vm.allocations.insert(0x50000000, source.clone());
             vm.allocations
                 .insert(0x60000000, vec![0xa5; native_helper::TARGET_SIZE + 32]);
-            vm.banks.get_mut(&12).unwrap()[..2]
-                .copy_from_slice(&[0x50000000, if overlap { 0x50000010 } else { 0x60000010 }]);
+            vm.banks.get_mut(&12).unwrap()[arguments[0]] = 0x50000000;
+            vm.banks.get_mut(&12).unwrap()[arguments[1]] =
+                if overlap { 0x50000010 } else { 0x60000010 };
             let banks = vm.banks.clone();
             let stack = vm.sp;
             if corrupt || overlap {
                 assert!(vm.step().is_err());
-                assert_eq!(vm.pc, 0xb0a2e);
+                assert_eq!(vm.pc, call);
                 assert!(vm.allocations[&0x60000000].iter().all(|&b| b == 0xa5));
             } else {
                 vm.step()?;
-                assert_eq!(vm.pc, 0xb0a35);
+                assert_eq!(vm.pc, call + 7);
                 let output = &vm.allocations[&0x60000000];
                 assert_eq!(&output[..16], &[0xa5; 16]);
                 assert_eq!(&output[output.len() - 16..], &[0xa5; 16]);
