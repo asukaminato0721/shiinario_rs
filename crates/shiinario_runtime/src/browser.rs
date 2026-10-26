@@ -111,7 +111,7 @@ impl Host for BrowserHost {
                 self.poll()?;
                 Ok(1)
             }
-            PlatformRequest::InvalidateRect { .. } => {
+            PlatformRequest::InvalidateRect { .. } | PlatformRequest::UpdateWindow => {
                 self.dirty = true;
                 Ok(1)
             }
