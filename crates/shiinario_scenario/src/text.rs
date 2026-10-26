@@ -74,6 +74,8 @@ pub struct TextStyle {
     // DrawImageGlyph carries the binding separately in serialized events.
     #[serde(skip)]
     pub image: [u32; 2],
+    #[serde(skip)]
+    pub glyph_task: u32,
 }
 impl Default for TextStyle {
     fn default() -> Self {
@@ -103,6 +105,7 @@ impl Default for TextStyle {
             outline_rasterizer: false,
             punctuation: Default::default(),
             image: [u32::MAX, 0],
+            glyph_task: u32::MAX,
         }
     }
 }
@@ -178,7 +181,6 @@ impl TextStyle {
                 }
                 b't' => {
                     // v2.48 432624 stores the optional per-glyph task index.
-                    // -1 disables the callback, matching the default context.
                     ensure!(
                         bytes.get(at) == Some(&b'/'),
                         "unsupported text task control"
@@ -186,9 +188,10 @@ impl TextStyle {
                     at += 1;
                     let task = number(bytes, &mut at)?;
                     ensure!(
-                        task == u32::MAX,
-                        "per-glyph task callback _t/{task} is unresolved"
+                        task == u32::MAX || task < 1000,
+                        "text callback task {task} out of bounds"
                     );
+                    result.glyph_task = task;
                 }
                 b'w' | b'W' => {
                     ensure!(
@@ -391,7 +394,8 @@ mod tests {
         let (style, _) = style.configure(b"_g-1").unwrap();
         assert_eq!(style.image, [u32::MAX, 8]);
         assert!(style.configure(b"_g256").is_err());
-        assert!(style.configure(b"_t/1").is_err());
+        assert_eq!(style.configure(b"_t/1").unwrap().0.glyph_task, 1);
+        assert!(style.configure(b"_t/1000").is_err());
     }
     #[test]
     fn rejects_unknown_controls_glyphs_and_incomplete_parameters() {

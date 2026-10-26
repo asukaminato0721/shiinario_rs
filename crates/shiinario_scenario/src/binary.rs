@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod native_helper;
 mod text_execution;
-use text_execution::{AsyncText, StagedText};
+use text_execution::{AsyncText, StagedText, TextCallback};
 
 /// The original engine stores the full operand and treats every nonzero value as
 /// swapped. Input bits 0, 1 and 2 represent the first three physical mouse buttons.
@@ -673,6 +673,8 @@ pub struct BinaryVm {
     text_cursor: [u32; 3],
     text_layout: crate::text_layout::TextLayout,
     async_text: Option<AsyncText>,
+    text_callback: Option<TextCallback>,
+    text_callback_result: u32,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
 #[derive(Clone)]
@@ -772,6 +774,8 @@ impl BinaryVm {
             text_cursor: [0; 3],
             text_layout: crate::text_layout::TextLayout::new([0; 3]),
             async_text: None,
+            text_callback: None,
+            text_callback_result: 0,
             pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
@@ -889,6 +893,16 @@ impl BinaryVm {
     pub fn scheduled_step(&mut self) -> Result<Event> {
         if self.failure.is_some() || self.ended || self.pending.is_some() {
             return self.step();
+        }
+        if self.text_callback.is_some() {
+            if self.context_flags & 1 == 0 {
+                self.finish_text_callback();
+            } else if self.async_text.is_none() {
+                return self.step();
+            } else if self.context_flags & 8 != 0 {
+                self.async_text.as_mut().unwrap().ticking = true;
+                return self.text_step();
+            }
         }
         if self.async_text.as_ref().is_some_and(|text| text.ticking) {
             return self.text_step();
@@ -2378,6 +2392,9 @@ impl BinaryVm {
             0x07e8 => writes.push((self.destination(&mut cursor)?, self.background_mode)),
             0x0000 => {
                 let result = self.read(&mut cursor)?;
+                if self.text_callback.is_some() {
+                    self.text_callback_result = result;
+                }
                 self.context_flags = 0;
                 rescan = true;
                 // A window procedure's nonzero return consumes the message;
@@ -2386,7 +2403,11 @@ impl BinaryVm {
                     && self
                         .window_callback
                         .is_some_and(|(_, _, message)| message == 0x10);
-                if close || (result != 0 && self.window_callback.is_none()) {
+                if close
+                    || (result != 0
+                        && self.window_callback.is_none()
+                        && self.text_callback.is_none())
+                {
                     self.ended = true;
                 }
             }

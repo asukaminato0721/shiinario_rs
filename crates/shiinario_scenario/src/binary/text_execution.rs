@@ -14,6 +14,9 @@ enum TextYield {
         reply: PlatformReply,
     },
     Tick,
+    Callback {
+        task: u32,
+    },
 }
 
 pub(super) struct AsyncText {
@@ -49,6 +52,11 @@ pub(super) struct StagedText {
     text: Option<AsyncText>,
     context: TextContext,
     completed: bool,
+}
+pub(super) struct TextCallback {
+    previous: u32,
+    stack_pointer: usize,
+    text: AsyncText,
 }
 
 struct TextCo(Co<TextYield>);
@@ -167,11 +175,30 @@ async fn run_text(co: Co<TextYield>) -> Result<()> {
             let Some(TextGlyph {
                 layout,
                 offset,
-                request,
+                mut request,
+                position,
+                character,
             }) = co.with_vm(BinaryVm::text_glyph).await?
             else {
                 return Ok(());
             };
+            let task = co.with_vm(|vm| Ok(vm.text_style.glyph_task)).await?;
+            if task != u32::MAX {
+                co.0.yield_(TextYield::Callback { task }).await;
+                request = co
+                    .with_vm(move |vm| {
+                        Ok(if vm.text_callback_result & 1 != 0 {
+                            None
+                        } else {
+                            vm.text_glyph_request(
+                                vm.async_text.as_ref().unwrap().surface,
+                                position,
+                                character,
+                            )
+                        })
+                    })
+                    .await?;
+            }
             if let Some(request) = request {
                 // Commit layout when the host accepts the glyph, as before.
                 co.request_with_reply(request, move |vm, _| {
@@ -204,9 +231,49 @@ struct TextGlyph {
     layout: TextLayout,
     offset: usize,
     request: Option<PlatformRequest>,
+    position: [u32; 2],
+    character: char,
 }
 
 impl BinaryVm {
+    fn begin_text_callback(&mut self, task: u32) -> Result<Event> {
+        ensure!(
+            self.text_callback.is_none(),
+            "recursive text callback is unresolved"
+        );
+        ensure!(
+            task != self.current_task,
+            "text callback cannot invoke its owner task"
+        );
+        let &(base, pc) = self
+            .task_entries
+            .get(&task)
+            .context("text callback task is not defined")?;
+        let previous = self.current_task;
+        let context = self.text_context;
+        let text = self
+            .async_text
+            .take()
+            .context("text callback has no text coroutine")?;
+        self.select_task(task);
+        self.select_text_context(context);
+        self.text_callback = Some(TextCallback {
+            previous,
+            stack_pointer: self.sp,
+            text,
+        });
+        self.text_callback_result = 0;
+        self.switch_scenario(base);
+        self.pc = pc;
+        self.context_flags = 1;
+        Ok(Event::TextCallback { task, context })
+    }
+    pub(super) fn finish_text_callback(&mut self) {
+        let callback = self.text_callback.take().unwrap();
+        self.sp = callback.stack_pointer;
+        self.select_task(callback.previous);
+        self.async_text = Some(callback.text);
+    }
     fn text_snapshot(&self) -> TextContext {
         TextContext {
             style: self.text_style.clone(),
@@ -333,6 +400,8 @@ impl BinaryVm {
         let result = self.resume_text(&mut coroutine);
         if let Some(text) = &mut self.async_text {
             text.coroutine = Some(coroutine);
+        } else if let Some(callback) = &mut self.text_callback {
+            callback.text.coroutine = Some(coroutine);
         } else if staged
             && let Some(text) = self
                 .staged_texts
@@ -354,6 +423,9 @@ impl BinaryVm {
                 }
                 Resume::Yielded(TextYield::Tick) => return self.text_tick(false),
                 Resume::Complete => return self.text_tick(true),
+                Resume::Yielded(TextYield::Callback { task }) => {
+                    return self.begin_text_callback(task);
+                }
             }
         }
     }
@@ -498,7 +570,23 @@ impl BinaryVm {
             self.text_style.line_limit,
             &self.text_style.punctuation,
         )?;
-        let request = if self.text_style.image[0] != u32::MAX {
+        let request = self.text_glyph_request(surface, position, character);
+        Ok(Some(TextGlyph {
+            layout,
+            offset: offset + consumed,
+            request,
+            position,
+            character,
+        }))
+    }
+
+    fn text_glyph_request(
+        &self,
+        surface: u32,
+        position: [u32; 2],
+        character: char,
+    ) -> Option<PlatformRequest> {
+        if self.text_style.image[0] != u32::MAX {
             Some(PlatformRequest::DrawImageGlyph {
                 image: self.text_style.image[0],
                 frame: self.text_style.image[1],
@@ -518,12 +606,7 @@ impl BinaryVm {
             })
         } else {
             None
-        };
-        Ok(Some(TextGlyph {
-            layout,
-            offset: offset + consumed,
-            request,
-        }))
+        }
     }
 
     fn commit_text_glyph(&mut self, layout: TextLayout, offset: usize, drawn: bool) -> Result<()> {
@@ -541,6 +624,66 @@ impl BinaryVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn glyph_callbacks_run_before_drawing_and_can_change_the_image_or_skip_it() {
+        for result in [0u32, 1] {
+            let mut code = 0x0083u16.to_le_bytes().to_vec();
+            code.extend(immediate(0));
+            code.extend(b"\x10AB\0");
+            code.extend(0u16.to_le_bytes());
+            code.extend(immediate(0));
+            let entry = code.len();
+            code.extend(0x0391u16.to_le_bytes());
+            code.extend([14, 2, 0]);
+            code.extend(0x00b4u16.to_le_bytes());
+            code.extend(immediate(7));
+            code.extend([14, 2, 0]);
+            code.extend(0u16.to_le_bytes());
+            code.extend(immediate(result));
+            let mut vm = BinaryVm::new("glyph-callback.scn", code).unwrap();
+            vm.define_task(10, vm.script_base, entry, false);
+            vm.text_style.fullwidth_ascii = false;
+            vm.text_style.glyph_task = 10;
+            let mut frames = Vec::new();
+            let mut callbacks = 0;
+            let mut ended = false;
+            for _ in 0..100 {
+                match vm.scheduled_step().unwrap() {
+                    Event::TextCallback {
+                        task: 10,
+                        context: 0,
+                    } => callbacks += 1,
+                    Event::Platform {
+                        request:
+                            PlatformRequest::DrawImageGlyph {
+                                image: 7, frame, ..
+                            },
+                        ..
+                    } => {
+                        frames.push(frame);
+                        vm.respond(1).unwrap();
+                    }
+                    Event::Platform {
+                        request: PlatformRequest::DrawGlyph { .. },
+                        ..
+                    } => panic!("callback did not replace the drawing target"),
+                    Event::Platform { .. } | Event::SchedulerPoll => vm.respond(1).unwrap(),
+                    Event::End => {
+                        ended = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(ended);
+            assert_eq!(callbacks, 2);
+            assert_eq!(frames, if result == 0 { vec![1, 2] } else { vec![] });
+            assert_eq!(vm.current_task, 0);
+            assert_eq!(vm.sp, CELLS);
+            assert_eq!(vm.tasks[&10].sp, CELLS);
+            assert_eq!(vm.banks[&14][2], 2);
+        }
+    }
     #[test]
     fn big5_glyphs_preserve_source_offsets_and_double_byte_advances() {
         let mut vm = BinaryVm::new("big5.scn", vec![0; 7]).unwrap();
