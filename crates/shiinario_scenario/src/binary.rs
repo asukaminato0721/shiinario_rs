@@ -3396,8 +3396,8 @@ impl BinaryVm {
             0x0084 => {
                 let surface = self.read(&mut cursor)?;
                 ensure!(
-                    surface == u32::MAX,
-                    "text drawing to surfaces is unresolved"
+                    surface < 256 || surface == u32::MAX,
+                    "text surface out of bounds"
                 );
                 let address = self.read(&mut cursor)?;
                 let controls = self.string_bytes(address)?;
