@@ -104,6 +104,66 @@ impl Host for TestHost {
 }
 
 #[test]
+fn window_timers_repeat_coalesce_and_stop_after_cancellation() {
+    for cancel in [false, true] {
+        for epoch in [0u32, u32::MAX - 50] {
+            let game = Game::new();
+            let imm = |value: u32| [vec![4], value.to_le_bytes().to_vec()].concat();
+            let op = |opcode: u16, args: Vec<u8>| [opcode.to_le_bytes().to_vec(), args].concat();
+            let mut code = op(0xc, imm(10));
+            code.push(0x84);
+            let patch = code.len();
+            code.extend([0; 4]);
+            code.extend(op(0xaf0, imm(10)));
+            code.extend(op(0xafa, [imm(123), imm(100), vec![12, 0, 0]].concat()));
+            let target = code.len() as u32;
+            code.extend(op(
+                0x258,
+                [vec![0x84], target.to_le_bytes().to_vec()].concat(),
+            ));
+            let callback = code.len() as u32;
+            code[patch..patch + 4].copy_from_slice(&callback.to_le_bytes());
+            if cancel {
+                code.extend(op(0xafb, imm(123)));
+            }
+            code.extend(op(0x49d, imm(17)));
+            code.extend(op(0, imm(0)));
+            std::fs::write(game.0.join("wait.scn"), code).unwrap();
+            let project = Project::open(&game.0).unwrap();
+            let mut session = Session::new(&project, "wait.scn").unwrap();
+            let mut host = TestHost {
+                now: epoch,
+                ..Default::default()
+            };
+            let mut callbacks = 0;
+            for (elapsed, expected) in [
+                (0, 0),
+                (99, 0),
+                (100, 1),
+                (199, 1),
+                (350, if cancel { 1 } else { 2 }),
+            ] {
+                host.now = epoch.wrapping_add(elapsed);
+                for _ in 0..200 {
+                    session
+                        .resume(&project, &mut host, |event| {
+                            if matches!(event, Event::MouseButtonMapping { value: 17, .. }) {
+                                callbacks += 1;
+                            }
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                assert_eq!(
+                    callbacks, expected,
+                    "cancel={cancel}, epoch={epoch}, elapsed={elapsed}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn registry_directories_are_nonempty_and_resolve_inside_the_project() {
     for savedata in [false, true] {
         let game = Game::new();
