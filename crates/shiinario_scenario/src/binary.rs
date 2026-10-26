@@ -505,6 +505,7 @@ struct TaskState {
     parameters: Vec<u32>,
     text_context: u32,
     text_surface: u32,
+    read_cursor: u32,
 }
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
@@ -519,6 +520,7 @@ impl TaskState {
             parameters: Vec::new(),
             text_context: 0,
             text_surface: 0,
+            read_cursor: 0,
         }
     }
     fn bank(&self, tag: u8) -> &[u32] {
@@ -675,6 +677,7 @@ pub struct BinaryVm {
     text_contexts: std::collections::BTreeMap<u32, TextContext>,
     staged_texts: std::collections::BTreeMap<u32, StagedText>,
     text_surface: u32,
+    read_cursor: u32,
     text_style: crate::text::TextStyle,
     text_encoding: crate::text::TextEncoding,
     text_image_offset: [u32; 2],
@@ -779,6 +782,7 @@ impl BinaryVm {
             text_contexts: Default::default(),
             staged_texts: Default::default(),
             text_surface: 0,
+            read_cursor: 0,
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
             text_layout: crate::text_layout::TextLayout::new([0; 3]),
@@ -848,6 +852,7 @@ impl BinaryVm {
             parameters: std::mem::replace(&mut self.parameters, task.parameters),
             text_context: self.text_context,
             text_surface: self.text_surface,
+            read_cursor: self.read_cursor,
         };
         self.tasks.insert(self.current_task, old);
         self.switch_scenario(task.base);
@@ -856,6 +861,7 @@ impl BinaryVm {
         self.context_flags = task.flags;
         self.current_task = id;
         self.text_surface = task.text_surface;
+        self.read_cursor = task.read_cursor;
         self.select_text_context(task.text_context);
     }
     fn select_text_context(&mut self, id: u32) {
@@ -3109,6 +3115,37 @@ impl BinaryVm {
             0x0033 => self.message_mode = 1,
             0x001e => self.context_flags |= 4,
             0x001f => self.context_flags &= !4,
+            0x02e4 => {
+                // v2.48 4269df stores a separate cursor for each task.
+                let address = self.read(&mut cursor)?;
+                self.memory_range(address, 0)?;
+                self.read_cursor = address;
+            }
+            0x02e5..=0x02e7 => {
+                let width = match opcode {
+                    0x02e5 => 4,
+                    0x02e6 => 1,
+                    _ => 2,
+                };
+                let bytes = self.memory_read(self.read_cursor, width)?;
+                let mut value = [0; 4];
+                value[..width].copy_from_slice(&bytes);
+                let destination = self.destination(&mut cursor)?;
+                let next = self
+                    .read_cursor
+                    .checked_add(width as u32)
+                    .context("read cursor overflow")?;
+                writes.push((destination, u32::from_le_bytes(value)));
+                self.read_cursor = next;
+            }
+            0x02e8 | 0x02e9 => {
+                let address = if opcode == 0x02e8 {
+                    self.read_cursor.wrapping_sub(self.script_base)
+                } else {
+                    self.read_cursor
+                };
+                writes.push((self.destination(&mut cursor)?, address));
+            }
             0x02ee => {
                 let selector = self.read(&mut cursor)?;
                 ensure!(self.sp > 0, "stack overflow saving execution mode");
@@ -4419,6 +4456,43 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sequential_memory_reads_keep_a_cursor_per_task_and_report_relative_addresses() {
+        let address = 0x2000_0000u32;
+        let mut code = instruction(0x02e4, &immediate(address + 1));
+        for (index, opcode) in [0x02e6u16, 0x02e7, 0x02e5, 0x02e8, 0x02e9]
+            .into_iter()
+            .enumerate()
+        {
+            code.extend(instruction(opcode, &[12, index as u8, 0]));
+        }
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("cursor.scn", code).unwrap();
+        vm.allocations
+            .insert(address, vec![99, 255, 0xcd, 0xab, 1, 2, 3, 4]);
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert_eq!(vm.read_cursor, address + 2);
+        vm.define_task(1, vm.script_base, 0, false);
+        vm.select_task(1);
+        assert_eq!(vm.read_cursor, 0);
+        vm.read_cursor = address;
+        vm.select_task(0);
+        assert_eq!(vm.read_cursor, address + 2);
+        while !matches!(vm.step().unwrap(), Event::End) {}
+        assert_eq!(
+            &vm.banks[&12][..5],
+            &[
+                255,
+                0xabcd,
+                0x0403_0201,
+                address + 8 - SCRIPT_BASE,
+                address + 8
+            ]
+        );
+        assert_eq!(vm.tasks[&1].read_cursor, address);
+        assert!(vm.memory_read(vm.read_cursor, 1).is_err());
+    }
     #[test]
     fn staged_asset_result_survives_join_and_remains_script_owned() {
         let mut code = instruction(0x00ce, b"\x10scene.txt\0");
