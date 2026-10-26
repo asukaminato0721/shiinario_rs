@@ -23,7 +23,7 @@ use winit::{
     icon::RgbaIcon,
     keyboard::{KeyCode, PhysicalKey},
     monitor::Fullscreen,
-    window::{ImeRequest, Window, WindowAttributes, WindowId},
+    window::{ImeRequest, Window, WindowAttributes, WindowButtons, WindowId},
 };
 
 #[derive(Default)]
@@ -138,8 +138,11 @@ impl NativeHost {
                 0xa4 | 0xa5 => 0x12,
                 _ => vk,
             };
-            self.window_messages
-                .push([if pressed { 0x100 } else { 0x101 }, message_key as u32, 0]);
+            self.window_messages.push(crate::input::keyboard_message(
+                message_key as u32,
+                pressed,
+                self.controls.keys[0x38] || self.controls.keys[0xb8],
+            ));
             self.key(
                 vk,
                 if vk == 0x0d {
@@ -257,6 +260,12 @@ impl Host for NativeHost {
             PlatformRequest::SetFullscreen { enabled } => {
                 self.window
                     .set_fullscreen(enabled.then_some(Fullscreen::Borderless(None)));
+                Ok(1)
+            }
+            PlatformRequest::SetMinimizeButton { enabled } => {
+                let mut buttons = self.window.enabled_buttons();
+                buttons.set(WindowButtons::MINIMIZE, *enabled);
+                self.window.set_enabled_buttons(buttons);
                 Ok(1)
             }
             PlatformRequest::InitializeAudio { .. } => {

@@ -120,6 +120,8 @@ impl Host for BrowserHost {
                 browser_fullscreen(*enabled);
                 Ok(1)
             }
+            // Browser pages do not control the browser window's title-bar buttons.
+            PlatformRequest::SetMinimizeButton { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } => Ok(1),
             PlatformRequest::InitializeGraphics | PlatformRequest::ReleaseGraphics => Ok(1),
             // Select the verified scalar renderer; SIMD CPU flags describe the original x86 host.
@@ -286,7 +288,11 @@ impl BrowserPlayer {
         self.host.async_keys.set(vk as usize, pressed);
         self.host
             .window_messages
-            .push([if pressed { 0x100 } else { 0x101 }, vk, 0]);
+            .push(crate::input::keyboard_message(
+                vk,
+                pressed,
+                self.host.controls.keys[0x38] || self.host.controls.keys[0xb8],
+            ));
         for (key, left, right) in [(0x10, 0x2a, 0x36), (0x11, 0x1d, 0x9d), (0x12, 0x38, 0xb8)] {
             self.host.async_keys.set(
                 key,

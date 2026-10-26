@@ -7,6 +7,16 @@ pub fn key_state_reply(raw: i16, active: bool) -> u32 {
     if active { raw as i32 as u32 } else { 0 }
 }
 
+/// Alt modifies ordinary key messages to WM_SYSKEYDOWN/WM_SYSKEYUP.
+pub fn keyboard_message(key: u32, pressed: bool, alt_down: bool) -> [u32; 3] {
+    let system = alt_down || matches!(key, 0x12 | 0xa4 | 0xa5);
+    [
+        if system { 0x104 } else { 0x100 } + u32::from(!pressed),
+        key,
+        0,
+    ]
+}
+
 /// Host-side asynchronous key flags. Reading consumes the recent-press bit,
 /// including when opcode 03e8 subsequently masks the reply for inactivity.
 pub struct AsyncKeys([u16; 256]);
@@ -136,6 +146,13 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn alt_key_events_use_system_messages() {
+        assert_eq!(keyboard_message(0xd, true, true), [0x104, 0xd, 0]);
+        assert_eq!(keyboard_message(0xd, false, true), [0x105, 0xd, 0]);
+        assert_eq!(keyboard_message(0xd, true, false), [0x100, 0xd, 0]);
+        assert_eq!(keyboard_message(0x12, false, false), [0x105, 0x12, 0]);
+    }
     #[test]
     fn asynchronous_press_latches_survive_release_and_are_consumed_once() {
         let mut keys = AsyncKeys::default();

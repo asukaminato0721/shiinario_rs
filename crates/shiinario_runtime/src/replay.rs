@@ -66,11 +66,14 @@ impl Replay {
             }
             self.mouse = frame.mouse_buttons;
             self.control_mask = frame.control_mask;
+            let alt = [0x12, 0xa4, 0xa5]
+                .iter()
+                .any(|key| frame.keys.contains(key));
             for key in 0..256 {
                 let down = frame.keys.contains(&(key as u8));
                 if key > 6 && down != self.keys.is_down(key) {
                     self.window_messages
-                        .push([if down { 0x100 } else { 0x101 }, key as u32, 0]);
+                        .push(crate::input::keyboard_message(key as u32, down, alt));
                 }
                 self.keys.set(key, down);
             }

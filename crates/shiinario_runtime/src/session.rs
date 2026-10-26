@@ -52,6 +52,7 @@ pub struct Session {
     movies: crate::movie::Movies,
     state: SessionState,
     main_loop: Option<MainLoop>,
+    window_timers: std::collections::BTreeMap<u32, (u32, u32)>,
 }
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
@@ -75,6 +76,7 @@ impl Session {
             movies: Default::default(),
             state: SessionState::Runnable,
             main_loop: Some(MainLoop::new()),
+            window_timers: Default::default(),
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -159,7 +161,11 @@ impl Session {
         match self.state {
             SessionState::Runnable => Some(0),
             SessionState::Waiting { epoch, duration } => {
-                let delay = duration.saturating_sub(now.wrapping_sub(epoch));
+                let delay = self
+                    .window_timers
+                    .values()
+                    .map(|&(epoch, period)| period.saturating_sub(now.wrapping_sub(epoch)))
+                    .fold(duration.saturating_sub(now.wrapping_sub(epoch)), u32::min);
                 Some(
                     self.movies
                         .next_wake_delay_ms(now)
@@ -178,6 +184,15 @@ impl Session {
     ) -> Result<bool> {
         self.state = SessionState::Runnable;
         let vm = &mut self.vm;
+        if !self.window_timers.is_empty() {
+            let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+            for (&id, (epoch, period)) in &mut self.window_timers {
+                if now.wrapping_sub(*epoch) >= *period {
+                    *epoch = now;
+                    vm.window_message(0x113, id, 0);
+                }
+            }
+        }
         for [message, wparam, lparam] in host.take_window_messages() {
             vm.window_message(message, wparam, lparam);
         }
@@ -578,6 +593,40 @@ impl Session {
                 emit(&Event::PlatformReply {
                     value: 1,
                     simulated: false,
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::SetWindowTimer { id, milliseconds } = &request {
+                let id = if *id == 0 {
+                    (1..=256)
+                        .find(|id| !self.window_timers.contains_key(id))
+                        .context("window timer slots exhausted")?
+                } else {
+                    *id
+                };
+                ensure!(
+                    self.window_timers.contains_key(&id) || self.window_timers.len() < 256,
+                    "window timer slots exhausted"
+                );
+                let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                self.window_timers
+                    .insert(id, (now, (*milliseconds).clamp(10, 0x7fffffff)));
+                vm.respond(id)?;
+                emit(&Event::PlatformReply {
+                    value: id,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::KillWindowTimer { id } = &request {
+                ensure!(
+                    self.window_timers.remove(id).is_some(),
+                    "window timer {id} does not exist"
+                );
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
                 })?;
                 return Ok(true);
             }
