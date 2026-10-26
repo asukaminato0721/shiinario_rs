@@ -368,6 +368,9 @@ pub enum PlatformRequest {
     CreateDirectory {
         path: String,
     },
+    DeleteFile {
+        path: String,
+    },
     FindMedia {
         name: String,
     },

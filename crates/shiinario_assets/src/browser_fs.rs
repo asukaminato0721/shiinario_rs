@@ -17,6 +17,8 @@ extern "C" {
     fn write_bytes(path: &str, bytes: &[u8]) -> Result<(), JsValue>;
     #[wasm_bindgen(catch, js_name = shiinarioMkdir)]
     fn mkdir(path: &str) -> Result<(), JsValue>;
+    #[wasm_bindgen(catch, js_name = shiinarioRemove)]
+    fn remove(path: &str) -> Result<(), JsValue>;
 }
 fn error(value: JsValue) -> io::Error {
     let text = value.as_string().unwrap_or_else(|| format!("{value:?}"));
@@ -149,6 +151,9 @@ pub fn read(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
 }
 pub fn create_dir(path: impl AsRef<Path>) -> io::Result<()> {
     mkdir(name(path.as_ref())?).map_err(error)
+}
+pub fn remove_file(path: impl AsRef<Path>) -> io::Result<()> {
+    remove(name(path.as_ref())?).map_err(error)
 }
 pub fn write(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
     write_bytes(name(path.as_ref())?, bytes).map_err(error)

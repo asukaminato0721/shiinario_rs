@@ -34,6 +34,174 @@ impl Drop for Game {
 }
 
 #[test]
+fn deletion_removes_loose_files_and_reveals_registered_archive_entries() {
+    for simulated in [false, true] {
+        let game = Game::new();
+        let project = game.project();
+        project
+            .write_file("fixture.txt", b"loose override")
+            .unwrap();
+        let mut resources = Resources::for_project(&project).unwrap();
+        assert!(
+            resources
+                .delete_file(&project, "FIXTURE.TXT", simulated)
+                .unwrap()
+        );
+        assert!(!resources.file_exists(&project, "fixture.txt").unwrap());
+        assert!(
+            resources
+                .read_file_contents(&project, "fixture.txt")
+                .is_err()
+        );
+        assert!(
+            resources
+                .open_file(&project, "fixture.txt", 0x80000000)
+                .is_err()
+        );
+        assert_eq!(
+            resources.read_asset(&project, "fixture.txt").unwrap(),
+            b"synthetic asset fixture\n"
+        );
+        assert_eq!(
+            resources.asset_sizes(&project, "fixture.txt").unwrap(),
+            [24, 40]
+        );
+        assert!(
+            !resources
+                .delete_file(&project, "fixture.txt", simulated)
+                .unwrap()
+        );
+        assert_eq!(game.0.join("fixture.txt").exists(), simulated);
+        if simulated {
+            assert_eq!(
+                std::fs::read(game.0.join("fixture.txt")).unwrap(),
+                b"loose override"
+            );
+        }
+        resources
+            .write_file(&project, "fixture.txt", b"new".to_vec(), simulated)
+            .unwrap();
+        assert!(resources.file_exists(&project, "fixture.txt").unwrap());
+        assert_eq!(
+            resources
+                .read_file_contents(&project, "fixture.txt")
+                .unwrap(),
+            b"new"
+        );
+        assert_eq!(
+            resources.asset_sizes(&project, "fixture.txt").unwrap(),
+            [0, 3]
+        );
+        assert!(
+            resources
+                .delete_file(&project, "fixture.txt", simulated)
+                .unwrap()
+        );
+    }
+}
+
+#[test]
+fn deletion_keeps_directories_and_rejects_paths_outside_the_project() {
+    for simulated in [false, true] {
+        let game = Game::new();
+        let project = game.project();
+        let mut resources = Resources::default();
+        std::fs::create_dir(game.0.join("Save")).unwrap();
+        std::fs::write(game.0.join("Save/Slot.DAT"), b"state").unwrap();
+        assert!(!resources.delete_file(&project, "SAVE", simulated).unwrap());
+        assert!(
+            !resources
+                .delete_file(&project, "missing.dat", simulated)
+                .unwrap()
+        );
+        for name in ["", ".", ".\\", "/"] {
+            assert!(!resources.delete_file(&project, name, simulated).unwrap());
+        }
+        for name in ["../escape", "Save/../../escape", "/escape", "C:\\escape"] {
+            assert!(resources.delete_file(&project, name, simulated).is_err());
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("Save/Slot.DAT", game.0.join("link.dat")).unwrap();
+            std::os::unix::fs::symlink("Save", game.0.join("link-dir")).unwrap();
+            for name in ["link.dat", "link-dir/Slot.DAT"] {
+                assert!(resources.delete_file(&project, name, simulated).is_err());
+            }
+        }
+        assert_eq!(
+            std::fs::read(game.0.join("Save/Slot.DAT")).unwrap(),
+            b"state"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let slot = game.0.join("Save/Slot.DAT");
+            std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o444)).unwrap();
+            assert!(
+                !resources
+                    .delete_file(&project, "save/slot.dat", simulated)
+                    .unwrap()
+            );
+            assert_eq!(std::fs::read(&slot).unwrap(), b"state");
+            std::fs::set_permissions(&slot, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        assert!(
+            resources
+                .delete_file(&project, "save/slot.dat", simulated)
+                .unwrap()
+        );
+        assert!(game.0.join("Save").is_dir());
+        assert_eq!(game.0.join("Save/Slot.DAT").exists(), simulated);
+        resources
+            .write_file(&project, "new.dat", vec![7], simulated)
+            .unwrap();
+        assert!(
+            resources
+                .delete_file(&project, "NEW.DAT", simulated)
+                .unwrap()
+        );
+        assert!(resources.read_asset(&project, "new.dat").is_err());
+        assert!(resources.asset_sizes(&project, "new.dat").is_err());
+    }
+}
+
+#[test]
+fn deletion_instruction_reaches_the_runtime_without_changing_disk_during_trace() {
+    use shiinario_scenario::{Event, PlatformRequest};
+    let game = Game::new();
+    std::fs::create_dir(game.0.join("Save")).unwrap();
+    std::fs::write(game.0.join("Save/Slot.DAT"), b"state").unwrap();
+    let mut code = b"\x23\x01\x10save\0\x10slot.dat\0".to_vec();
+    code.extend(b"\x0e\x01\x10SAVE\\SLOT.DAT\0\x0c\0\0\x9d\x04\x0c\0\0");
+    code.extend(b"\0\0\x04\0\0\0\0");
+    std::fs::write(game.0.join("delete.scn"), code).unwrap();
+    let project = game.project();
+    let mut deleted = false;
+    let mut exists = None;
+    shiinario_runtime::trace_with_platform(&project, "delete.scn", 100, true, |event| {
+        if let Event::Platform {
+            request: PlatformRequest::DeleteFile { path },
+            ..
+        } = event
+        {
+            assert_eq!(path, "save\\slot.dat");
+            deleted = true;
+        }
+        if let Event::MouseButtonMapping { value, .. } = event {
+            exists = Some(*value);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(deleted);
+    assert_eq!(exists, Some(0));
+    assert_eq!(
+        std::fs::read(game.0.join("Save/Slot.DAT")).unwrap(),
+        b"state"
+    );
+}
+
+#[test]
 fn startup_archive_is_registered_when_resources_are_created() {
     let game = Game::new();
     let project = game.project();

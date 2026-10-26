@@ -13,6 +13,69 @@ fn instruction(op: u16, args: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn delete_file_joins_both_operands_and_preserves_the_next_instruction() {
+    for (directory, name, expected) in [
+        ("Save", "Old.DAT", "Save\\Old.DAT"),
+        ("Save\\", "Old.DAT", "Save\\Old.DAT"),
+        ("Save/", "Old.DAT", "Save/Old.DAT"),
+        ("", "Old.DAT", "Old.DAT"),
+        ("Save", "", "Save\\"),
+    ] {
+        for reply in [0, 1] {
+            let mut args = vec![0x10];
+            args.extend(directory.bytes());
+            args.extend([0, 0x10]);
+            args.extend(name.bytes());
+            args.push(0);
+            let mut code = instruction(0x123, &args);
+            let next = code.len();
+            code.extend(instruction(0x49d, &immediate(42)));
+            let mut vm = BinaryVm::with_version("delete.scn", code, EngineVersion::V2_48).unwrap();
+            let event = vm.step().unwrap();
+            assert!(matches!(&event, Event::Platform {
+                request: PlatformRequest::DeleteFile { path }, ..
+            } if path == expected));
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond(reply).unwrap();
+            assert_eq!(vm.location().offset, next);
+            assert!(matches!(
+                vm.step().unwrap(),
+                Event::MouseButtonMapping { value: 42, .. }
+            ));
+        }
+    }
+    for args in [
+        b"\x10save\0".to_vec(),
+        b"\x10save\0\x10unterminated".to_vec(),
+        [b"\x10save\0\x10".as_slice(), &[b'a'; 260], &[0]].concat(),
+    ] {
+        let mut vm =
+            BinaryVm::with_version("bad.scn", instruction(0x123, &args), EngineVersion::V2_48)
+                .unwrap();
+        assert!(vm.step().is_err());
+        assert_eq!(vm.location().offset, 0);
+    }
+}
+
+#[test]
+fn minimize_button_commands_have_no_operands() {
+    for (opcode, enabled) in [(0x79e, true), (0x79f, false)] {
+        let mut code = instruction(opcode, &[]);
+        code.extend(instruction(0x49d, &immediate(42)));
+        let mut vm = BinaryVm::with_version("window.scn", code, EngineVersion::V2_48).unwrap();
+        assert!(matches!(vm.step().unwrap(), Event::Platform {
+            request: PlatformRequest::SetMinimizeButton { enabled: actual }, ..
+        } if actual == enabled));
+        vm.respond(1).unwrap();
+        assert_eq!(vm.location().offset, 2);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::MouseButtonMapping { value: 42, .. }
+        ));
+    }
+}
+
+#[test]
 fn main_window_handle_can_set_the_window_title() {
     let mut code = instruction(0x7b3, &[12, 0, 0]);
     code.extend(instruction(0x7a8, b"\x0c\0\0\x10Game\0"));

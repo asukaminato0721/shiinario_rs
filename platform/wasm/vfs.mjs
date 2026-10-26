@@ -26,12 +26,16 @@ export class DirectoryFs {
     }
     for (const [path, data] of saved) {
       const key = normalize(path);
-      this.overlay.set(key, data === null ? null : new Uint8Array(data));
+      this.overlay.set(key, data === null || data === false ? data : new Uint8Array(data));
     }
   }
   node(path) {
     const key = normalize(path);
-    if (this.overlay.has(key)) return this.overlay.get(key);
+    if (this.overlay.has(key)) {
+      const node = this.overlay.get(key);
+      if (node === false) throw new Error(`NotFound: ${key}`);
+      return node;
+    }
     if (!this.nodes.has(key)) throw new Error(`NotFound: ${key}`);
     return this.nodes.get(key);
   }
@@ -44,7 +48,7 @@ export class DirectoryFs {
     if (this.node(key) !== null) throw new Error(`Not a directory: ${key}`);
     const prefix = key ? `${key}/` : '';
     return [...new Set([...this.nodes.keys(), ...this.overlay.keys()])]
-      .filter(p => p.startsWith(prefix) && p !== key && !p.slice(prefix.length).includes('/'))
+      .filter(p => this.overlay.get(p) !== false && p.startsWith(prefix) && p !== key && !p.slice(prefix.length).includes('/'))
       .map(p => p.slice(prefix.length)).sort();
   }
   read(path, offset, length) {
@@ -62,19 +66,25 @@ export class DirectoryFs {
     let size = 0;
     for (const data of next.values()) size += data?.length ?? 0;
     if (size > 64 * 1024 * 1024) throw new Error('Save data exceeds 64 MiB');
-    this.persist([...next].map(([name, data]) => [name, data === null ? null : Array.from(data)]));
+    this.persist([...next].map(([name, data]) => [name, data === null || data === false ? data : Array.from(data)]));
     this.overlay = next;
   }
   write(path, data) {
     const key = normalize(path);
     if (data.length > 16 * 1024 * 1024) throw new Error('File write exceeds 16 MiB');
-    if ((this.overlay.has(key) || this.nodes.has(key)) && this.node(key) === null) throw new Error('Cannot write a directory');
+    const current = this.overlay.has(key) ? this.overlay.get(key) : this.nodes.get(key);
+    if (current === null) throw new Error('Cannot write a directory');
     this.commit(key, new Uint8Array(data));
   }
   mkdir(path) {
     const key = normalize(path);
-    if (this.nodes.has(key) || this.overlay.has(key)) throw new Error(`AlreadyExists: ${key}`);
+    if (this.overlay.get(key) !== false && (this.nodes.has(key) || this.overlay.has(key))) throw new Error(`AlreadyExists: ${key}`);
     this.commit(key, null);
+  }
+  remove(path) {
+    const key = normalize(path);
+    if (this.node(key) === null) throw new Error('Cannot delete a directory');
+    this.commit(key, false);
   }
   install(target = globalThis) {
     target.shiinarioStat = p => JSON.stringify(this.stat(p));
@@ -82,6 +92,7 @@ export class DirectoryFs {
     target.shiinarioRead = (p, start, size) => this.read(p, start, size);
     target.shiinarioWrite = (p, bytes) => this.write(p, bytes);
     target.shiinarioMkdir = p => this.mkdir(p);
+    target.shiinarioRemove = p => this.remove(p);
   }
 }
 
