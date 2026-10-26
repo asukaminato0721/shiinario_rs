@@ -103,6 +103,9 @@ impl Host for BrowserHost {
             PlatformRequest::ReadMouseButtons => {
                 Ok(u32::from(self.mapping.map_buttons(self.mouse)))
             }
+            PlatformRequest::GetAudioStreamStatus { handle } => {
+                Ok(self.audio.stream_status(*handle))
+            }
             PlatformRequest::ClockMilliseconds => Ok(self.elapsed),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {
                 Ok(u32::from((self.elapsed).wrapping_sub(*epoch) >= *duration))

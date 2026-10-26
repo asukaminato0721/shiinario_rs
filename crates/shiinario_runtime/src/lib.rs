@@ -252,6 +252,9 @@ impl Host for TracePlatform {
             PlatformRequest::ReadKeyState { key } => Ok(self.replay.keys.query(*key, true)),
             PlatformRequest::ReadControls => Ok(self.replay.controls()),
             PlatformRequest::ReadMouseButtons => Ok(self.replay.mouse_button_mask()),
+            PlatformRequest::GetAudioStreamStatus { handle } => {
+                Ok(self.mixer.stream_status(*handle))
+            }
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
             PlatformRequest::ReleaseGraphics
