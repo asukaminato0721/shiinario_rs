@@ -267,6 +267,7 @@ fn main() -> Result<()> {
                         Event::Platform {
                             request:
                                 PlatformRequest::LoadAsset { name }
+                                | PlatformRequest::BeginAssetLoad { name }
                                 | PlatformRequest::ReadAssetInto { name, .. },
                             ..
                         } if name.to_ascii_lowercase().ends_with(".txt") => {

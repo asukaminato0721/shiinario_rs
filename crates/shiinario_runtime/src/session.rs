@@ -591,7 +591,9 @@ impl Session {
                 })?;
                 return Ok(true);
             }
-            if let PlatformRequest::LoadAsset { name } = &request {
+            if let PlatformRequest::LoadAsset { name } | PlatformRequest::BeginAssetLoad { name } =
+                &request
+            {
                 let bytes = resources.read_asset(project, name).with_context(|| {
                     format!(
                         "{}:{:#x}: load asset {name}",
