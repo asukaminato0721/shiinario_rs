@@ -64,6 +64,47 @@ fn execute(version: EngineVersion, style: &[u8], text: &[u8], surface: u32) -> R
 }
 
 #[test]
+fn synchronous_text_measures_plain_glyphs_without_character_delays() {
+    let mut code = 0x84u16.to_le_bytes().to_vec();
+    code.extend(immediate(u32::MAX));
+    code.extend(b"\x10_A_w100\0");
+    code.extend(0x78u16.to_le_bytes());
+    code.extend(immediate(23));
+    code.extend(immediate(41));
+    code.extend(0x84u16.to_le_bytes());
+    code.extend(immediate(u32::MAX));
+    code.extend(b"\x10MingLiU\0");
+    code.extend(b"\x79\0\x0c\0\0\x0c\x01\0\x9d\x04\x0c\0\0");
+    code.extend(b"\0\0\x04\0\0\0\0");
+    let mut vm = BinaryVm::with_version("measure.scn", code, EngineVersion::V2_48).unwrap();
+    let mut clocks = 0;
+    let mut x = None;
+    let mut ended = false;
+    for _ in 0..100 {
+        match vm.scheduled_step().unwrap() {
+            Event::SchedulerPoll => vm.respond(1).unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ClockMilliseconds,
+                ..
+            } => {
+                clocks += 1;
+                vm.respond(0).unwrap();
+            }
+            Event::Platform { request, .. } => panic!("unexpected request: {request:?}"),
+            Event::MouseButtonMapping { value, .. } => x = Some(value),
+            Event::End => {
+                ended = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(ended);
+    assert_eq!(clocks, 1);
+    assert_eq!(x, Some(79));
+}
+
+#[test]
 fn v236_n_preserves_glyphs_style_cursor_and_timing() {
     // Original v2.36 helper 425fc0 -> 42697b consumes 'n' without changing
     // the text context; unlike _r, this command does not move the cursor.

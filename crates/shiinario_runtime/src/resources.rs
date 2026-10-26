@@ -1448,6 +1448,14 @@ impl Resources {
             PlatformRequest::FillSurface { id, rect, color } => {
                 self.fill_surface(*id, *rect, *color)?
             }
+            PlatformRequest::ClearSurface { id } => {
+                let surface = self
+                    .surfaces
+                    .get(id)
+                    .context("clear surface is not allocated")?;
+                let rect = [0, 0, surface.width as i32, surface.height as i32];
+                self.fill_surface(*id, rect, [0; 3])?;
+            }
             PlatformRequest::LoadSound { id, name, flags } => {
                 let bytes = project.read_with_archives(name, &self.archives)?;
                 self.load_sound(*id, &bytes, *flags)?;

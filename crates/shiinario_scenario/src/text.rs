@@ -34,6 +34,9 @@ pub struct TextStyle {
     pub background_mode: u32,
     pub outline_rasterizer: bool,
     pub punctuation: [Vec<u8>; 3],
+    // DrawImageGlyph carries the binding separately in serialized events.
+    #[serde(skip)]
+    pub image: [u32; 2],
 }
 impl Default for TextStyle {
     fn default() -> Self {
@@ -62,6 +65,7 @@ impl Default for TextStyle {
             background_mode: 1,
             outline_rasterizer: false,
             punctuation: Default::default(),
+            image: [u32::MAX, 0],
         }
     }
 }
@@ -125,6 +129,30 @@ impl TextStyle {
                     );
                 }
                 b'e' => result.effects = number(bytes, &mut at)?,
+                b'g' => {
+                    result.image[0] = number(bytes, &mut at)?;
+                    ensure!(
+                        result.image[0] < 256 || result.image[0] == u32::MAX,
+                        "image text slot out of bounds"
+                    );
+                    if at > 0 && bytes[at - 1] == b',' {
+                        result.image[1] = number(bytes, &mut at)?;
+                    }
+                }
+                b't' => {
+                    // v2.48 432624 stores the optional per-glyph task index.
+                    // -1 disables the callback, matching the default context.
+                    ensure!(
+                        bytes.get(at) == Some(&b'/'),
+                        "unsupported text task control"
+                    );
+                    at += 1;
+                    let task = number(bytes, &mut at)?;
+                    ensure!(
+                        task == u32::MAX,
+                        "per-glyph task callback _t/{task} is unresolved"
+                    );
+                }
                 b'w' | b'W' => {
                     ensure!(
                         clock_read.is_none(),
@@ -305,6 +333,16 @@ fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) -> Result<u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn image_font_controls_and_disabled_character_callback_parse_in_sequence() {
+        let style = TextStyle::default();
+        let (style, _) = style.configure(b"_g7,8_t/-1").unwrap();
+        assert_eq!(style.image, [7, 8]);
+        let (style, _) = style.configure(b"_g-1").unwrap();
+        assert_eq!(style.image, [u32::MAX, 8]);
+        assert!(style.configure(b"_g256").is_err());
+        assert!(style.configure(b"_t/1").is_err());
+    }
     #[test]
     fn rejects_unknown_controls_glyphs_and_incomplete_parameters() {
         let style = TextStyle::default();
