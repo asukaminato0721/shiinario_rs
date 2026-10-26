@@ -17,6 +17,43 @@ pub fn keyboard_message(key: u32, pressed: bool, alt_down: bool) -> [u32; 3] {
     ]
 }
 
+/// Original 414190, repeat slot 256: emit a new combination immediately.
+/// A held combination arms a repeat after 300 ms, then every 50 ms.
+#[derive(Default)]
+pub(crate) struct ControlRepeat {
+    mask: u32,
+    phase: u8,
+    epoch: u32,
+    delay: u32,
+}
+impl ControlRepeat {
+    pub fn query(&mut self, mask: u32, now: u32) -> u32 {
+        if mask == 0 {
+            self.mask = 0;
+            self.phase = 0;
+            return 0;
+        }
+        let previous = std::mem::replace(&mut self.mask, mask);
+        if previous & mask != mask || self.phase == 0 {
+            self.epoch = now;
+            self.delay = 300;
+            self.phase = 2;
+            return mask;
+        }
+        if self.phase == 1 {
+            self.epoch = now;
+            self.delay = 50;
+            self.phase = 2;
+            return mask;
+        }
+        // The native helper emits on the query after the deadline check.
+        if now.wrapping_sub(self.epoch) >= self.delay {
+            self.phase = 1;
+        }
+        0
+    }
+}
+
 /// Host-side asynchronous key flags. Reading consumes the recent-press bit,
 /// including when opcode 03e8 subsequently masks the reply for inactivity.
 pub struct AsyncKeys([u16; 256]);
@@ -146,6 +183,24 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn control_repeat_waits_rearms_and_resets_across_clock_wrap() {
+        for epoch in [0u32, u32::MAX - 100] {
+            let mut repeat = ControlRepeat::default();
+            assert_eq!(repeat.query(0x20, epoch), 0x20);
+            for elapsed in [0, 1, 299, 300] {
+                assert_eq!(repeat.query(0x20, epoch.wrapping_add(elapsed)), 0);
+            }
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(300)), 0x20);
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(349)), 0);
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(350)), 0);
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(350)), 0x20);
+            assert_eq!(repeat.query(0x21, epoch.wrapping_add(351)), 0x21);
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(352)), 0);
+            assert_eq!(repeat.query(0, epoch.wrapping_add(353)), 0);
+            assert_eq!(repeat.query(0x20, epoch.wrapping_add(354)), 0x20);
+        }
+    }
     #[test]
     fn alt_key_events_use_system_messages() {
         assert_eq!(keyboard_message(0xd, true, true), [0x104, 0xd, 0]);

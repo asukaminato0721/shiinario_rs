@@ -53,6 +53,7 @@ pub struct Session {
     state: SessionState,
     main_loop: Option<MainLoop>,
     window_timers: std::collections::BTreeMap<u32, (u32, u32)>,
+    control_repeat: crate::input::ControlRepeat,
 }
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
@@ -77,6 +78,7 @@ impl Session {
             state: SessionState::Runnable,
             main_loop: Some(MainLoop::new()),
             window_timers: Default::default(),
+            control_repeat: Default::default(),
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -338,6 +340,17 @@ impl Session {
                 emit(&Event::PlatformReply {
                     value: 0,
                     simulated: false,
+                })?;
+                return Ok(true);
+            }
+            if matches!(&request, PlatformRequest::ReadRepeatedControls) {
+                let mask = host.respond(&PlatformRequest::ReadControls)?;
+                let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                let value = self.control_repeat.query(mask, now);
+                vm.respond(value)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: host.simulated(),
                 })?;
                 return Ok(true);
             }
