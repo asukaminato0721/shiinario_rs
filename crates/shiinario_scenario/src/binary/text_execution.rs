@@ -625,6 +625,59 @@ impl BinaryVm {
 mod tests {
     use super::*;
     #[test]
+    fn immediate_surface_text_draws_without_input_or_character_delays() {
+        for surface in [0, 7, u32::MAX] {
+            let mut code = 0x0084u16.to_le_bytes().to_vec();
+            code.extend(immediate(surface));
+            code.extend(b"\x10AB\0");
+            code.extend(0u16.to_le_bytes());
+            code.extend(immediate(0));
+            let mut vm = BinaryVm::new("immediate.scn", code).unwrap();
+            vm.text_surface = 9;
+            vm.text_style.fullwidth_ascii = false;
+            vm.text_style.character_delay = 1000;
+            vm.text_style.skip_mask = 8;
+            let mut glyphs = Vec::new();
+            let mut ended = false;
+            for _ in 0..50 {
+                match vm.scheduled_step().unwrap() {
+                    Event::Platform {
+                        request:
+                            PlatformRequest::DrawGlyph {
+                                surface: target,
+                                character,
+                                ..
+                            },
+                        ..
+                    } => {
+                        assert_eq!(target, surface);
+                        glyphs.push(character);
+                        vm.respond(1).unwrap();
+                    }
+                    Event::Platform { request, .. } => panic!("unexpected request: {request:?}"),
+                    Event::SchedulerPoll => vm.respond(1).unwrap(),
+                    Event::End => {
+                        ended = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(ended);
+            assert_eq!(
+                glyphs,
+                if surface == u32::MAX {
+                    vec![]
+                } else {
+                    vec!['A', 'B']
+                }
+            );
+            assert_eq!(vm.text_cursor[1], 2 * vm.text_style.half_advance);
+            assert_eq!(vm.text_surface, 9);
+        }
+    }
+
+    #[test]
     fn glyph_callbacks_run_before_drawing_and_can_change_the_image_or_skip_it() {
         for result in [0u32, 1] {
             let mut code = 0x0083u16.to_le_bytes().to_vec();
