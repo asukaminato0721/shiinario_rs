@@ -718,6 +718,16 @@ impl Resources {
             y.wrapping_add(height as i32),
         ])
     }
+    fn image_frame_exists(&self, id: u32, index: u32) -> Result<bool> {
+        match self.images.get(&id).context("image slot is not loaded")? {
+            encoded @ (Image::Encoded(_) | Image::Memory { .. }) => {
+                Ok(image::frames(&encoded.encoded_bytes()?)?
+                    .iter()
+                    .any(|frame| frame.index == index as usize))
+            }
+            Image::Mutable { frames, .. } => Ok((index as usize) < frames.len()),
+        }
+    }
     fn hit_test_images(&self, x: i32, y: i32, items: &[ImageDraw]) -> Result<u32> {
         // Highest layer and latest entry win. Unlike painting, the native hit
         // tester includes disabled items and the maximum layer sentinel.
@@ -1401,6 +1411,9 @@ impl Resources {
     }
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        if let PlatformRequest::ImageFrameExists { id, frame } = request {
+            return Ok(Some(u32::from(self.image_frame_exists(*id, *frame)?)));
+        }
         if let PlatformRequest::GetAudioStreamVolume { handle } = request {
             return Ok(Some(if *handle == 0 {
                 u32::MAX
@@ -1764,6 +1777,28 @@ mod tests {
         assert!(matches!(&resources.images[&10], Image::Encoded(bytes) if bytes == &data));
         assert_eq!(resources.resident_bytes(), 8);
         assert!(resources.frame(10, 0).is_err());
+    }
+    #[test]
+    fn frame_existence_distinguishes_empty_frames_and_missing_table_entries() {
+        let mut data = b"S25\0".to_vec();
+        for word in [3u32, 20, 0, 20, 0, 0, 0, 0, 0] {
+            data.extend(word.to_le_bytes());
+        }
+        let mut resources = Resources::default();
+        resources.load_image(1, data).unwrap();
+        for (frame, exists) in [
+            (0, true),
+            (1, false),
+            (2, true),
+            (3, false),
+            (u32::MAX, false),
+        ] {
+            assert_eq!(resources.image_frame_exists(1, frame).unwrap(), exists);
+        }
+        resources.create_image(2, 1, 1, 4, 2).unwrap();
+        assert!(resources.image_frame_exists(2, 1).unwrap());
+        assert!(!resources.image_frame_exists(2, 2).unwrap());
+        assert!(resources.image_frame_exists(3, 0).is_err());
     }
     #[test]
     fn memory_image_reads_changes_through_relocated_pointers() {
