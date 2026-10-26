@@ -480,6 +480,9 @@ impl Session {
                         location.scenario, location.offset
                     )
                 })?;
+                if matches!(command, SoundCommand::Release) {
+                    resources.release_sound(*id);
+                }
                 vm.respond(value)?;
                 emit(&Event::PlatformReply {
                     value,

@@ -143,6 +143,10 @@ impl Mixer {
     }
     pub fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32> {
         ensure!(id < 256, "sound slot out of bounds");
+        if matches!(command, SoundCommand::Release) {
+            self.buffers.remove(&id);
+            return Ok(1);
+        }
         match self.buffers.get_mut(&id) {
             Some(buffer) => buffer.command(command),
             None => Ok(if matches!(command, SoundCommand::Status) {
@@ -520,6 +524,31 @@ mod tests {
         mixer.play(1, stream, 2).unwrap();
         mixer.stop(1);
         assert_eq!(mixer.stream_status(1), 0);
+    }
+    #[test]
+    fn releasing_a_sound_stops_playback_and_drops_the_mixer_reference() {
+        let sound = Arc::new(Sound {
+            channels: 1,
+            sample_rate: 48000,
+            samples: vec![1234; 16],
+        });
+        let mut mixer = Mixer::default();
+        mixer.install_sound(2, sound.clone()).unwrap();
+        assert_eq!(Arc::strong_count(&sound), 2);
+        mixer
+            .sound_command(2, &SoundCommand::Play { flags: 1 })
+            .unwrap();
+        assert_eq!(mixer.sound_command(2, &SoundCommand::Status).unwrap(), 5);
+        mixer.sound_command(2, &SoundCommand::Release).unwrap();
+        assert_eq!(Arc::strong_count(&sound), 1);
+        assert_eq!(
+            mixer.sound_command(2, &SoundCommand::Status).unwrap(),
+            u32::MAX
+        );
+        mixer.sound_command(2, &SoundCommand::Release).unwrap();
+        let mut output = [1.0; 8];
+        mixer.render(&mut output, 48000, 1).unwrap();
+        assert_eq!(output, [0.0; 8]);
     }
     #[test]
     fn static_buffers_restart_loop_stop_replace_and_mix_with_streams() {

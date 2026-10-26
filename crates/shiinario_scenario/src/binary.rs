@@ -96,6 +96,7 @@ pub struct ImageDraw {
 pub enum SoundCommand {
     Play { flags: u32 },
     Stop,
+    Release,
     Volume { attenuation: i32 },
     Pan { attenuation: i32 },
     Frequency { hz: u32 },
@@ -2347,7 +2348,7 @@ impl BinaryVm {
                 delay = Some(self.read(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
             }
-            0x06a7..=0x06ab | 0x06af => {
+            0x06a7..=0x06ab | 0x06af | 0x06b0 => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "unsupported sound slot/handle {id:#x}");
                 let command = match opcode {
@@ -2355,6 +2356,7 @@ impl BinaryVm {
                         flags: self.read(&mut cursor)?,
                     },
                     0x06a8 => SoundCommand::Stop,
+                    0x06b0 => SoundCommand::Release,
                     0x06a9 => SoundCommand::Volume {
                         attenuation: self.read(&mut cursor)? as i32,
                     },
