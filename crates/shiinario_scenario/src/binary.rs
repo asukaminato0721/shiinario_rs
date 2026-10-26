@@ -189,6 +189,10 @@ pub enum PlatformRequest {
         id: u32,
         frame: u32,
     },
+    ImageFrameExists {
+        id: u32,
+        frame: u32,
+    },
     DrawImages {
         id: u32,
         items: Vec<ImageDraw>,
@@ -2681,6 +2685,14 @@ impl BinaryVm {
                     self.destination(&mut cursor)?,
                 ]);
                 request = Some(PlatformRequest::ImageBounds { id, frame });
+            }
+            0x04c9 => {
+                // v2.48 426117 tests both frame count and the frame pointer.
+                let id = self.read(&mut cursor)?;
+                let frame = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot {id} out of bounds");
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ImageFrameExists { id, frame });
             }
             0x04b5 => {
                 let id = self.read(&mut cursor)?;
