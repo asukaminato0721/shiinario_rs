@@ -16,6 +16,7 @@ use std::{
 const MAX_EXE: usize = 128 * 1024 * 1024;
 const KEY_PREFIX: &[u8] = b"Crypt Type Yoshikun - Copyright(C) 2000 Y.Yamada/STUDIO ";
 const ENGINE_PREFIX: &[u8] = b"\x92\xc5\x96\xbc\x97\xa2\x8f\x8f v2.";
+const ENGLISH_ENGINE_PREFIX: &[u8] = b"Rio Shiina v2.";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 pub(crate) fn from_executable(bytes: &[u8]) -> Result<Profile> {
@@ -135,6 +136,9 @@ impl<'a> PeImage<'a> {
     }
 
     fn unpack(&self) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.unpack_rolling_xor()? {
+            return Ok(Some(bytes));
+        }
         let sections = self.pe.section_table();
         if sections.len() != 1 {
             return Ok(None);
@@ -177,6 +181,116 @@ impl<'a> PeImage<'a> {
         }
         Ok(Some(bytes))
     }
+
+    /// Read the two section ranges from the entry stub. Do not execute x86 code.
+    fn unpack_rolling_xor(&self) -> Result<Option<Vec<u8>>> {
+        let entry_address = self
+            .base
+            .checked_add(
+                self.pe
+                    .nt_headers()
+                    .optional_header()
+                    .address_of_entry_point(),
+            )
+            .context("PE entry address overflow")?;
+        let Ok(entry) = self.offset(entry_address) else {
+            return Ok(None);
+        };
+        let Ok(stub) = slice(self.bytes, entry, 0x4a) else {
+            return Ok(None);
+        };
+        if stub[..7] != *b"\x90\x53\x51\x52\x56\x57\xbe"
+            || stub[11] != 0xb9
+            || stub[16] != 0xbb
+            || stub[21..28] != *b"\xb8\xff\xff\xff\xff\x33\xd2"
+            || stub[28] != 0xe8
+            || stub[33] != 0xbe
+            || stub[38] != 0xb9
+            || stub[43] != 0xe8
+            || stub[48..53] != *b"\x83\xf0\xff\x5f\x3d"
+            || stub[57..62] != *b"\x5e\x5a\x59\x5b\xb8"
+            || stub[66..70] != *b"\x74\x01\xc3\xe9"
+        {
+            return Ok(None);
+        }
+        let target = |next: usize, operand: usize| -> Result<u32> {
+            let displacement = word_at(stub, operand)? as i32;
+            entry_address
+                .checked_add(next as u32)
+                .and_then(|address| address.checked_add_signed(displacement))
+                .context("section decoder address overflow")
+        };
+        let decoder = target(33, 29)?;
+        ensure!(
+            decoder == target(48, 44)?,
+            "inconsistent section decoder calls"
+        );
+        let routine = slice(self.bytes, self.offset(decoder)?, 39)?;
+        ensure!(
+            routine[..5] == *b"\x8b\xf8\x8d\x9c\x9b"
+                && routine[9..31] == *b"\x8a\x16\x90\xc1\xe8\x08\x32\xd3\x81\xe7\xff\0\0\0\x88\x16\x33\xfa\x46\x33\x04\xbd"
+                && routine[35..] == *b"\x49\x75\xda\xc3",
+            "unsupported section decoder instructions"
+        );
+        let table = slice(self.bytes, self.offset(word_at(routine, 31)?)?, 1024)?;
+        for i in 0..256 {
+            let mut value = i as u32;
+            for _ in 0..8 {
+                value = (value >> 1) ^ if value & 1 != 0 { 0xedb88320 } else { 0 };
+            }
+            ensure!(
+                word_at(table, i * 4)? == value,
+                "invalid section decoder CRC table"
+            );
+        }
+        let mut ranges = Vec::new();
+        for (address_at, length_at) in [(7, 12), (34, 39)] {
+            let address = word_at(stub, address_at)?;
+            let length = word_at(stub, length_at)?;
+            let section = self
+                .pe
+                .section_table()
+                .iter()
+                .find(|section| {
+                    self.base.checked_add(section.virtual_address.get(LE)) == Some(address)
+                        && length > 0
+                        && length <= section.size_of_raw_data.get(LE)
+                        && length <= section.virtual_size.get(LE)
+                })
+                .context("invalid encrypted section range")?;
+            let start = section.pointer_to_raw_data.get(LE) as usize;
+            slice(self.bytes, start, length as usize)?;
+            let range = start..start + length as usize;
+            ensure!(
+                !range.contains(&entry),
+                "section decoder overlaps encrypted data"
+            );
+            ensure!(
+                ranges.iter().all(
+                    |previous: &std::ops::Range<usize>| previous.end <= range.start
+                        || range.end <= previous.start
+                ),
+                "encrypted section ranges overlap"
+            );
+            ranges.push(range);
+        }
+        let mut bytes = self.bytes.to_vec();
+        let mut key = word_at(stub, 17)?;
+        let increment = word_at(routine, 5)?;
+        let mut crc = flate2::Crc::new();
+        for range in ranges {
+            for byte in &mut bytes[range.clone()] {
+                key = key.wrapping_mul(5).wrapping_add(increment);
+                *byte ^= key as u8;
+            }
+            crc.update(&bytes[range]);
+        }
+        ensure!(
+            crc.sum() == word_at(stub, 53)?,
+            "decoded section checksum mismatch"
+        );
+        Ok(Some(bytes))
+    }
 }
 
 fn matches<'a>(bytes: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
@@ -194,11 +308,14 @@ fn unique<T>(mut values: impl Iterator<Item = T>, what: &str) -> Result<T> {
 
 fn recover(image: &PeImage<'_>) -> Result<Profile> {
     let bytes = image.bytes;
-    let mut versions = matches(bytes, ENGINE_PREFIX).filter_map(|at| {
-        let minor = bytes.get(at + ENGINE_PREFIX.len()..at + ENGINE_PREFIX.len() + 2)?;
-        let minor = std::str::from_utf8(minor).ok()?;
-        EngineVersion::from_config(&format!("椎名里緒 v2.{minor}"))
-    });
+    let mut versions = [ENGINE_PREFIX, ENGLISH_ENGINE_PREFIX]
+        .into_iter()
+        .flat_map(|prefix| matches(bytes, prefix).map(move |at| at + prefix.len()))
+        .filter_map(|at| {
+            let minor = bytes.get(at..at + 2)?;
+            let minor = std::str::from_utf8(minor).ok()?;
+            EngineVersion::from_config(&format!("椎名里緒 v2.{minor}"))
+        });
     let version = versions
         .next()
         .context("missing ShiinaRio version banner")?;
@@ -614,6 +731,110 @@ mod tests {
         Ok(())
     }
 
+    fn rolling_xor_fixture(raw: usize, base: u32, seed: u32, increment: u32) -> Vec<u8> {
+        let mut bytes = fixture(raw, base, b"20261027");
+        bytes[raw..raw + 0x40].fill(0);
+        put(&mut bytes, raw, b"Rio Shiina v2.36\0");
+        put(&mut bytes, 0x86, &3u16.to_le_bytes());
+        put(&mut bytes, 0xa8, &0x9000u32.to_le_bytes());
+        for (index, rva, offset, length) in [
+            (0, 0x5000u32, raw, 0x1000u32),
+            (1, 0x7000, raw + 0x1000, 0x400),
+            (2, 0x9000, raw + 0x1800, 0x800),
+        ] {
+            for (field, value) in [(8, length), (12, rva), (16, length), (20, offset as u32)] {
+                put(&mut bytes, 0x178 + index * 40 + field, &value.to_le_bytes());
+            }
+        }
+        let entry = raw + 0x1800;
+        let stub = &mut bytes[entry..];
+        put(stub, 0, b"\x90\x53\x51\x52\x56\x57\xbe");
+        put(stub, 7, &(base + 0x5000).to_le_bytes());
+        stub[11] = 0xb9;
+        put(stub, 12, &0x1000u32.to_le_bytes());
+        stub[16] = 0xbb;
+        put(stub, 17, &seed.to_le_bytes());
+        put(stub, 21, b"\xb8\xff\xff\xff\xff\x33\xd2\xe8");
+        put(stub, 29, &(0x50u32 - 33).to_le_bytes());
+        stub[33] = 0xbe;
+        put(stub, 34, &(base + 0x7000).to_le_bytes());
+        stub[38] = 0xb9;
+        put(stub, 39, &0x400u32.to_le_bytes());
+        stub[43] = 0xe8;
+        put(stub, 44, &(0x50u32 - 48).to_le_bytes());
+        put(stub, 48, b"\x83\xf0\xff\x5f\x3d");
+        put(stub, 57, b"\x5e\x5a\x59\x5b\xb8\0\0\0\0\x74\x01\xc3\xe9");
+        put(stub, 70, &(-0x4000i32 - 74).to_le_bytes());
+        put(stub, 0x50, b"\x8b\xf8\x8d\x9c\x9b");
+        put(stub, 0x55, &increment.to_le_bytes());
+        put(
+            stub,
+            0x59,
+            b"\x8a\x16\x90\xc1\xe8\x08\x32\xd3\x81\xe7\xff\0\0\0\x88\x16\x33\xfa\x46\x33\x04\xbd",
+        );
+        put(stub, 0x6f, &(base + 0x9080).to_le_bytes());
+        put(stub, 0x73, b"\x49\x75\xda\xc3");
+        for i in 0..256 {
+            let mut value = i as u32;
+            for _ in 0..8 {
+                value = (value >> 1) ^ if value & 1 != 0 { 0xedb88320 } else { 0 };
+            }
+            put(stub, 0x80 + i * 4, &value.to_le_bytes());
+        }
+        let mut key = seed;
+        let mut crc = flate2::Crc::new();
+        for range in [raw..raw + 0x1000, raw + 0x1000..raw + 0x1400] {
+            crc.update(&bytes[range.clone()]);
+            for byte in &mut bytes[range] {
+                key = key.wrapping_mul(5).wrapping_add(increment);
+                *byte ^= key as u8;
+            }
+        }
+        put(&mut bytes, entry + 53, &crc.sum().to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn recovers_rolling_xor_sections_with_english_version_banner() -> Result<()> {
+        for (raw, base, seed, increment) in [
+            (0x200, 0x400000, 0xe5b9abd3, 0x3711),
+            (0x700, 0x1200000, 0x12345678, 0x1357),
+        ] {
+            let bytes = rolling_xor_fixture(raw, base, seed, increment);
+            let expected = from_executable(&fixture(raw, base, b"20261027"))?;
+            assert!(same_profile(&expected, &from_executable(&bytes)?));
+            for offset in [
+                raw + 0x80,
+                raw + 0x1100,
+                raw + 0x1800 + 53,
+                raw + 0x1800 + 0x50,
+                raw + 0x1800 + 0x80,
+            ] {
+                let mut bad = bytes.clone();
+                bad[offset] ^= 1;
+                assert!(
+                    from_executable(&bad).is_err(),
+                    "accepted corruption at {offset:x}"
+                );
+            }
+            for (offset, value) in [
+                (7, u32::MAX),
+                (12, u32::MAX),
+                (34, base + 0x5000),
+                (44, u32::MAX),
+                (0x6f, u32::MAX),
+            ] {
+                let mut bad = bytes.clone();
+                put(&mut bad, raw + 0x1800 + offset, &value.to_le_bytes());
+                assert!(
+                    from_executable(&bad).is_err(),
+                    "accepted invalid operand at {offset:x}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     struct Temp(PathBuf);
     impl Drop for Temp {
         fn drop(&mut self) {
@@ -798,6 +1019,37 @@ mod tests {
         let message = format!("{error:#}");
         assert!(message.contains("missing crypt key template"), "{message}");
         assert!(message.contains("unverified ShiinaRio v2.46"), "{message}");
+    }
+
+    #[test]
+    #[ignore = "requires localized v2.48 game installation; set SHIINARIO_LOCALIZED_V248_EXE"]
+    fn original_localized_v248_archives_decode() -> Result<()> {
+        let exe = PathBuf::from(
+            std::env::var_os("SHIINARIO_LOCALIZED_V248_EXE")
+                .context("set SHIINARIO_LOCALIZED_V248_EXE")?,
+        );
+        let profile = from_executable(&fs::read(&exe)?)?;
+        assert_eq!(profile.version, EngineVersion::V2_48);
+        let project = crate::project::Project::open(exe.parent().unwrap())?;
+        assert_eq!(project.config.version, EngineVersion::V2_48);
+        for archive in &project.archives {
+            assert!(same_profile(&archive.profile, &profile));
+            for entry in &archive.entries {
+                archive
+                    .read(entry)
+                    .with_context(|| format!("{}:{}", archive.path.display(), entry.name))?;
+            }
+            println!(
+                "{}: {} entries",
+                archive.path.display(),
+                archive.entries.len()
+            );
+        }
+        ensure!(
+            !project.read(&project.config.startup)?.is_empty(),
+            "empty startup scenario"
+        );
+        Ok(())
     }
 
     #[test]

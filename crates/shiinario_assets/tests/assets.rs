@@ -42,16 +42,18 @@ fn configuration_versions_and_wana_catalog_mapping() {
         ("2.46", EngineVersion::Unverified(246)),
         ("2.50", EngineVersion::Unverified(250)),
     ] {
-        let text = format!(
-            "[椎名里緒 v{version}]\r\nWindowWidth=800\r\nWindowHeight=600\r\nArc=fixture.war\r\nScn=start.scn\r\n"
-        );
-        let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&text);
-        let config = Config::parse("game.ini".into(), &bytes).unwrap();
-        assert_eq!(config.version, expected);
-        assert_eq!(
-            serde_json::to_value(config.version).unwrap(),
-            format!("椎名里緒 v{version}")
-        );
+        for name in ["椎名里緒", "Rio Shiina"] {
+            let text = format!(
+                "[{name} v{version}]\r\nWindowWidth=800\r\nWindowHeight=600\r\nArc=fixture.war\r\nScn=start.scn\r\n"
+            );
+            let (bytes, _, _) = encoding_rs::SHIFT_JIS.encode(&text);
+            let config = Config::parse("game.ini".into(), &bytes).unwrap();
+            assert_eq!(config.version, expected);
+            assert_eq!(
+                serde_json::to_value(config.version).unwrap(),
+                format!("椎名里緒 v{version}")
+            );
+        }
     }
     assert_eq!(
         EngineVersion::from_config("椎名里緒 v2.35"),
@@ -63,6 +65,15 @@ fn configuration_versions_and_wana_catalog_mapping() {
     );
     assert!(EngineVersion::from_config("Other Engine v2.46").is_none());
     assert!(EngineVersion::from_config("椎名里緒 v2.46garbage").is_none());
+    for section in [
+        "Rio Shiina v2.48garbage",
+        "Rio Shiina v2.4",
+        "Rio Shiina v2.048",
+        "Rio Shiina v2.xx",
+        "Rio Shiina v3.48",
+    ] {
+        assert!(EngineVersion::from_config(section).is_none(), "{section}");
+    }
     assert!(EngineVersion::from_scheme(-1).is_none());
     let t = Temp::new();
     std::fs::rename(t.0.join("RANDL_.exe"), t.0.join("WANA.EXE")).unwrap();

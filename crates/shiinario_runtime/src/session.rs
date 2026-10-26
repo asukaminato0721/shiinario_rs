@@ -598,13 +598,23 @@ impl Session {
                 &request,
                 PlatformRequest::ProjectDirectory | PlatformRequest::ReadRegistryString { .. }
             ) {
-                // All registry strings use the empty project-relative prefix,
-                // which resolves to Project.root even when SCN appends a filename.
+                // Registry paths must be nonempty: scripts use an empty value
+                // to detect a missing installation. Keep paths project-relative.
+                let bytes: &[u8] = match &request {
+                    PlatformRequest::ReadRegistryString { name, .. }
+                        if name.eq_ignore_ascii_case("DataPath")
+                            && project.directory_exists("savedata")? =>
+                    {
+                        b"savedata\\"
+                    }
+                    PlatformRequest::ReadRegistryString { .. } => b".\\",
+                    _ => &[],
+                };
                 emit(&Event::PlatformBytesReply {
-                    bytes: Vec::new(),
+                    bytes: bytes.to_vec(),
                     simulated: host.simulated(),
                 })?;
-                vm.respond_bytes(&[])?;
+                vm.respond_bytes(bytes)?;
                 return Ok(true);
             }
             if matches!(&request, PlatformRequest::ReadRegistryValue { .. }) {

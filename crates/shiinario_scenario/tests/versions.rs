@@ -13,6 +13,17 @@ fn instruction(op: u16, args: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn main_window_handle_can_set_the_window_title() {
+    let mut code = instruction(0x7b3, &[12, 0, 0]);
+    code.extend(instruction(0x7a8, b"\x0c\0\0\x10Game\0"));
+    let mut vm = BinaryVm::with_version("window.scn", code, EngineVersion::V2_48).unwrap();
+    vm.step().unwrap();
+    assert!(matches!(vm.step().unwrap(), Event::Platform {
+        request: PlatformRequest::SetWindowTitle { window: 0, title }, ..
+    } if title == "Game"));
+}
+
+#[test]
 fn program_info_dispatches_by_version() {
     for (version, expected) in [
         (EngineVersion::V2_36, [236, 20050900]),

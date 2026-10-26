@@ -42,6 +42,50 @@ fn execute(code: Vec<u8>) -> Vec<u32> {
 }
 
 #[test]
+fn explicit_globals_start_at_zero_and_preserve_existing_values_and_addresses() {
+    let mut code = instruction(0x3ce, b"\x03\0\x12Gevnum\0\x12Gpnum\0\x12Gevnum\0");
+    observe(&mut code, "Gevnum");
+    observe(&mut code, "Gpnum");
+    assign(&mut code, 42, "Gevnum");
+    code.extend(instruction(0x3ce, b"\x01\0\x12pointer\0"));
+    code.extend(instruction(
+        0x38f,
+        &[named(0x52, "Gevnum"), named(0x12, "pointer")].concat(),
+    ));
+    code.extend(instruction(0x3ce, b"\x02\0\x12Gevnum\0\x12other\0"));
+    code.extend(instruction(0x3ce, &[0, 0]));
+    observe(&mut code, "Gevnum");
+    code.extend(instruction(0x49d, &named(0x13, "pointer")));
+    observe(&mut code, "other");
+    let length = code.len();
+    let mut vm = BinaryVm::with_version("start.scn", code, EngineVersion::V2_48).unwrap();
+    let mut values = Vec::new();
+    while vm.location().offset < length {
+        if let Event::MouseButtonMapping { value, .. } = vm.step().unwrap() {
+            values.push(value);
+        }
+    }
+    assert_eq!(values, [0, 0, 42, 42, 0]);
+}
+
+#[test]
+fn explicit_globals_reject_invalid_declarations() {
+    for args in [
+        b"\x01\0\x12missing".as_slice(),
+        b"\x01\0\x10name\0",
+        b"\x01\0\x12array[2]\0",
+        b"\x01\x01",
+        b"\x01\0\x12\0",
+    ] {
+        let mut vm =
+            BinaryVm::with_version("bad.scn", instruction(0x3ce, args), EngineVersion::V2_48)
+                .unwrap();
+        assert!(vm.step().is_err());
+        assert_eq!(vm.location().offset, 0);
+    }
+}
+
+#[test]
 fn global_fallback_matches_original_setter_and_getter() {
     // Captured by executing 428d40/428b00 from wana.EXE in Unicorn, supplying
     // only the variable tables and the three Win32 string imports.

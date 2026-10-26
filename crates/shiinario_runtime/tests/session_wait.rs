@@ -104,6 +104,73 @@ impl Host for TestHost {
 }
 
 #[test]
+fn registry_directories_are_nonempty_and_resolve_inside_the_project() {
+    for savedata in [false, true] {
+        let game = Game::new();
+        if savedata {
+            std::fs::create_dir(game.0.join("savedata")).unwrap();
+        }
+        // Allocate a 256-byte string buffer, then read installation paths.
+        let mut code = b"\xbc\x02\x04\0\x01\0\0\x0c\0\0".to_vec();
+        for name in ["DataPath", "InstPath"] {
+            code.extend(b"\xfe\0\x10");
+            code.extend(name.as_bytes());
+            code.extend(b"\0\x0c\0\0");
+            // Read the first byte that the reply stored in the VM buffer.
+            code.extend(b"\x04\x03\x0c\0\0\x0c\x01\0");
+            code.extend(b"\x9d\x04\x0c\x01\0");
+        }
+        code.extend(b"\0\0\x04\0\0\0\0");
+        std::fs::write(game.0.join("wait.scn"), code).unwrap();
+        let project = Project::open(&game.0).unwrap();
+        let mut session = Session::new(&project, "wait.scn").unwrap();
+        let mut host = TestHost::default();
+        let mut paths = Vec::new();
+        let mut exists = Vec::new();
+        let mut ended = false;
+        for _ in 0..100 {
+            let state = session
+                .resume(&project, &mut host, |event| {
+                    match event {
+                        Event::PlatformBytesReply { bytes, .. } => paths.push(bytes.clone()),
+                        Event::MouseButtonMapping { value, .. } => exists.push(*value),
+                        _ => {}
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            if state == SessionState::Ended {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended);
+        assert_eq!(
+            paths,
+            [
+                if savedata {
+                    b"savedata\\".as_slice()
+                } else {
+                    b".\\"
+                },
+                b".\\"
+            ]
+        );
+        assert_eq!(
+            exists,
+            [
+                if savedata { b's' as u32 } else { b'.' as u32 },
+                b'.' as u32
+            ]
+        );
+        for path in paths {
+            let path = String::from_utf8(path).unwrap().replace('\\', "/");
+            assert!(game.0.join(path).is_dir());
+        }
+    }
+}
+
+#[test]
 fn resume_preserves_timer_blocking_and_execution_across_clock_wrap() {
     let game = Game::new();
     let project = Project::open(&game.0).unwrap();
