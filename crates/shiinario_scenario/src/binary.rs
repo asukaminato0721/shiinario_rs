@@ -4208,7 +4208,7 @@ impl BinaryVm {
                     },
                 ));
             }
-            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039a..=0x039b | 0x039e..=0x039f => {
+            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039a..=0x039f => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
@@ -4222,6 +4222,8 @@ impl BinaryVm {
                     0x398 => first ^ second,
                     0x39a => second.wrapping_shr(first),
                     0x39b => second.wrapping_shl(first),
+                    0x39c => second.rotate_right(first),
+                    0x39d => second.rotate_left(first),
                     _ => second.wrapping_mul(first),
                 };
                 writes.push((destination, value));
@@ -4474,6 +4476,29 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn rotations_wrap_bits_and_accept_counts_above_word_width() {
+        for (count, right, left) in [
+            (0, 0x8123_4567, 0x8123_4567),
+            (1, 0xc091_a2b3, 0x0246_8acf),
+            (31, 0x0246_8acf, 0xc091_a2b3),
+            (32, 0x8123_4567, 0x8123_4567),
+            (33, 0xc091_a2b3, 0x0246_8acf),
+            (u32::MAX, 0x0246_8acf, 0xc091_a2b3),
+        ] {
+            let mut code = instruction(0x039c, &[immediate(count), vec![12, 0, 0]].concat());
+            code.extend(instruction(
+                0x039d,
+                &[immediate(count), vec![12, 1, 0]].concat(),
+            ));
+            code.extend(instruction(0, &immediate(0)));
+            let mut vm = BinaryVm::new("rotate.scn", code).unwrap();
+            vm.banks.get_mut(&12).unwrap()[..2].fill(0x8123_4567);
+            while !matches!(vm.step().unwrap(), Event::End) {}
+            assert_eq!(&vm.banks[&12][..2], &[right, left]);
+        }
+    }
+
     #[test]
     fn string_comparisons_use_unsigned_bytes_and_stop_at_nul() {
         for (left, right, sensitive, insensitive) in [
