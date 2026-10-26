@@ -137,6 +137,7 @@ pub struct Resources {
     display: Option<Surface>,
     text_damage: Vec<[i32; 4]>,
     images: BTreeMap<u32, Image>,
+    image_origins: BTreeMap<(u32, u32), [i32; 2]>,
     sounds: BTreeMap<u32, Arc<Sound>>,
     streams: BTreeMap<u32, Arc<AudioStream>>,
     resident: usize,
@@ -654,10 +655,10 @@ impl Resources {
     }
     /// Decode only the requested frame. The caller owns the decoded pixels.
     pub fn frame(&self, id: u32, index: usize) -> Result<Frame> {
-        match self.images.get(&id).context("image slot is not loaded")? {
+        let mut frame = match self.images.get(&id).context("image slot is not loaded")? {
             encoded @ (Image::Encoded(_) | Image::Memory { .. }) => {
                 let frame = image::decode(&encoded.encoded_bytes()?, index)?;
-                Ok(Frame {
+                Frame {
                     x: frame.info.x,
                     y: frame.info.y,
                     methods: frame.methods,
@@ -666,12 +667,12 @@ impl Resources {
                         height: frame.info.height,
                         rgba: frame.rgba,
                     },
-                })
+                }
             }
             Image::Mutable {
                 frames,
                 bytes_per_pixel,
-            } => Ok(Frame {
+            } => Frame {
                 x: 0,
                 y: 0,
                 methods: vec![
@@ -687,8 +688,13 @@ impl Resources {
                     .get(index)
                     .context("image frame out of bounds")?
                     .clone(),
-            }),
+            },
+        };
+        if let Some(&[x, y]) = self.image_origins.get(&(id, index as u32)) {
+            frame.x = x;
+            frame.y = y;
         }
+        Ok(frame)
     }
     pub fn resident_bytes(&self) -> usize {
         self.resident
@@ -711,12 +717,35 @@ impl Resources {
                     (0, 0, surface.width, surface.height)
                 }
             };
+        let [x, y] = self
+            .image_origins
+            .get(&(id, index))
+            .copied()
+            .unwrap_or([x, y]);
         Ok([
             x,
             y,
             x.wrapping_add(width as i32),
             y.wrapping_add(height as i32),
         ])
+    }
+    fn set_image_origin(&mut self, id: u32, frame: u32, position: [i32; 2]) -> Result<()> {
+        ensure!(
+            self.image_frame_exists(id, frame)?,
+            "image frame not present"
+        );
+        if let Image::Memory { memory, address } = &self.images[&id] {
+            let pointer =
+                u32::from_le_bytes(memory.read(8 + frame as usize * 4, 4)?.try_into().unwrap());
+            let offset = pointer
+                .checked_sub(*address)
+                .context("image pointer precedes allocation")? as usize;
+            let bytes: Vec<u8> = position.into_iter().flat_map(i32::to_le_bytes).collect();
+            memory.write(offset + 8, &bytes)?;
+        } else {
+            self.image_origins.insert((id, frame), position);
+        }
+        Ok(())
     }
     fn image_frame_exists(&self, id: u32, index: u32) -> Result<bool> {
         match self.images.get(&id).context("image slot is not loaded")? {
@@ -1234,6 +1263,7 @@ impl Resources {
         if let Some(image) = self.images.remove(&id) {
             self.resident -= image.size();
         }
+        self.image_origins.retain(|&(slot, _), _| slot != id);
         Ok(())
     }
     fn release_surface(&mut self, id: u32) -> Result<()> {
@@ -1257,6 +1287,7 @@ impl Resources {
         let resident = self.resident - old + data.len();
         ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
         self.images.insert(id, Image::Encoded(data));
+        self.image_origins.retain(|&(slot, _), _| slot != id);
         self.resident = resident;
         Ok(())
     }
@@ -1273,6 +1304,7 @@ impl Resources {
         image::relocate(&mut bytes, address, true)?;
         memory.write(0, &bytes)?;
         self.images.insert(id, Image::Memory { memory, address });
+        self.image_origins.retain(|&(slot, _), _| slot != id);
         self.resident = resident;
         Ok(())
     }
@@ -1366,6 +1398,7 @@ impl Resources {
                 frames,
             },
         );
+        self.image_origins.retain(|&(slot, _), _| slot != id);
         self.resident = resident;
         Ok(())
     }
@@ -1487,6 +1520,11 @@ impl Resources {
             PlatformRequest::DrawImages { id, items, clip } => {
                 self.draw_images(*id, items, *clip)?
             }
+            PlatformRequest::SetImageOrigin {
+                id,
+                frame,
+                position,
+            } => self.set_image_origin(*id, *frame, *position)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
             PlatformRequest::BitBlt {
@@ -1793,6 +1831,50 @@ mod tests {
         assert!(!samples.is_empty());
     }
     #[test]
+    fn image_origins_affect_bounds_rendering_and_reset_on_replacement() {
+        let mut resources = Resources::default();
+        resources.create_image(3, 1, 1, 4, 2).unwrap();
+        resources
+            .fill_image(3, 1, [0, 0, 1, 1], 0xff00_00ff)
+            .unwrap();
+        resources.set_image_origin(3, 1, [1, 1]).unwrap();
+        assert_eq!(resources.image_bounds(3, 1).unwrap(), [1, 1, 2, 2]);
+        assert_eq!(
+            (
+                resources.frame(3, 1).unwrap().x,
+                resources.frame(3, 1).unwrap().y
+            ),
+            (1, 1)
+        );
+        resources.create_surface(0, 2, 2, 0).unwrap();
+        let item = ImageDraw {
+            image: 3,
+            frame: 1,
+            flags: 0x8000_0000,
+            layer: 0,
+            x: 0,
+            y: 0,
+            extra: [77, 0],
+        };
+        resources
+            .draw_images(0, std::slice::from_ref(&item), None)
+            .unwrap();
+        assert_eq!(
+            &resources.surface(0).unwrap().rgba[12..16],
+            &[255, 0, 0, 255]
+        );
+        assert_eq!(
+            resources
+                .hit_test_images(1, 1, std::slice::from_ref(&item))
+                .unwrap(),
+            77
+        );
+        assert_eq!(resources.hit_test_images(0, 0, &[item]).unwrap(), u32::MAX);
+        resources.create_image(3, 1, 1, 4, 2).unwrap();
+        assert_eq!(resources.image_bounds(3, 1).unwrap(), [0, 0, 1, 1]);
+        assert!(resources.set_image_origin(3, 2, [0, 0]).is_err());
+    }
+    #[test]
     fn frame_existence_distinguishes_empty_frames_and_missing_table_entries() {
         let mut data = b"S25\0".to_vec();
         for word in [3u32, 20, 0, 20, 0, 0, 0, 0, 0] {
@@ -1833,6 +1915,12 @@ mod tests {
         memory.write(20, &5u32.to_le_bytes()).unwrap();
         assert_eq!(resources.frame(2, 0).unwrap().surface.rgba, [1, 2, 9, 255]);
         assert_eq!(resources.image_bounds(2, 0).unwrap(), [5, 0, 6, 1]);
+        resources.set_image_origin(2, 0, [-7, 11]).unwrap();
+        assert_eq!(resources.image_bounds(2, 0).unwrap(), [-7, 11, -6, 12]);
+        assert_eq!(
+            memory.read(20, 8).unwrap(),
+            [(-7i32).to_le_bytes(), 11i32.to_le_bytes()].concat()
+        );
         memory.write(8, &u32::MAX.to_le_bytes()).unwrap();
         assert!(resources.frame(2, 0).is_err());
     }

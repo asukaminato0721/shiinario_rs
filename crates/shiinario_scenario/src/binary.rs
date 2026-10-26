@@ -195,6 +195,15 @@ pub enum PlatformRequest {
         id: u32,
         frame: u32,
     },
+    SetImageOrigin {
+        id: u32,
+        frame: u32,
+        position: [i32; 2],
+    },
+    ImageOrigin {
+        id: u32,
+        frame: u32,
+    },
     DrawImages {
         id: u32,
         items: Vec<ImageDraw>,
@@ -2482,6 +2491,28 @@ impl BinaryVm {
                     destination,
                     position,
                     source,
+                });
+            }
+            0x0560 | 0x0561 => {
+                let id = self.read(&mut cursor)?;
+                let frame = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot out of bounds");
+                request = Some(if opcode == 0x0560 {
+                    let position = [
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                    ];
+                    PlatformRequest::SetImageOrigin {
+                        id,
+                        frame,
+                        position,
+                    }
+                } else {
+                    point_destinations = Some([
+                        self.destination(&mut cursor)?,
+                        self.destination(&mut cursor)?,
+                    ]);
+                    PlatformRequest::ImageOrigin { id, frame }
                 });
             }
             0x055e => {
