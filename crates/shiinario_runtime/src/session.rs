@@ -54,6 +54,7 @@ pub struct Session {
     main_loop: Option<MainLoop>,
     window_timers: std::collections::BTreeMap<u32, (u32, u32)>,
     control_repeat: crate::input::ControlRepeat,
+    scan_repeats: std::collections::BTreeMap<u32, crate::input::ControlRepeat>,
 }
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
@@ -79,6 +80,7 @@ impl Session {
             main_loop: Some(MainLoop::new()),
             window_timers: Default::default(),
             control_repeat: Default::default(),
+            scan_repeats: Default::default(),
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -347,6 +349,17 @@ impl Session {
                 let mask = host.respond(&PlatformRequest::ReadControls)?;
                 let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
                 let value = self.control_repeat.query(mask, now);
+                vm.respond(value)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ReadRepeatedScanKey { scan } = &request {
+                let mask = host.respond(&PlatformRequest::ReadScanKey { scan: *scan })?;
+                let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                let value = self.scan_repeats.entry(*scan).or_default().query(mask, now);
                 vm.respond(value)?;
                 emit(&Event::PlatformReply {
                     value,
