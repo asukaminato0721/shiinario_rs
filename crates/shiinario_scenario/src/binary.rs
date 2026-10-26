@@ -2244,7 +2244,7 @@ impl BinaryVm {
             }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
-                let [source_index, target_index] = native_helper::THUMBNAIL_CODE_SIZES
+                let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
                     .iter()
                     .find_map(|&size| {
                         self.memory_read(address, size)
@@ -2252,8 +2252,8 @@ impl BinaryVm {
                             .and_then(|code| native_helper::thumbnail_arguments(&code))
                     })
                     .with_context(|| format!("unsupported native SCN helper at {address:#x}"))?;
-                let source = self.banks[&12][source_index];
-                let target = self.banks[&12][target_index];
+                let source = self.banks[&bank][self.bank_index(bank, source_index)?];
+                let target = self.banks[&bank][self.bank_index(bank, target_index)?];
                 ensure!(
                     u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
                         || u64::from(target) + native_helper::TARGET_SIZE as u64
@@ -4639,13 +4639,27 @@ mod tests {
     #[test]
     #[ignore = "requires extracted TANEGAME start.SCN; set SHIINARIO_TANE_START_SCN"]
     fn original_v248_save_thumbnail_consumes_helper_and_preserves_buffers() -> Result<()> {
-        check_original_thumbnail("SHIINARIO_TANE_START_SCN", 0xb1eeb, 115, 0xb0a2e, [0, 1])
+        check_original_thumbnail(
+            "SHIINARIO_TANE_START_SCN",
+            0xb1eeb,
+            115,
+            0xb0a2e,
+            12,
+            [0, 1],
+        )
     }
 
     #[test]
     #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_thumbnail_uses_local_four_as_source() -> Result<()> {
-        check_original_thumbnail("SHIINARIO_HANAOTO_START_SCN", 0x489b0, 114, 0x247e9, [4, 0])
+    fn original_hanaoto_thumbnail_uses_stack_four_as_source() -> Result<()> {
+        check_original_thumbnail(
+            "SHIINARIO_HANAOTO_START_SCN",
+            0x489b0,
+            114,
+            0x247e9,
+            8,
+            [4, 0],
+        )
     }
 
     fn check_original_thumbnail(
@@ -4653,7 +4667,8 @@ mod tests {
         helper: usize,
         size: usize,
         call: usize,
-        arguments: [usize; 2],
+        bank: u8,
+        arguments: [u16; 2],
     ) -> Result<()> {
         use sha2::{Digest, Sha256};
         let path = std::env::var_os(variable).with_context(|| format!("set {variable}"))?;
@@ -4676,11 +4691,14 @@ mod tests {
             }
             let mut vm = BinaryVm::with_version("start.SCN", code, EngineVersion::V2_48)?;
             vm.pc = call;
+            vm.sp = 969;
             vm.allocations.insert(0x50000000, source.clone());
             vm.allocations
                 .insert(0x60000000, vec![0xa5; native_helper::TARGET_SIZE + 32]);
-            vm.banks.get_mut(&12).unwrap()[arguments[0]] = 0x50000000;
-            vm.banks.get_mut(&12).unwrap()[arguments[1]] =
+            let source_index = vm.bank_index(bank, arguments[0])?;
+            let target_index = vm.bank_index(bank, arguments[1])?;
+            vm.banks.get_mut(&bank).unwrap()[source_index] = 0x50000000;
+            vm.banks.get_mut(&bank).unwrap()[target_index] =
                 if overlap { 0x50000010 } else { 0x60000010 };
             let banks = vm.banks.clone();
             let stack = vm.sp;
