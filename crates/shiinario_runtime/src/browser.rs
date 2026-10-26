@@ -100,6 +100,9 @@ impl Host for BrowserHost {
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
                 Ok(self.controls.mask())
             }
+            PlatformRequest::ReadMouseButtons => {
+                Ok(u32::from(self.mapping.map_buttons(self.mouse)))
+            }
             PlatformRequest::ClockMilliseconds => Ok(self.elapsed),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {
                 Ok(u32::from((self.elapsed).wrapping_sub(*epoch) >= *duration))

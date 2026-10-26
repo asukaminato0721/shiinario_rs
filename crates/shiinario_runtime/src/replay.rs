@@ -98,6 +98,9 @@ impl Replay {
         let buttons = self.mapping.map_buttons(self.mouse);
         [i32::from(buttons & 1 != 0), i32::from(buttons & 2 != 0)]
     }
+    pub fn mouse_button_mask(&self) -> u32 {
+        u32::from(self.mapping.map_buttons(self.mouse))
+    }
 }
 
 #[cfg(test)]
