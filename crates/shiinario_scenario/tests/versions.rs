@@ -58,6 +58,65 @@ fn delete_file_joins_both_operands_and_preserves_the_next_instruction() {
 }
 
 #[test]
+fn negation_preserves_wrapping_values_and_operand_boundaries() {
+    for (input, expected) in [
+        (0, 0),
+        (1, u32::MAX),
+        (u32::MAX, 1),
+        (0x80000000, 0x80000000),
+    ] {
+        let mut code = instruction(0x38e, &[immediate(input), vec![12, 0, 0]].concat());
+        code.extend(instruction(0x399, &[12, 0, 0]));
+        code.extend(instruction(0x49d, &[12, 0, 0]));
+        let mut vm = BinaryVm::with_version("negate.scn", code, EngineVersion::V2_48).unwrap();
+        vm.step().unwrap();
+        vm.step().unwrap();
+        assert!(
+            matches!(vm.step().unwrap(), Event::MouseButtonMapping { value, .. } if value == expected)
+        );
+    }
+}
+
+#[test]
+fn frame_blend_handles_endpoints_and_ignores_repeated_levels() {
+    let code: Vec<_> = [0, 0, 256, 128, 255, 255]
+        .into_iter()
+        .flat_map(|level| instruction(0x500, &immediate(level)))
+        .collect();
+    let mut vm = BinaryVm::with_version("blend.scn", code, EngineVersion::V2_48).unwrap();
+    assert!(matches!(
+        vm.step().unwrap(),
+        Event::Platform {
+            request: PlatformRequest::FillSurface {
+                id: 0,
+                color: [0, 0, 0],
+                ..
+            },
+            ..
+        }
+    ));
+    vm.respond(1).unwrap();
+    for _ in 0..2 {
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::BinaryInstruction { .. }
+        ));
+    }
+    assert!(
+        matches!(vm.step().unwrap(), Event::Platform { request: PlatformRequest::BlendSurfaces(blend), .. } if blend.weights == [127,128])
+    );
+    vm.respond(1).unwrap();
+    assert!(
+        matches!(vm.step().unwrap(), Event::Platform { request: PlatformRequest::CopySurface(copy), .. } if copy.source.id == 1 && copy.destination.id == 0)
+    );
+    vm.respond(1).unwrap();
+    assert!(matches!(
+        vm.step().unwrap(),
+        Event::BinaryInstruction { .. }
+    ));
+}
+
+#[test]
 fn drawing_lists_keep_separate_slots_and_expose_their_memory() {
     let mut code = instruction(0x4b5, &[immediate(1), immediate(2)].concat());
     code.extend(instruction(0x4b8, &immediate(1)));

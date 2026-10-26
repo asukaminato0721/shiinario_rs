@@ -465,6 +465,7 @@ struct TaskState {
     locals: Vec<u32>,
     scopes: Vec<NamedScope>,
     parameters: Vec<u32>,
+    text_context: u32,
 }
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
@@ -477,6 +478,7 @@ impl TaskState {
             locals: vec![0; CELLS],
             scopes: Vec::new(),
             parameters: Vec::new(),
+            text_context: 0,
         }
     }
     fn bank(&self, tag: u8) -> &[u32] {
@@ -628,14 +630,34 @@ pub struct BinaryVm {
     message_mode: u32,
     background_mode: u32,
     archive_paths: Vec<String>,
+    text_context: u32,
+    text_contexts: std::collections::BTreeMap<u32, TextContext>,
     text_style: crate::text::TextStyle,
     text_image: [u32; 2],
     text_image_offset: [u32; 2],
-    /// Line-start X, current X, current Y in the default text context.
+    /// Line-start X, current X, current Y in the selected text context.
     text_cursor: [u32; 3],
     text_layout: crate::text_layout::TextLayout,
     async_text: Option<AsyncText>,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
+}
+struct TextContext {
+    style: crate::text::TextStyle,
+    image: [u32; 2],
+    image_offset: [u32; 2],
+    cursor: [u32; 3],
+    layout: crate::text_layout::TextLayout,
+}
+impl Default for TextContext {
+    fn default() -> Self {
+        Self {
+            style: Default::default(),
+            image: [u32::MAX, 0],
+            image_offset: [0; 2],
+            cursor: [0; 3],
+            layout: crate::text_layout::TextLayout::new([0; 3]),
+        }
+    }
 }
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
@@ -707,6 +729,8 @@ impl BinaryVm {
             pending_delay: None,
             task_timers: Default::default(),
             text_style: Default::default(),
+            text_context: 0,
+            text_contexts: Default::default(),
             text_image: [u32::MAX, 0],
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
@@ -773,6 +797,7 @@ impl BinaryVm {
             locals: std::mem::replace(self.banks.get_mut(&12).unwrap(), task.locals),
             scopes: std::mem::replace(&mut self.named_scopes, task.scopes),
             parameters: std::mem::replace(&mut self.parameters, task.parameters),
+            text_context: self.text_context,
         };
         self.tasks.insert(self.current_task, old);
         self.switch_scenario(task.base);
@@ -780,6 +805,22 @@ impl BinaryVm {
         self.sp = task.sp;
         self.context_flags = task.flags;
         self.current_task = id;
+        self.select_text_context(task.text_context);
+    }
+    fn select_text_context(&mut self, id: u32) {
+        if id == self.text_context {
+            return;
+        }
+        let next = self.text_contexts.remove(&id).unwrap_or_default();
+        let previous = TextContext {
+            style: std::mem::replace(&mut self.text_style, next.style),
+            image: std::mem::replace(&mut self.text_image, next.image),
+            image_offset: std::mem::replace(&mut self.text_image_offset, next.image_offset),
+            cursor: std::mem::replace(&mut self.text_cursor, next.cursor),
+            layout: std::mem::replace(&mut self.text_layout, next.layout),
+        };
+        self.text_contexts.insert(self.text_context, previous);
+        self.text_context = id;
     }
     fn scheduler_poll(&mut self) -> Event {
         let event = Event::SchedulerPoll;
@@ -2036,6 +2077,7 @@ impl BinaryVm {
         let mut released_scopes = Vec::new();
         let mut new_draw_list = None;
         let mut draw_item = None;
+        let mut new_text_context = None;
         let mut file_destinations = None;
         let mut timer_reply = None;
         let mut delay = None;
@@ -3018,6 +3060,13 @@ impl BinaryVm {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
             }
+            0x0096 => {
+                // v2.48 424d6a selects the task's text context without
+                // resetting its font, cursor, or image bindings.
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "text context slot out of bounds");
+                new_text_context = Some(id);
+            }
             0x0078 | 0x007a => {
                 let x = self.read(&mut cursor)?;
                 let y = self.read(&mut cursor)?;
@@ -3809,7 +3858,7 @@ impl BinaryVm {
                 let address = self.operand_address(tag, &mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, address));
             }
-            0x0391 | 0x0392 | 0x03a2 => {
+            0x0391 | 0x0392 | 0x0399 | 0x03a2 => {
                 let saved = cursor.pc;
                 let value = self.read(&mut cursor)?;
                 cursor.pc = saved;
@@ -3819,6 +3868,8 @@ impl BinaryVm {
                     match opcode {
                         0x0391 => value.wrapping_add(1),
                         0x0392 => value.wrapping_sub(1),
+                        // v2.48 41cf60 negates the existing operand in place.
+                        0x0399 => value.wrapping_neg(),
                         // v2.36 4158e0 and v2.47 41cbe0 take signed abs
                         // in place; INT_MIN retains its 0x80000000 bits.
                         _ => (value as i32).wrapping_abs() as u32,
@@ -4000,6 +4051,9 @@ impl BinaryVm {
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
         let next_pc = cursor.pc;
+        if let Some(id) = new_text_context {
+            self.select_text_context(id);
+        }
         if let Some((id, capacity)) = new_draw_list {
             self.create_draw_list(id, capacity)?;
         }
