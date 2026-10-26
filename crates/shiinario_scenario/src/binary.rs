@@ -4150,13 +4150,16 @@ impl BinaryVm {
                     memory_write = Some((range, bytes));
                 }
             }
-            0x02d6 => {
+            0x02d4 | 0x02d6 => {
                 let left = self.string_bytes(self.read(&mut cursor)?)?;
                 let right = self.string_bytes(self.read(&mut cursor)?)?;
-                let comparison = left
-                    .iter()
-                    .map(u8::to_ascii_lowercase)
-                    .cmp(right.iter().map(u8::to_ascii_lowercase));
+                let comparison = if opcode == 0x02d4 {
+                    left.cmp(&right)
+                } else {
+                    left.iter()
+                        .map(u8::to_ascii_lowercase)
+                        .cmp(right.iter().map(u8::to_ascii_lowercase))
+                };
                 let value = match comparison {
                     std::cmp::Ordering::Less => u32::MAX,
                     std::cmp::Ordering::Equal => 0,
@@ -4470,6 +4473,38 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn string_comparisons_use_unsigned_bytes_and_stop_at_nul() {
+        for (left, right, sensitive, insensitive) in [
+            (&b"same\0ignored"[..], &b"same\0other"[..], 0, 0),
+            (&b"A\0"[..], &b"a\0"[..], u32::MAX, 0),
+            (&b"ab\0"[..], &b"abc\0"[..], u32::MAX, u32::MAX),
+            (&b"\xff\0"[..], &b"\x80\0"[..], 1, 1),
+            (&b"\x80\0"[..], &b"z\0"[..], 1, 1),
+        ] {
+            let left_address = 0x2000_0000;
+            let right_address = 0x2000_0100;
+            let mut code = Vec::new();
+            for (index, opcode) in [0x02d4, 0x02d6].into_iter().enumerate() {
+                code.extend(instruction(
+                    opcode,
+                    &[
+                        immediate(left_address),
+                        immediate(right_address),
+                        vec![12, index as u8, 0],
+                    ]
+                    .concat(),
+                ));
+            }
+            code.extend(instruction(0, &immediate(0)));
+            let mut vm = BinaryVm::new("compare.scn", code).unwrap();
+            vm.allocations.insert(left_address, left.to_vec());
+            vm.allocations.insert(right_address, right.to_vec());
+            while !matches!(vm.step().unwrap(), Event::End) {}
+            assert_eq!(&vm.banks[&12][..2], &[sensitive, insensitive]);
+        }
+    }
+
     #[test]
     fn sequential_memory_reads_keep_a_cursor_per_task_and_report_relative_addresses() {
         let address = 0x2000_0000u32;
