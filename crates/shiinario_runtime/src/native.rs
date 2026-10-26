@@ -244,6 +244,15 @@ impl Host for NativeHost {
             PlatformRequest::ReadMouseButtons => {
                 Ok(u32::from(self.mapping.map_buttons(self.mouse)))
             }
+            PlatformRequest::GetAudioStreamStatus { handle } => {
+                if *handle == 0 {
+                    return Ok(0);
+                }
+                self.audio
+                    .as_ref()
+                    .context("audio device is not initialized")?
+                    .stream_status(*handle)
+            }
             PlatformRequest::ClockMilliseconds => Ok(self.started.elapsed().as_millis() as u32),
             PlatformRequest::WaitTaskTimer { epoch, duration } => Ok(u32::from(
                 (self.started.elapsed().as_millis() as u32).wrapping_sub(*epoch) >= *duration,

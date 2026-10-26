@@ -258,6 +258,13 @@ impl Mixer {
             .get(&handle)
             .is_some_and(|voice| voice.frame_at(voice.frame).is_some())
     }
+    /// Original 456020 returns playback bit 0, fade bit 1 and worker bit 4.
+    pub fn stream_status(&self, handle: u32) -> u32 {
+        self.voices
+            .get(&handle)
+            .filter(|voice| voice.frame_at(voice.frame).is_some())
+            .map_or(0, |voice| 0x11 | if voice.fade.is_some() { 2 } else { 0 })
+    }
     fn next_frame(&mut self, rate: u32) -> [f32; 2] {
         let mut sum = [0.0; 2];
         self.voices.retain(|_, voice| {
@@ -309,6 +316,14 @@ pub struct AudioOutput {
 }
 #[cfg(not(target_arch = "wasm32"))]
 impl AudioOutput {
+    pub fn stream_status(&self, handle: u32) -> Result<u32> {
+        self.check()?;
+        Ok(self
+            .mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .stream_status(handle))
+    }
     pub fn fade(&self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
         self.check()?;
         self.mixer
@@ -481,6 +496,30 @@ mod tests {
         let mut resources = Resources::default();
         let handle = resources.create_audio_stream(&data, 0x21).unwrap();
         resources.audio_stream(handle).unwrap().clone()
+    }
+    #[test]
+    fn stream_status_tracks_playback_fades_stop_and_natural_completion() {
+        let stream = synthetic();
+        let mut mixer = Mixer::default();
+        assert_eq!(mixer.stream_status(0), 0);
+        assert_eq!(mixer.stream_status(1), 0);
+        mixer.play(1, stream.clone(), 2).unwrap();
+        assert_eq!(mixer.stream_status(1), 0x11);
+        mixer.fade(1, 0, -100, 0x8000_0000).unwrap();
+        assert_eq!(mixer.stream_status(1), 0x13);
+        mixer.advance_ms(10);
+        assert_eq!(mixer.stream_status(1), 0x11);
+        stream.volume.set_percent(100).unwrap();
+        mixer.fade(1, 0, -100, 0).unwrap();
+        assert_eq!(mixer.stream_status(1), 0x13);
+        mixer.advance_ms(10);
+        assert_eq!(mixer.stream_status(1), 0);
+        mixer.play(1, stream.clone(), 0).unwrap();
+        mixer.advance_ms(100);
+        assert_eq!(mixer.stream_status(1), 0);
+        mixer.play(1, stream, 2).unwrap();
+        mixer.stop(1);
+        assert_eq!(mixer.stream_status(1), 0);
     }
     #[test]
     fn static_buffers_restart_loop_stop_replace_and_mix_with_streams() {
