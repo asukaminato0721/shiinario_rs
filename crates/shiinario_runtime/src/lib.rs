@@ -251,6 +251,7 @@ impl Host for TracePlatform {
             }
             PlatformRequest::ReadKeyState { key } => Ok(self.replay.keys.query(*key, true)),
             PlatformRequest::ReadControls => Ok(self.replay.controls()),
+            PlatformRequest::ReadMouseButtons => Ok(self.replay.mouse_button_mask()),
             // The portable trace reports no x86 rendering acceleration.
             PlatformRequest::CpuFeatures => Ok(0),
             PlatformRequest::ReleaseGraphics
@@ -308,6 +309,32 @@ pub fn open(path: impl AsRef<Path>) -> Result<Project> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mouse_button_query_retains_middle_button_and_applies_mapping_once() {
+        for buttons in 0..8u8 {
+            for mapping in [0u32, 1, u32::MAX] {
+                let mut host = TracePlatform {
+                    replay: replay::Replay::new(vec![replay::InputFrame {
+                        at_ms: 0,
+                        cursor: [0; 2],
+                        mouse_buttons: buttons,
+                        control_mask: 0,
+                        keys: vec![],
+                    }])
+                    .unwrap(),
+                    ..Default::default()
+                };
+                host.replay.advance(0);
+                host.mouse_mapping(mapping);
+                let expected =
+                    shiinario_scenario::MouseButtonMapping { value: mapping }.map_buttons(buttons);
+                assert_eq!(
+                    host.respond(&PlatformRequest::ReadMouseButtons).unwrap(),
+                    u32::from(expected)
+                );
+            }
+        }
+    }
     #[test]
     fn system_mouse_metric_does_not_reapply_the_script_button_mapping() {
         let mut host = TracePlatform::default();

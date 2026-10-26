@@ -177,6 +177,7 @@ pub enum PlatformRequest {
     },
     ReadControls,
     ReadRepeatedControls,
+    ReadMouseButtons,
     CursorPosition,
     MapCursor {
         point: [i32; 2],
@@ -2302,6 +2303,11 @@ impl BinaryVm {
                 let key = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadKeyState { key });
+            }
+            0x0459 => {
+                // v2.48 41db20 -> 40d590 returns the three mapped button bits.
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadMouseButtons);
             }
             0x0456 | 0x0458 | 0x0492 => {
                 let begin = cursor.pc;

@@ -241,6 +241,9 @@ impl Host for NativeHost {
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
                 Ok(self.controls.mask())
             }
+            PlatformRequest::ReadMouseButtons => {
+                Ok(u32::from(self.mapping.map_buttons(self.mouse)))
+            }
             PlatformRequest::ClockMilliseconds => Ok(self.started.elapsed().as_millis() as u32),
             PlatformRequest::WaitTaskTimer { epoch, duration } => Ok(u32::from(
                 (self.started.elapsed().as_millis() as u32).wrapping_sub(*epoch) >= *duration,
