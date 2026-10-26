@@ -581,6 +581,7 @@ pub struct BinaryVm {
     // Each entry contains the allocation address, used count, and capacity.
     draw_lists: std::collections::BTreeMap<u32, (u32, usize, usize)>,
     draw_list_id: u32,
+    last_frame_blend: Option<u32>,
     file_read_marker: u32,
     file_write_marker: u32,
     input_latches: [u32; 2],
@@ -666,6 +667,7 @@ impl BinaryVm {
             thread_limit_override: 0,
             draw_lists: Default::default(),
             draw_list_id: 0,
+            last_frame_blend: None,
             file_read_marker: 0,
             file_write_marker: 0,
             input_latches: [0; 2],
@@ -2675,6 +2677,35 @@ impl BinaryVm {
                     items: self.draw_list()?,
                     clip,
                 });
+            }
+            0x0500 => {
+                // v2.48 4261ba -> 412770 updates surface zero from surface one.
+                // 256 preserves the current pixels. Repeated levels do no work.
+                let level = self.read(&mut cursor)?;
+                ensure!(level <= 256, "frame blend level exceeds 256");
+                if level != 256 && self.last_frame_blend != Some(level) {
+                    let point = |id| SurfacePoint { id, x: 0, y: 0 };
+                    let size = self.viewport.map(|n| n as i32);
+                    request = Some(match level {
+                        0 => PlatformRequest::FillSurface {
+                            id: 0,
+                            rect: [0, 0, size[0], size[1]],
+                            color: [0; 3],
+                        },
+                        255 => PlatformRequest::CopySurface(SurfaceCopy {
+                            destination: point(0),
+                            source: point(1),
+                            size,
+                        }),
+                        _ => PlatformRequest::BlendSurfaces(SurfaceBlend {
+                            destination: point(0),
+                            sources: [point(0), point(1)],
+                            size,
+                            weights: [255 - level, level],
+                        }),
+                    });
+                    self.last_frame_blend = Some(level);
+                }
             }
             0x04b1 => {
                 let id = self.read(&mut cursor)?;
