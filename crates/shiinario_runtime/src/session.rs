@@ -700,6 +700,24 @@ impl Session {
                 resources.commit_display(rect);
                 host.respond(&PlatformRequest::InvalidateRect { rect })?;
             }
+            if let PlatformRequest::BitBlt { copy, .. } = &request
+                && copy.destination.id == 0
+            {
+                let rect = [
+                    copy.destination.x,
+                    copy.destination.y,
+                    copy.destination
+                        .x
+                        .checked_add(copy.size[0])
+                        .context("BitBlt rectangle overflow")?,
+                    copy.destination
+                        .y
+                        .checked_add(copy.size[1])
+                        .context("BitBlt rectangle overflow")?,
+                ];
+                resources.commit_display(rect);
+                host.respond(&PlatformRequest::InvalidateRect { rect })?;
+            }
             // Bulk drawing modifies the working DIB until SCN invalidates it.
             // Text also submits its own glyph rectangles at TextTick, matching
             // the native text renderer without exposing the rest of the DIB.

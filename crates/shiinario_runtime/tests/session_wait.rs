@@ -104,6 +104,60 @@ impl Host for TestHost {
 }
 
 #[test]
+fn bitblt_copies_pixels_and_presents_only_the_screen_destination() {
+    for raster_operation in [0x00cc_0020u32, 0x1234_5678] {
+        let game = Game::new();
+        let mut code = Vec::new();
+        for (opcode, values) in [
+            (0x04d8u16, vec![1, 0, 0, 1, 1, 10, 20, 30]),
+            (0x0514, vec![0, 5, 6, 1, 1, 1, 0, 0, raster_operation]),
+            (0x0514, vec![1, 2, 3, 1, 1, 0, 5, 6, 0x00cc_0020]),
+            (0, vec![0]),
+        ] {
+            code.extend(opcode.to_le_bytes());
+            for value in values {
+                code.push(4);
+                code.extend(value.to_le_bytes());
+            }
+        }
+        std::fs::write(game.0.join("wait.scn"), code).unwrap();
+        let project = Project::open(&game.0).unwrap();
+        let mut session = Session::new(&project, "wait.scn").unwrap();
+        let mut host = TestHost::default();
+        let result = (|| -> Result<()> {
+            for _ in 0..100 {
+                if session.resume(&project, &mut host, |_| Ok(()))? == SessionState::Ended {
+                    return Ok(());
+                }
+            }
+            bail!("script did not end")
+        })();
+        let screen_pixel = (6 * 800 + 5) * 4;
+        if raster_operation == 0x00cc_0020 {
+            result.unwrap();
+            assert_eq!(host.invalidates, 1);
+            assert_eq!(
+                &session.display().unwrap().rgba[screen_pixel..screen_pixel + 4],
+                &[10, 20, 30, 255]
+            );
+            let offscreen = session.surface(1).unwrap();
+            let index = (3 * 800 + 2) * 4;
+            assert_eq!(&offscreen.rgba[index..index + 4], &[10, 20, 30, 255]);
+        } else {
+            assert!(
+                format!("{:#}", result.unwrap_err())
+                    .contains("unsupported BitBlt raster operation")
+            );
+            assert_eq!(host.invalidates, 0);
+            assert_eq!(
+                &session.surface(0).unwrap().rgba[screen_pixel..screen_pixel + 4],
+                &[0, 0, 0, 255]
+            );
+        }
+    }
+}
+
+#[test]
 fn clear_surface_presents_only_surface_zero_and_sleep_waits_for_elapsed_time() {
     let game = Game::new();
     let imm = |value: u32| [vec![4], value.to_le_bytes().to_vec()].concat();

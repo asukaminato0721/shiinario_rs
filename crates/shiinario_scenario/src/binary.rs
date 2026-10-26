@@ -201,6 +201,10 @@ pub enum PlatformRequest {
     },
     BlendSurfaces(SurfaceBlend),
     CopySurface(SurfaceCopy),
+    BitBlt {
+        copy: SurfaceCopy,
+        raster_operation: u32,
+    },
     PixelateSurface {
         copy: SurfaceCopy,
         block_size: i32,
@@ -2426,6 +2430,32 @@ impl BinaryVm {
                     size,
                     source,
                 }));
+            }
+            0x0514 => {
+                // v2.48 41e340 -> 41e230 maps surface slots to GDI DCs.
+                let destination = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                let size = [
+                    self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32,
+                ];
+                let source = SurfacePoint {
+                    id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32,
+                    y: self.read(&mut cursor)? as i32,
+                };
+                let raster_operation = self.read(&mut cursor)?;
+                request = Some(PlatformRequest::BitBlt {
+                    copy: SurfaceCopy {
+                        destination,
+                        source,
+                        size,
+                    },
+                    raster_operation,
+                });
             }
             0x051e => {
                 let destination = SurfacePoint {

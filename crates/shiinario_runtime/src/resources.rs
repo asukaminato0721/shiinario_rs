@@ -1476,6 +1476,16 @@ impl Resources {
             }
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::BitBlt {
+                copy,
+                raster_operation,
+            } => {
+                ensure!(
+                    *raster_operation == 0x00cc_0020,
+                    "unsupported BitBlt raster operation {raster_operation:#x}"
+                );
+                self.copy_surface(copy)?;
+            }
             PlatformRequest::PixelateSurface { copy, block_size } => {
                 self.pixelate_surface(copy, *block_size)?
             }
