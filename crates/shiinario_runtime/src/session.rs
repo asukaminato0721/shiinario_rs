@@ -380,6 +380,21 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::LoadSoundMemory { id, address, flags } = &request {
+                resources.load_sound(*id, &vm.allocation_bytes(*address)?, *flags)?;
+                host.install_sound(
+                    *id,
+                    resources
+                        .sound_buffer(*id)
+                        .context("loaded sound missing")?,
+                )?;
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::CreateAudioStream { address, flags } = &request {
                 let handle = resources
                     .create_audio_stream(&vm.allocation_bytes(*address)?, *flags)
