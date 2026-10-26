@@ -664,6 +664,8 @@ impl Session {
                 u32::from(resources.file_exists(project, path)?)
             } else if let PlatformRequest::CreateDirectory { path } = &request {
                 u32::from(resources.create_directory(project, path, host.simulated())?)
+            } else if let PlatformRequest::DeleteFile { path } = &request {
+                u32::from(resources.delete_file(project, path, host.simulated())?)
             } else {
                 if let PlatformRequest::InvalidateRect { rect } = &request {
                     resources.commit_display(*rect);

@@ -337,6 +337,12 @@ impl Resources {
         Ok(bytes.len() as u32)
     }
     pub fn file_exists(&self, project: &Project, name: &str) -> Result<bool> {
+        if self
+            .deleted_files
+            .contains(&shiinario_assets::project::normalize(name)?)
+        {
+            return Ok(false);
+        }
         Ok(self
             .transient_files
             .contains_key(&shiinario_assets::project::normalize(name)?)
@@ -368,7 +374,33 @@ impl Resources {
             self.transient_directories.len() < 256,
             "too many transient directories"
         );
+        self.deleted_files.remove(&key);
         Ok(self.transient_directories.insert(key))
+    }
+    pub fn delete_file(&mut self, project: &Project, name: &str, simulated: bool) -> Result<bool> {
+        if !simulated {
+            return project.delete_file(name, false);
+        }
+        if name
+            .replace('\\', "/")
+            .split('/')
+            .all(|part| part.is_empty() || part == ".")
+        {
+            return Ok(false);
+        }
+        let key = shiinario_assets::project::normalize(name)?;
+        if !self.file_exists(project, &key)?
+            || self.transient_directories.contains(&key)
+            || project.directory_exists(&key)?
+        {
+            return Ok(false);
+        }
+        if !self.transient_files.contains_key(&key) && !project.delete_file(name, true)? {
+            return Ok(false);
+        }
+        self.transient_files.remove(&key);
+        self.deleted_files.insert(key);
+        Ok(true)
     }
     pub fn write_file(
         &mut self,
@@ -389,6 +421,7 @@ impl Resources {
                 total + bytes.len() <= 64 * 1024 * 1024,
                 "transient files exceed 64 MiB"
             );
+            self.deleted_files.remove(&key);
             self.transient_files.insert(key, bytes);
             Ok(())
         } else {

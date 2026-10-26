@@ -36,8 +36,11 @@ cargo test -p shiinario_assets --release --locked \
   original_localized_v248_archives_decode -- --ignored --nocapture
 ```
 
-This establishes archive decoding only. Native startup currently stops at the
-unimplemented file-deletion opcode `0123` at `start.scn:0x58b`.
+This establishes archive decoding only. File-deletion opcode `0123` now joins
+the directory and filename operands and deletes the loose file. It retains
+directories and read-only files. Simulated runs record deletions without changing
+disk files. Native startup currently stops at the unimplemented opcode `079e`
+at `start.scn:0x82d`.
 
 Currently the executable recovery instruction patterns support v2.36,
 v2.47, and the tested v2.49 layout. The v2.49 path also recovers the crypt-image

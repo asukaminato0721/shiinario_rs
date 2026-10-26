@@ -250,6 +250,10 @@ impl Project {
             ensure!(size <= MAX_OUTPUT as u64, "file exceeds cap");
             return Ok([0, size as u32]);
         }
+        self.sizes_in_archives(name, paths)
+    }
+    /// Query registered archives without considering loose files.
+    pub fn sizes_in_archives(&self, name: &str, paths: &[String]) -> Result<[u32; 2]> {
         let (_, entry) = self.registered_entry(name, paths)?;
         Ok([entry.unpacked_size, entry.size])
     }
@@ -281,6 +285,29 @@ impl Project {
         Ok(self
             .loose_path(name, false)?
             .is_some_and(|path| crate::fs::is_dir(&path)))
+    }
+    /// Delete one loose file with Windows-style case lookup. Simulation only
+    /// checks the target. Keep directories and read-only files in both modes.
+    pub fn delete_file(&self, name: &str, simulated: bool) -> Result<bool> {
+        if name
+            .replace('\\', "/")
+            .split('/')
+            .all(|part| part.is_empty() || part == ".")
+        {
+            return Ok(false);
+        }
+        let Some(path) = self.loose_path(name, false)? else {
+            return Ok(false);
+        };
+        let metadata = crate::fs::metadata(&path)?;
+        if !metadata.is_file() {
+            return Ok(false);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if metadata.permissions().readonly() {
+            return Ok(false);
+        }
+        Ok(simulated || crate::fs::remove_file(path).is_ok())
     }
     /// Create one game-relative directory with Windows-style case lookup.
     pub fn create_directory(&self, name: &str) -> Result<bool> {

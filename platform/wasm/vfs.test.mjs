@@ -69,4 +69,40 @@ test('installs the browser imports used by Rust', () => {
   assert.deepEqual(JSON.parse(imports.shiinarioStat('save/slot.dat')), [false, 1]);
   assert.deepEqual(JSON.parse(imports.shiinarioList('save')), ['slot.dat']);
   assert.deepEqual(imports.shiinarioRead('save/slot.dat', 0, 1), new Uint8Array([7]));
+  imports.shiinarioRemove('save/slot.dat');
+  assert.deepEqual(JSON.parse(imports.shiinarioList('save')), []);
+  assert.throws(() => imports.shiinarioStat('save/slot.dat'), /NotFound/);
+});
+
+test('deletion persists for original files and saved files and permits recreation', () => {
+  const entries = [['save/original.dat', new Uint8Array([1, 2])]];
+  let snapshot;
+  const fs = new DirectoryFs(entries, undefined, files => { snapshot = structuredClone(files); });
+  fs.write('save/slot.dat', new Uint8Array([3]));
+  for (const name of ['original.dat', 'slot.dat']) {
+    fs.remove(`save/${name}`);
+    assert.throws(() => fs.stat(`save/${name}`), /NotFound/);
+    assert.throws(() => fs.read(`save/${name}`, 0, 1), /NotFound/);
+    assert.throws(() => fs.remove(`save/${name}`), /NotFound/);
+  }
+  assert.deepEqual(fs.list('save'), []);
+  const restored = new DirectoryFs(entries, undefined, () => {}, snapshot);
+  assert.deepEqual(restored.list('save'), []);
+  assert.throws(() => restored.stat('save/original.dat'), /NotFound/);
+  assert.throws(() => restored.remove('save'), /directory/);
+  restored.write('save/original.dat', new Uint8Array([9]));
+  assert.deepEqual(restored.read('save/original.dat', 0, 1), new Uint8Array([9]));
+  restored.mkdir('save/slot.dat');
+  assert.deepEqual(restored.stat('save/slot.dat'), [true, 0]);
+});
+
+test('failed deletion persistence keeps the file visible', () => {
+  let fail = false;
+  const fs = new DirectoryFs([], undefined, () => { if (fail) throw new Error('Disk full'); });
+  fs.write('slot.dat', new Uint8Array([1, 2]));
+  fail = true;
+  assert.throws(() => fs.remove('slot.dat'), /Disk full/);
+  assert.deepEqual(fs.list('.'), ['slot.dat']);
+  assert.deepEqual(fs.read('slot.dat', 0, 2), new Uint8Array([1, 2]));
+  assert.throws(() => fs.remove('../slot.dat'), /Invalid path/);
 });
