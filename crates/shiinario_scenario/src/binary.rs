@@ -178,6 +178,12 @@ pub enum PlatformRequest {
     ReadControls,
     ReadRepeatedControls,
     ReadMouseButtons,
+    ReadScanKey {
+        scan: u32,
+    },
+    ReadRepeatedScanKey {
+        scan: u32,
+    },
     CursorPosition,
     MapCursor {
         point: [i32; 2],
@@ -2369,6 +2375,12 @@ impl BinaryVm {
                 let key = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadKeyState { key });
+            }
+            0x03ec => {
+                let scan = self.read(&mut cursor)?;
+                ensure!(scan < 256, "keyboard scan code out of bounds");
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::ReadRepeatedScanKey { scan });
             }
             0x0459 => {
                 // v2.48 41db20 -> 40d590 returns the three mapped button bits.

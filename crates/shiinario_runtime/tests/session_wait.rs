@@ -58,6 +58,7 @@ struct TestHost {
     requests: usize,
     polls: usize,
     messages: Vec<[u32; 3]>,
+    scan_keys: Vec<u32>,
 }
 impl Host for TestHost {
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
@@ -74,6 +75,11 @@ impl Host for TestHost {
         self.requests += 1;
         match request {
             PlatformRequest::ClockMilliseconds => Ok(self.now),
+            PlatformRequest::ReadScanKey { scan } => Ok(if self.scan_keys.contains(scan) {
+                0x80
+            } else {
+                0
+            }),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {
                 Ok(u32::from(self.now.wrapping_sub(*epoch) >= *duration))
             }
@@ -106,6 +112,48 @@ impl Host for TestHost {
     fn play_stream(&mut self, _: u32, _: Arc<AudioStream>, _: u32) -> Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn physical_key_repeats_keep_separate_state_for_left_and_right_keys() {
+    let game = Game::new();
+    let mut code = Vec::new();
+    for scan in [29u32, 157, 29, 157] {
+        code.extend(0x03ecu16.to_le_bytes());
+        code.push(4);
+        code.extend(scan.to_le_bytes());
+        code.extend([12, 0, 0]);
+        code.extend(0x049du16.to_le_bytes());
+        code.extend([12, 0, 0]);
+    }
+    code.extend(0u16.to_le_bytes());
+    code.extend([4, 0, 0, 0, 0]);
+    std::fs::write(game.0.join("wait.scn"), code).unwrap();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost {
+        scan_keys: vec![29, 157],
+        ..Default::default()
+    };
+    let mut values = Vec::new();
+    let mut ended = false;
+    for _ in 0..100 {
+        if session
+            .resume(&project, &mut host, |event| {
+                if let Event::MouseButtonMapping { value, .. } = event {
+                    values.push(*value);
+                }
+                Ok(())
+            })
+            .unwrap()
+            == SessionState::Ended
+        {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended);
+    assert_eq!(values, [0x80, 0x80, 0, 0]);
 }
 
 #[test]

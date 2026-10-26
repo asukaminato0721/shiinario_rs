@@ -17,6 +17,9 @@ pub struct InputFrame {
     /// Windows virtual-key codes. Keyboard control masks are not synthesized.
     #[serde(default)]
     pub keys: Vec<u8>,
+    /// Physical DirectInput scan-code indices, separate from virtual keys.
+    #[serde(default)]
+    pub scan_keys: Vec<u8>,
 }
 #[derive(Default)]
 pub(crate) struct Replay {
@@ -26,6 +29,7 @@ pub(crate) struct Replay {
     mouse: u8,
     control_mask: u32,
     pub keys: AsyncKeys,
+    scan_keys: Vec<u8>,
     mapping: MouseButtonMapping,
     last_clock: u32,
     elapsed_ms: u64,
@@ -66,6 +70,7 @@ impl Replay {
             }
             self.mouse = frame.mouse_buttons;
             self.control_mask = frame.control_mask;
+            self.scan_keys.clone_from(&frame.scan_keys);
             let alt = [0x12, 0xa4, 0xa5]
                 .iter()
                 .any(|key| frame.keys.contains(key));
@@ -101,11 +106,48 @@ impl Replay {
     pub fn mouse_button_mask(&self) -> u32 {
         u32::from(self.mapping.map_buttons(self.mouse))
     }
+    pub fn scan_key(&self, scan: u32) -> u32 {
+        if scan < 256 && self.scan_keys.contains(&(scan as u8)) {
+            0x80
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scan_code_snapshots_do_not_consume_or_synthesize_virtual_keys() {
+        let mut replay = Replay::new(vec![
+            InputFrame {
+                at_ms: 0,
+                cursor: [0; 2],
+                mouse_buttons: 0,
+                control_mask: 0,
+                keys: vec![],
+                scan_keys: vec![29],
+            },
+            InputFrame {
+                at_ms: 10,
+                cursor: [0; 2],
+                mouse_buttons: 0,
+                control_mask: 0,
+                keys: vec![17],
+                scan_keys: vec![],
+            },
+        ])
+        .unwrap();
+        replay.advance(0);
+        assert_eq!(replay.scan_key(29), 0x80);
+        assert_eq!(replay.scan_key(157), 0);
+        assert_eq!(replay.keys.query(17, true), 0);
+        replay.advance(10);
+        assert_eq!(replay.scan_key(29), 0);
+        assert_eq!(replay.keys.query(17, true), 0xffff_8001);
+        assert_eq!(replay.scan_key(256), 0);
+    }
     #[test]
     fn replay_delivers_ctrl_release_and_mouse_edges_once() {
         let mut replay = Replay::new(vec![
@@ -115,6 +157,7 @@ mod tests {
                 mouse_buttons: 1,
                 control_mask: 256,
                 keys: vec![17],
+                scan_keys: vec![],
             },
             InputFrame {
                 at_ms: 20,
@@ -122,6 +165,7 @@ mod tests {
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
+                scan_keys: vec![],
             },
         ])
         .unwrap();
@@ -149,6 +193,7 @@ mod tests {
                 mouse_buttons: 1,
                 control_mask: 0,
                 keys: vec![],
+                scan_keys: vec![],
             },
             InputFrame {
                 at_ms: u64::from(u32::MAX) + 2,
@@ -156,6 +201,7 @@ mod tests {
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
+                scan_keys: vec![],
             },
         ])
         .unwrap();
@@ -177,6 +223,7 @@ mod tests {
                 mouse_buttons: 1,
                 control_mask: 0x100,
                 keys: vec![],
+                scan_keys: vec![],
             },
             InputFrame {
                 at_ms: 20,
@@ -184,6 +231,7 @@ mod tests {
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
+                scan_keys: vec![],
             },
         ])
         .unwrap();

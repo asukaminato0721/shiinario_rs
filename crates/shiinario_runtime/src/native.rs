@@ -241,6 +241,13 @@ impl Host for NativeHost {
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
                 Ok(self.controls.mask())
             }
+            PlatformRequest::ReadScanKey { scan } => Ok(
+                if self.controls.focused && self.controls.keys.get(*scan as usize) == Some(&true) {
+                    0x80
+                } else {
+                    0
+                },
+            ),
             PlatformRequest::ReadMouseButtons => {
                 Ok(u32::from(self.mapping.map_buttons(self.mouse)))
             }

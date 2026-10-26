@@ -127,6 +127,8 @@ python tools/research/make_story_input.py /tmp/input.json --skip
 Replay input is a JSON array of frames with strictly increasing `at_ms`, logical
 `cursor: [x, y]`, optional `mouse_buttons` (left/right/middle bits), `keys` (Windows
 virtual-key numbers), and `control_mask` (`256` holds the engine's skip control).
+`scan_keys` supplies physical DirectInput scan-code indices for opcode `03ec`.
+It is separate from virtual keys. For example, left Ctrl has scan code `29`.
 The optional `--final-frame /tmp/new-frame.png` captures the last SCN display even
 on failure and refuses to overwrite an existing file. State persists until the next frame. Exhausting the instruction budget is a failure,
 not evidence that a story route ended.

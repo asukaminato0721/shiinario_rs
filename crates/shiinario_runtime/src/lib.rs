@@ -252,6 +252,7 @@ impl Host for TracePlatform {
             PlatformRequest::ReadKeyState { key } => Ok(self.replay.keys.query(*key, true)),
             PlatformRequest::ReadControls => Ok(self.replay.controls()),
             PlatformRequest::ReadMouseButtons => Ok(self.replay.mouse_button_mask()),
+            PlatformRequest::ReadScanKey { scan } => Ok(self.replay.scan_key(*scan)),
             PlatformRequest::GetAudioStreamStatus { handle } => {
                 Ok(self.mixer.stream_status(*handle))
             }
@@ -323,6 +324,7 @@ mod tests {
                         mouse_buttons: buttons,
                         control_mask: 0,
                         keys: vec![],
+                        scan_keys: vec![],
                     }])
                     .unwrap(),
                     ..Default::default()
