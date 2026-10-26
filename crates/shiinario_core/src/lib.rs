@@ -16,7 +16,9 @@ pub enum EngineVersion {
 
 impl EngineVersion {
     pub fn from_config(section: &str) -> Option<Self> {
-        let minor = section.strip_prefix("椎名里緒 v2.")?;
+        let minor = section
+            .strip_prefix("椎名里緒 v2.")
+            .or_else(|| section.strip_prefix("Rio Shiina v2."))?;
         if minor.len() != 2 || !minor.bytes().all(|b| b.is_ascii_digit()) {
             return None;
         }

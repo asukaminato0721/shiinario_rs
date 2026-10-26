@@ -21,6 +21,24 @@ a runnable unpacked EXE. The embedded v2.47/v2.49 `DecodeBin` is located through
 initialization call and rebuilt from both Huffman layers, including runtime tree
 and bit-counter state.
 
+Recovery also accepts the English `Rio Shiina v2.xx` version banner. It recognizes
+the entry stub that decodes two PE sections with a rolling XOR key. The stub
+supplies the section addresses, lengths, key seed, and increment. Recovery checks
+the decoder instructions, CRC table, section bounds, and decoded checksum before
+it reads the WARC initialization data. This path does not execute the EXE.
+
+The supplied localized Hana to Otome v2.48 installation passed decoding of all
+20457 entries in its seven archives, including `START.SCN`. Run this local check with:
+
+```sh
+SHIINARIO_LOCALIZED_V248_EXE='/path/to/HANAOTO.exe' \
+cargo test -p shiinario_assets --release --locked \
+  original_localized_v248_archives_decode -- --ignored --nocapture
+```
+
+This establishes archive decoding only. Native startup currently stops at the
+unimplemented file-deletion opcode `0123` at `start.scn:0x58b`.
+
 Currently the executable recovery instruction patterns support v2.36,
 v2.47, and the tested v2.49 layout. The v2.49 path also recovers the crypt-image
 length from its helper and recognizes an embedded, compressed KM6532 extra-crypt

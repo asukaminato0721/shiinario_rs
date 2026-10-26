@@ -3155,6 +3155,21 @@ impl BinaryVm {
                     }
                 }
             }
+            0x03ce => {
+                // v2.48: 4270fd calls 41d8f0. The shared declaration helper
+                // uses the global table, skips existing names, and stores zero.
+                let count = cursor.word()? as usize;
+                ensure!(count <= 256, "named declaration exceeds 256 variables");
+                for _ in 0..count {
+                    ensure!(cursor.byte()? == 0x12, "unsupported declaration operand");
+                    let name = cursor.declaration_name()?;
+                    if self.find_named_address(&name).is_none() {
+                        let mut key = [0; 32];
+                        key[..name.len()].copy_from_slice(&name);
+                        writes.push((Destination::NewGlobal(key), 0));
+                    }
+                }
+            }
             0x03cf => {
                 let count = cursor.word()? as usize;
                 ensure!(count <= 256, "named declaration exceeds 256 variables");
@@ -3767,6 +3782,11 @@ impl BinaryVm {
                     wparam: self.read(&mut cursor)?,
                     lparam: self.read(&mut cursor)?,
                 });
+            }
+            0x07b3 => {
+                // v2.48: 4200e0 returns the main window. The portable host
+                // represents this window with token zero.
+                writes.push((self.destination(&mut cursor)?, 0));
             }
             0x07b2 => {
                 let class = self.string(self.read(&mut cursor)?)?;
