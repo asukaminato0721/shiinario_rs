@@ -1,4 +1,4 @@
-//! Scenario records retain original CP932 byte offsets. Binary SCN and story TXT
+//! Scenario records retain original byte offsets. Binary SCN and story TXT
 //! are distinct formats. Unsupported operations return errors.
 mod binary;
 mod expression;
@@ -12,7 +12,7 @@ pub use binary::{
     SurfaceStretch, boot_binary,
 };
 pub use memory::SharedMemory;
-pub use text::TextStyle;
+pub use text::{TextEncoding, TextStyle};
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
@@ -54,6 +54,7 @@ impl TextScript {
         let name = name.into();
         ensure!(data.len() <= 16 * 1024 * 1024, "scenario exceeds size cap");
         ensure!(!data.contains(&0), "binary data in text scenario");
+        let encoding = TextEncoding::detect(data);
         let mut records = Vec::new();
         let mut offset = 0;
         let mut paragraph: Option<(Location, String)> = None;
@@ -65,8 +66,13 @@ impl TextScript {
         for (line, raw) in data.split_inclusive(|&b| b == b'\n').enumerate() {
             let content = raw.strip_suffix(b"\n").unwrap_or(raw);
             let content = content.strip_suffix(b"\r").unwrap_or(content);
-            let (text, _, bad) = encoding_rs::SHIFT_JIS.decode(content);
-            ensure!(!bad, "{}:{offset:#x}: invalid CP932", name);
+            let (text, _, bad) = encoding.codec().decode(content);
+            ensure!(
+                !bad,
+                "{}:{offset:#x}: invalid {}",
+                name,
+                encoding.codec().name()
+            );
             let text = text.trim_end();
             let location = Location {
                 scenario: name.clone(),

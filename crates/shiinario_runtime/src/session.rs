@@ -594,6 +594,9 @@ impl Session {
                         location.scenario, location.offset
                     )
                 })?;
+                if name.to_ascii_lowercase().ends_with(".txt") {
+                    vm.set_text_encoding(shiinario_scenario::TextEncoding::detect(&bytes));
+                }
                 vm.respond_asset_into(&bytes).with_context(|| {
                     format!(
                         "{}:{:#x}: asset destination",
@@ -615,6 +618,9 @@ impl Session {
                         location.scenario, location.offset
                     )
                 })?;
+                if name.to_ascii_lowercase().ends_with(".txt") {
+                    vm.set_text_encoding(shiinario_scenario::TextEncoding::detect(&bytes));
+                }
                 let address = vm.respond_asset(bytes)?;
                 emit(&Event::PlatformReply {
                     value: address,

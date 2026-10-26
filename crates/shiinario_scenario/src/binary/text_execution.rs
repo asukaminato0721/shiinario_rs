@@ -455,10 +455,12 @@ impl BinaryVm {
                 bytes[0]
             );
         }
-        let length = cp932_len(bytes[start]);
+        let encoding = self.text_encoding;
+        let length = encoding.character_length(bytes[start]);
         ensure!(
             start + length <= bytes.len(),
-            "truncated CP932 text character"
+            "truncated {} text character",
+            encoding.codec().name()
         );
         let glyph = &bytes[start..start + length];
         ensure!(
@@ -471,12 +473,16 @@ impl BinaryVm {
         let next = if consumed == bytes.len() {
             &[]
         } else {
-            let end = consumed + cp932_len(bytes[consumed]);
-            ensure!(end <= bytes.len(), "truncated following CP932 character");
+            let end = consumed + encoding.character_length(bytes[consumed]);
+            ensure!(
+                end <= bytes.len(),
+                "truncated following {} character",
+                encoding.codec().name()
+            );
             &bytes[consumed..end]
         };
-        let (decoded, _, bad) = encoding_rs::SHIFT_JIS.decode(glyph);
-        ensure!(!bad, "invalid CP932 text character");
+        let (decoded, _, bad) = encoding.codec().decode(glyph);
+        ensure!(!bad, "invalid {} text character", encoding.codec().name());
         let mut chars = decoded.chars();
         let character = chars.next().context("empty decoded glyph")?;
         ensure!(
@@ -532,17 +538,40 @@ impl BinaryVm {
     }
 }
 
-fn cp932_len(first: u8) -> usize {
-    if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) {
-        2
-    } else {
-        1
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn big5_glyphs_preserve_source_offsets_and_double_byte_advances() {
+        let mut vm = BinaryVm::new("big5.scn", vec![0; 7]).unwrap();
+        vm.set_text_encoding(crate::TextEncoding::Big5);
+        let (bytes, _, bad) = encoding_rs::BIG5.encode("繁體中文");
+        assert!(!bad);
+        let address = 0x2000_0000u32;
+        let mut data = bytes.to_vec();
+        data.push(0);
+        vm.allocations.insert(address, data);
+        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        let advance = vm.text_style.full_advance;
+        for (index, expected) in "繁體中文".chars().enumerate() {
+            let glyph = vm.text_glyph().unwrap().unwrap();
+            assert_eq!(glyph.offset, (index + 1) * 2);
+            assert!(
+                matches!(glyph.request, Some(PlatformRequest::DrawGlyph { character, .. }) if character == expected)
+            );
+            vm.commit_text_glyph(glyph.layout, glyph.offset, false)
+                .unwrap();
+        }
+        assert_eq!(vm.text_cursor[1], 4 * advance);
+        assert!(vm.text_glyph().unwrap().is_none());
+        let (source, _, _) =
+            encoding_rs::BIG5.encode(";備註\r\n$WAIT,1\r\n善意的虛偽，勝於引起爭端的事實。\r\n");
+        let parsed = crate::TextScript::parse("localized.txt", &source).unwrap();
+        assert_eq!(parsed.records[0].location().offset, 7);
+        assert!(
+            matches!(&parsed.records[1], crate::Record::Dialogue { text, .. } if text == "善意的虛偽，勝於引起爭端的事實。")
+        );
+    }
     #[test]
     fn staged_text_returns_to_the_script_between_timed_glyphs() {
         let mut code = 0x00a0u16.to_le_bytes().to_vec();

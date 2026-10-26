@@ -2,6 +2,43 @@
 use anyhow::{Result, ensure};
 use shiinario_core::EngineVersion;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum TextEncoding {
+    #[default]
+    Cp932,
+    Big5,
+}
+impl TextEncoding {
+    /// Prefer CP932. Select Big5 only when the complete source is invalid
+    /// CP932 and valid Big5. Keep source bytes and offsets unchanged.
+    pub fn detect(bytes: &[u8]) -> Self {
+        if encoding_rs::SHIFT_JIS
+            .decode_without_bom_handling_and_without_replacement(bytes)
+            .is_none()
+            && encoding_rs::BIG5
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .is_some()
+        {
+            Self::Big5
+        } else {
+            Self::Cp932
+        }
+    }
+    pub(crate) fn character_length(self, first: u8) -> usize {
+        let double = match self {
+            Self::Cp932 => matches!(first, 0x81..=0x9f | 0xe0..=0xfc),
+            Self::Big5 => matches!(first, 0x81..=0xfe),
+        };
+        if double { 2 } else { 1 }
+    }
+    pub(crate) fn codec(self) -> &'static encoding_rs::Encoding {
+        match self {
+            Self::Cp932 => encoding_rs::SHIFT_JIS,
+            Self::Big5 => encoding_rs::BIG5,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum TextClock {
     Character,
@@ -333,6 +370,19 @@ fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) -> Result<u32
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_encoding_detection_preserves_cp932_and_accepts_valid_big5() {
+        let (big5, _, bad) = encoding_rs::BIG5.encode("善意的虛偽，勝於引起爭端的事實。");
+        assert!(!bad);
+        assert_eq!(TextEncoding::detect(&big5), TextEncoding::Big5);
+        let (japanese, _, bad) = encoding_rs::SHIFT_JIS.encode("日本語の文章です。");
+        assert!(!bad);
+        assert_eq!(TextEncoding::detect(&japanese), TextEncoding::Cp932);
+        assert_eq!(TextEncoding::detect(b"ASCII"), TextEncoding::Cp932);
+        assert_eq!(TextEncoding::detect(&[0x81]), TextEncoding::Cp932);
+        assert_eq!(TextEncoding::Big5.character_length(0xb4), 2);
+        assert_eq!(TextEncoding::Cp932.character_length(0xb4), 1);
+    }
     #[test]
     fn image_font_controls_and_disabled_character_callback_parse_in_sequence() {
         let style = TextStyle::default();

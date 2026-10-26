@@ -667,6 +667,7 @@ pub struct BinaryVm {
     staged_texts: std::collections::BTreeMap<u32, StagedText>,
     text_surface: u32,
     text_style: crate::text::TextStyle,
+    text_encoding: crate::text::TextEncoding,
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the selected text context.
     text_cursor: [u32; 3],
@@ -762,6 +763,7 @@ impl BinaryVm {
             pending_delay: None,
             task_timers: Default::default(),
             text_style: Default::default(),
+            text_encoding: Default::default(),
             text_context: 0,
             text_contexts: Default::default(),
             staged_texts: Default::default(),
@@ -1246,6 +1248,9 @@ impl BinaryVm {
         }
         self.pending = None;
         Ok(address)
+    }
+    pub fn set_text_encoding(&mut self, encoding: crate::text::TextEncoding) {
+        self.text_encoding = encoding;
     }
     /// Read a whole VM allocation for a pending resource operation.
     pub fn allocation_bytes(&self, address: u32) -> Result<Vec<u8>> {
