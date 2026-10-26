@@ -169,6 +169,10 @@ pub enum AudioChannel {
 pub enum Event {
     /// Host poll between scheduler passes or priority-task dispatches.
     SchedulerPoll,
+    TextCallback {
+        task: u32,
+        context: u32,
+    },
     /// One asynchronous text scheduler pass, after its input/drawing replies.
     TextTick {
         task: u32,
