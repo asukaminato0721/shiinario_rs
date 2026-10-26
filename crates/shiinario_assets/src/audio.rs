@@ -1,6 +1,8 @@
 //! Shiina Rio OGV is an Ogg/Vorbis stream in a RIFF-like wrapper.
 #[path = "audio_pad.rs"]
 mod pad;
+#[path = "audio_wav.rs"]
+mod wav;
 use anyhow::{Context, Result, ensure};
 pub fn ogg_stream(data: &[u8]) -> Result<&[u8]> {
     if data.starts_with(b"OggS") {
@@ -46,6 +48,9 @@ pub struct AudioInfo {
 /// Decode incrementally: callers can stream PCM into their host audio queue.
 /// The cap also bounds work for malicious streams with excessive packet counts.
 pub fn decode(data: &[u8], mut output: impl FnMut(&[i16]) -> Result<()>) -> Result<AudioInfo> {
+    if data.starts_with(b"RIFF") {
+        return wav::decode(data, output);
+    }
     if data.starts_with(b"PAD\0") {
         return pad::decode(data, output);
     }

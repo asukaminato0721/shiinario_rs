@@ -7,6 +7,13 @@ use std::{cell::RefCell, rc::Rc};
 #[derive(Clone)]
 pub struct SharedMemory(Rc<RefCell<Vec<u8>>>);
 impl SharedMemory {
+    pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
+        ensure!(
+            !bytes.is_empty() && bytes.len() <= 16 * 1024 * 1024,
+            "shared memory size exceeds bounds"
+        );
+        Ok(Self(Rc::new(RefCell::new(bytes))))
+    }
     pub fn zeroed(length: usize) -> Result<Self> {
         ensure!(
             length > 0 && length <= 16 * 1024 * 1024,

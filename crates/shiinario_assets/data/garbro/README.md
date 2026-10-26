@@ -39,8 +39,16 @@ cargo test -p shiinario_assets --release --locked \
 This establishes archive decoding only. File-deletion opcode `0123` now joins
 the directory and filename operands and deletes the loose file. It retains
 directories and read-only files. Simulated runs record deletions without changing
-disk files. Native startup currently stops at the unimplemented opcode `079e`
-at `start.scn:0x82d`.
+disk files.
+
+The localized installation also passed a five-second native startup check.
+The run executed about 110000 instructions, presented 159 frames, and started
+one audio stream. Startup support includes window callbacks and timers, draw
+lists, text contexts, synchronous text measurement, frame blending, surface
+clearing, and memory-backed S25 images. The image decoder accepts empty font
+frames. The audio decoder accepts RIFF/WAVE PCM sound effects with 8-bit or
+16-bit samples. These checks establish startup compatibility only. They do not
+establish complete gameplay support.
 
 Currently the executable recovery instruction patterns support v2.36,
 v2.47, and the tested v2.49 layout. The v2.49 path also recovers the crypt-image

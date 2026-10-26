@@ -104,6 +104,73 @@ impl Host for TestHost {
 }
 
 #[test]
+fn clear_surface_presents_only_surface_zero_and_sleep_waits_for_elapsed_time() {
+    let game = Game::new();
+    let imm = |value: u32| [vec![4], value.to_le_bytes().to_vec()].concat();
+    let mut code = Vec::new();
+    for id in [0u32, 1] {
+        code.extend(0x04d8u16.to_le_bytes());
+        for value in [id, 0, 0, 800, 600, 10, 20, 30] {
+            code.extend(imm(value));
+        }
+    }
+    for id in [1u32, 0] {
+        code.extend(0x04ceu16.to_le_bytes());
+        code.extend(imm(id));
+    }
+    code.extend(0x002au16.to_le_bytes());
+    code.extend(imm(20));
+    code.extend(0u16.to_le_bytes());
+    code.extend(imm(0));
+    std::fs::write(game.0.join("wait.scn"), code).unwrap();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost::default();
+    let mut cleared = 0;
+    for _ in 0..100 {
+        let state = session
+            .resume(&project, &mut host, |event| {
+                if matches!(
+                    event,
+                    Event::Platform {
+                        request: PlatformRequest::ClearSurface { .. },
+                        ..
+                    }
+                ) {
+                    cleared += 1;
+                }
+                Ok(())
+            })
+            .unwrap();
+        if cleared == 1 {
+            assert_eq!(host.invalidates, 0);
+            assert_eq!(&session.surface(0).unwrap().rgba[..4], &[10, 20, 30, 255]);
+            assert_eq!(&session.surface(1).unwrap().rgba[..4], &[0, 0, 0, 255]);
+        }
+        if matches!(state, SessionState::Waiting { .. }) {
+            break;
+        }
+    }
+    assert_eq!(cleared, 2);
+    assert_eq!(host.invalidates, 1);
+    assert_eq!(&session.display().unwrap().rgba[..4], &[0, 0, 0, 255]);
+    host.now = 19;
+    assert!(matches!(
+        session.resume(&project, &mut host, |_| Ok(())).unwrap(),
+        SessionState::Waiting { .. }
+    ));
+    host.now = 20;
+    let mut ended = false;
+    for _ in 0..10 {
+        if session.resume(&project, &mut host, |_| Ok(())).unwrap() == SessionState::Ended {
+            ended = true;
+            break;
+        }
+    }
+    assert!(ended);
+}
+
+#[test]
 fn window_timers_repeat_coalesce_and_stop_after_cancellation() {
     for cancel in [false, true] {
         for epoch in [0u32, u32::MAX - 50] {

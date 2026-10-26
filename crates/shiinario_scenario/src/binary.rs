@@ -340,6 +340,10 @@ pub enum PlatformRequest {
         id: u32,
         name: String,
     },
+    BindImageMemory {
+        id: u32,
+        address: u32,
+    },
     LoadSound {
         id: u32,
         name: String,
@@ -1050,6 +1054,7 @@ impl BinaryVm {
                     | PlatformRequest::CreateSurface { .. }
                     | PlatformRequest::ReleaseSurface { .. }
                     | PlatformRequest::LoadImage { .. }
+                    | PlatformRequest::BindImageMemory { .. }
                     | PlatformRequest::CreateImage { .. }
                     | PlatformRequest::FillImage { .. }
                     | PlatformRequest::LoadSound { .. }
@@ -1207,11 +1212,32 @@ impl BinaryVm {
         Ok(address)
     }
     /// Read a whole VM allocation for a pending resource operation.
-    pub fn allocation_bytes(&self, address: u32) -> Result<&[u8]> {
-        self.allocations
+    pub fn allocation_bytes(&self, address: u32) -> Result<Vec<u8>> {
+        if let Some(data) = self.allocations.get(&address) {
+            return Ok(data.clone());
+        }
+        let memory = self
+            .shared_regions
             .get(&address)
-            .map(Vec::as_slice)
-            .context("resource address is not an allocation base")
+            .context("resource address is not an allocation base")?;
+        memory.read(0, memory.len())
+    }
+    /// Share a heap allocation without changing its script address.
+    pub fn share_allocation(&mut self, address: u32) -> Result<SharedMemory> {
+        ensure!(
+            (0x2000_0000..0x3000_0000).contains(&address),
+            "image address is not a heap allocation"
+        );
+        if let Some(memory) = self.shared_regions.get(&address) {
+            return Ok(memory.clone());
+        }
+        let bytes = self
+            .allocations
+            .remove(&address)
+            .context("image address is not an allocation base")?;
+        let memory = SharedMemory::from_bytes(bytes)?;
+        self.shared_regions.insert(address, memory.clone());
+        Ok(memory)
     }
     /// Read the active list from VM memory, including changes made through 04b9.
     fn draw_list(&self) -> Result<Vec<ImageDraw>> {
@@ -1223,7 +1249,9 @@ impl BinaryVm {
         }
         let bytes = self.memory_read(address, count * 32)?;
         Ok(bytes
-            .chunks_exact(32)
+            .as_chunks::<32>()
+            .0
+            .iter()
             .map(|record| {
                 let values: [u32; 8] = std::array::from_fn(|i| {
                     u32::from_le_bytes(record[i * 4..i * 4 + 4].try_into().unwrap())
@@ -1264,12 +1292,22 @@ impl BinaryVm {
         let span = |len: usize| ((len as u32 + 4095) & !4095) + 4096;
         let needed = span(size);
         let mut address = 0x2000_0000u32;
-        for (&base, bytes) in &self.allocations {
+        let regions: std::collections::BTreeMap<_, _> = self
+            .allocations
+            .iter()
+            .map(|(&base, bytes)| (base, bytes.len()))
+            .chain(
+                self.shared_regions
+                    .range(0x2000_0000..0x3000_0000)
+                    .map(|(&base, memory)| (base, memory.len())),
+            )
+            .collect();
+        for (base, length) in regions {
             if address.checked_add(needed).is_some_and(|end| end <= base) {
                 break;
             }
             address = base
-                .checked_add(span(bytes.len()))
+                .checked_add(span(length))
                 .context("allocation address overflow")?;
         }
         ensure!(
@@ -2220,9 +2258,10 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::DirectShowAvailable);
             }
+            // v2.48 002a (42459a) calls Sleep(milliseconds). The portable
+            // host uses the same elapsed-time wait while servicing events.
             // 07bf uses MsgWaitForMultipleObjects in v2.36 (4183d0).
-            // The native host keeps servicing events during this cooperative wait.
-            0x0028 | 0x07bf => {
+            0x0028 | 0x002a | 0x07bf => {
                 delay = Some(self.read(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
             }
@@ -2763,6 +2802,13 @@ impl BinaryVm {
                 ensure!(id < 256, "image slot {id} out of bounds");
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadImage { id, name });
+            }
+            0x04b2 => {
+                // v2.48 425b60 binds and relocates the supplied S25 allocation.
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot {id} out of bounds");
+                let address = self.read(&mut cursor)?;
+                request = Some(PlatformRequest::BindImageMemory { id, address });
             }
             0x0154 => {
                 let name = self.string(self.read(&mut cursor)?)?;
@@ -3729,7 +3775,9 @@ impl BinaryVm {
                 let address = self.read(&mut cursor)?;
                 if address != 0 {
                     ensure!(
-                        self.allocations.remove(&address).is_some(),
+                        self.allocations.remove(&address).is_some()
+                            || ((0x2000_0000..0x3000_0000).contains(&address)
+                                && self.shared_regions.remove(&address).is_some()),
                         "free of unknown allocation {address:#x}"
                     );
                 }
@@ -4172,6 +4220,31 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_heap_binding_preserves_writes_and_reuses_memory_after_free() {
+        let address = 0x2000_0000u32;
+        let mut code = instruction(0x02bd, &immediate(address));
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("memory.scn", code).unwrap();
+        vm.allocations.insert(address, vec![1; 64]);
+        let memory = vm.share_allocation(address).unwrap();
+        assert!(!vm.allocations.contains_key(&address));
+        assert!(memory.same_region(&vm.share_allocation(address).unwrap()));
+        assert!(vm.allocation_address(64).unwrap() > address);
+        let range = vm.memory_range(address + 4, 1).unwrap();
+        vm.memory_write(range, &[9]);
+        assert_eq!(memory.read(4, 1).unwrap(), [9]);
+        memory.write(5, &[7]).unwrap();
+        assert_eq!(vm.memory_read(address + 5, 1).unwrap(), [7]);
+        loop {
+            if matches!(vm.step().unwrap(), Event::End) {
+                break;
+            }
+        }
+        assert!(vm.memory_read(address, 1).is_err());
+        assert_eq!(vm.allocation_address(64).unwrap(), address);
+    }
 
     fn instruction(opcode: u16, operands: &[u8]) -> Vec<u8> {
         let mut code = opcode.to_le_bytes().to_vec();

@@ -95,15 +95,31 @@ impl StreamVolume {
 }
 enum Image {
     Encoded(Vec<u8>),
+    Memory {
+        memory: SharedMemory,
+        address: u32,
+    },
     Mutable {
         bytes_per_pixel: u32,
         frames: Vec<Surface>,
     },
 }
 impl Image {
+    fn encoded_bytes(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+        match self {
+            Self::Encoded(bytes) => Ok(std::borrow::Cow::Borrowed(bytes)),
+            Self::Memory { memory, address } => {
+                let mut bytes = memory.read(0, memory.len())?;
+                image::relocate(&mut bytes, *address, false)?;
+                Ok(std::borrow::Cow::Owned(bytes))
+            }
+            Self::Mutable { .. } => bail!("image has no encoded data"),
+        }
+    }
     fn size(&self) -> usize {
         match self {
             Self::Encoded(bytes) => bytes.len(),
+            Self::Memory { memory, .. } => memory.len(),
             Self::Mutable { frames, .. } => frames.iter().map(|frame| frame.rgba.len()).sum(),
         }
     }
@@ -639,8 +655,8 @@ impl Resources {
     /// Decode only the requested frame. The caller owns the decoded pixels.
     pub fn frame(&self, id: u32, index: usize) -> Result<Frame> {
         match self.images.get(&id).context("image slot is not loaded")? {
-            Image::Encoded(bytes) => {
-                let frame = image::decode(bytes, index)?;
+            encoded @ (Image::Encoded(_) | Image::Memory { .. }) => {
+                let frame = image::decode(&encoded.encoded_bytes()?, index)?;
                 Ok(Frame {
                     x: frame.info.x,
                     y: frame.info.y,
@@ -680,8 +696,8 @@ impl Resources {
     pub fn image_bounds(&self, id: u32, index: u32) -> Result<[i32; 4]> {
         let (x, y, width, height) =
             match self.images.get(&id).context("image slot is not loaded")? {
-                Image::Encoded(bytes) => {
-                    let frames = image::frames(bytes)?;
+                encoded @ (Image::Encoded(_) | Image::Memory { .. }) => {
+                    let frames = image::frames(&encoded.encoded_bytes()?)?;
                     let info = frames
                         .iter()
                         .find(|f| f.index == index as usize)
@@ -710,9 +726,11 @@ impl Resources {
         for item in ordered {
             let present = match self.images.get(&item.image) {
                 None => false,
-                Some(Image::Encoded(bytes)) => image::frames(bytes)?
-                    .iter()
-                    .any(|f| f.index == item.frame as usize),
+                Some(encoded @ (Image::Encoded(_) | Image::Memory { .. })) => {
+                    image::frames(&encoded.encoded_bytes()?)?
+                        .iter()
+                        .any(|f| f.index == item.frame as usize)
+                }
                 Some(Image::Mutable { frames, .. }) => (item.frame as usize) < frames.len(),
             };
             if !present {
@@ -728,8 +746,8 @@ impl Resources {
                 continue;
             }
             let hit = match &self.images[&item.image] {
-                Image::Encoded(bytes) => image::hit_test(
-                    bytes,
+                encoded @ (Image::Encoded(_) | Image::Memory { .. }) => image::hit_test(
+                    &encoded.encoded_bytes()?,
                     item.frame as usize,
                     x.wrapping_sub(left) as u32,
                     y.wrapping_sub(top) as u32,
@@ -776,9 +794,11 @@ impl Resources {
                 .get(&item.image)
                 .context("draw image slot is not loaded")?
             {
-                Image::Encoded(bytes) => image::frames(bytes)?
-                    .iter()
-                    .any(|f| f.index == item.frame as usize),
+                encoded @ (Image::Encoded(_) | Image::Memory { .. }) => {
+                    image::frames(&encoded.encoded_bytes()?)?
+                        .iter()
+                        .any(|f| f.index == item.frame as usize)
+                }
                 Image::Mutable { frames, .. } => (item.frame as usize) < frames.len(),
             };
             if !exists {
@@ -1213,6 +1233,13 @@ impl Resources {
         }
         Ok(())
     }
+    fn clear_surface(&self, id: u32) -> Result<()> {
+        let surface = self
+            .surfaces
+            .get(&id)
+            .context("clear surface is not allocated")?;
+        surface.pixels.write(0, &vec![0; surface.pixels.len()])
+    }
     fn load_image(&mut self, id: u32, data: Vec<u8>) -> Result<()> {
         ensure!(id < 256, "image slot out of bounds");
         image::frames(&data)?;
@@ -1220,6 +1247,22 @@ impl Resources {
         let resident = self.resident - old + data.len();
         ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
         self.images.insert(id, Image::Encoded(data));
+        self.resident = resident;
+        Ok(())
+    }
+    pub(crate) fn bind_image_memory(
+        &mut self,
+        id: u32,
+        address: u32,
+        memory: SharedMemory,
+    ) -> Result<()> {
+        ensure!(id < 256, "image slot out of bounds");
+        let resident = self.resident - self.images.get(&id).map_or(0, Image::size) + memory.len();
+        ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
+        let mut bytes = memory.read(0, memory.len())?;
+        image::relocate(&mut bytes, address, true)?;
+        memory.write(0, &bytes)?;
+        self.images.insert(id, Image::Memory { memory, address });
         self.resident = resident;
         Ok(())
     }
@@ -1449,12 +1492,7 @@ impl Resources {
                 self.fill_surface(*id, *rect, *color)?
             }
             PlatformRequest::ClearSurface { id } => {
-                let surface = self
-                    .surfaces
-                    .get(id)
-                    .context("clear surface is not allocated")?;
-                let rect = [0, 0, surface.width as i32, surface.height as i32];
-                self.fill_surface(*id, rect, [0; 3])?;
+                self.clear_surface(*id)?;
             }
             PlatformRequest::LoadSound { id, name, flags } => {
                 let bytes = project.read_with_archives(name, &self.archives)?;
@@ -1716,5 +1754,41 @@ mod tests {
         assert!(matches!(&resources.images[&10], Image::Encoded(bytes) if bytes == &data));
         assert_eq!(resources.resident_bytes(), 8);
         assert!(resources.frame(10, 0).is_err());
+    }
+    #[test]
+    fn memory_image_reads_changes_through_relocated_pointers() {
+        let mut data = b"S25\0".to_vec();
+        for word in [1u32, 12, 1, 1, 0, 0, 0, 36] {
+            data.extend(word.to_le_bytes());
+        }
+        data.extend([5, 0, 1, 0x60, 3, 2, 1]);
+        let memory = SharedMemory::from_bytes(data).unwrap();
+        let mut resources = Resources::default();
+        resources
+            .bind_image_memory(2, 0x2000_0000, memory.clone())
+            .unwrap();
+        assert_eq!(memory.read(8, 4).unwrap(), 0x2000_000cu32.to_le_bytes());
+        assert_eq!(memory.read(32, 4).unwrap(), 0x2000_0024u32.to_le_bytes());
+        assert_eq!(resources.frame(2, 0).unwrap().surface.rgba, [1, 2, 3, 255]);
+        memory.write(40, &[9]).unwrap();
+        memory.write(20, &5u32.to_le_bytes()).unwrap();
+        assert_eq!(resources.frame(2, 0).unwrap().surface.rgba, [1, 2, 9, 255]);
+        assert_eq!(resources.image_bounds(2, 0).unwrap(), [5, 0, 6, 1]);
+        memory.write(8, &u32::MAX.to_le_bytes()).unwrap();
+        assert!(resources.frame(2, 0).is_err());
+    }
+    #[test]
+    fn clearing_surface_zeros_pixels_and_row_padding_in_shared_memory() {
+        let mut resources = Resources::default();
+        resources.create_surface(1, 1, 2, 0).unwrap();
+        let memory = resources.surface_memory(1).unwrap();
+        memory.write(0, &[255; 8]).unwrap();
+        resources.clear_surface(1).unwrap();
+        assert_eq!(memory.read(0, 8).unwrap(), [0; 8]);
+        assert_eq!(
+            resources.surface(1).unwrap().rgba,
+            [0, 0, 0, 255, 0, 0, 0, 255]
+        );
+        assert!(resources.clear_surface(2).is_err());
     }
 }

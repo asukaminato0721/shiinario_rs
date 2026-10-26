@@ -30,6 +30,58 @@ fn bytes(data: &[u8], p: usize, n: usize) -> Result<&[u8]> {
 fn word(data: &[u8], p: usize) -> Result<u32> {
     Ok(u32::from_le_bytes(bytes(data, p, 4)?.try_into()?))
 }
+/// Convert S25 frame and row pointers between file offsets and VM addresses.
+/// Validate the complete result before changing the supplied memory.
+pub fn relocate(data: &mut [u8], base: u32, absolute: bool) -> Result<()> {
+    ensure!(data.starts_with(b"S25\0"), "memory image is not S25");
+    let count = word(data, 4)? as usize;
+    ensure!(count <= 1_000_000, "S25 frame count exceeds cap");
+    bytes(data, 8, count * 4)?;
+    let relative = |value: u32| -> Result<u32> {
+        if absolute {
+            Ok(value)
+        } else {
+            value
+                .checked_sub(base)
+                .context("S25 pointer precedes allocation")
+        }
+    };
+    let converted = |offset: u32| -> Result<u32> {
+        if absolute {
+            offset.checked_add(base).context("S25 pointer overflow")
+        } else {
+            Ok(offset)
+        }
+    };
+    let mut updates = std::collections::BTreeMap::new();
+    let mut rows = 0usize;
+    for index in 0..count {
+        let table = 8 + index * 4;
+        let pointer = word(data, table)?;
+        if pointer == 0 {
+            continue;
+        }
+        let offset = relative(pointer)?;
+        bytes(data, offset as usize, 20)?;
+        updates.insert(table, converted(offset)?);
+        let height = word(data, offset as usize + 4)? as usize;
+        rows = rows.checked_add(height).context("S25 row count overflow")?;
+        ensure!(rows <= 4_000_000, "S25 total row references exceed cap");
+        bytes(data, offset as usize + 20, height * 4)?;
+        for y in 0..height {
+            let row = offset as usize + 20 + y * 4;
+            let offset = relative(word(data, row)?)?;
+            updates.insert(row, converted(offset)?);
+        }
+    }
+    let mut result = data.to_vec();
+    for (offset, value) in updates {
+        result[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+    frames(if absolute { data } else { &result })?;
+    data.copy_from_slice(&result);
+    Ok(())
+}
 pub fn frames(data: &[u8]) -> Result<Vec<FrameInfo>> {
     if !data.starts_with(b"S25\0") {
         return Ok(vec![legacy::info(data)?]);
@@ -48,9 +100,7 @@ pub fn frames(data: &[u8]) -> Result<Vec<FrameInfo>> {
         let width = word(data, offset)?;
         let height = word(data, offset + 4)?;
         ensure!(
-            width <= 16384
-                && height <= 16384
-                && width as u64 * height as u64 <= 16_777_216,
+            width <= 16384 && height <= 16384 && width as u64 * height as u64 <= 16_777_216,
             "S25 invalid dimensions {width}x{height}"
         );
         total_rows += height as u64;
@@ -260,13 +310,44 @@ pub fn entries(data: &[u8], basename: &str) -> Result<Vec<ImageEntry>> {
 mod tests {
     use super::*;
     #[test]
+    fn relocation_round_trip_preserves_shared_frames_and_rejects_invalid_pointers() {
+        let mut data = b"S25\0".to_vec();
+        for word in [3u32, 20, 0, 20, 1, 1, 0, 0, 0, 44] {
+            data.extend(word.to_le_bytes());
+        }
+        data.extend([5, 0, 1, 0x60, 3, 2, 1]);
+        let original = data.clone();
+        relocate(&mut data, 0x2000_0000, true).unwrap();
+        assert_eq!(word(&data, 8).unwrap(), 0x2000_0014);
+        assert_eq!(word(&data, 12).unwrap(), 0);
+        assert_eq!(word(&data, 16).unwrap(), 0x2000_0014);
+        assert_eq!(word(&data, 40).unwrap(), 0x2000_002c);
+        let absolute = data.clone();
+        relocate(&mut data, 0x2000_0000, false).unwrap();
+        assert_eq!(data, original);
+        assert_eq!(
+            decode(&data, 0).unwrap().rgba,
+            decode(&data, 2).unwrap().rgba
+        );
+        assert!(relocate(&mut data, u32::MAX, true).is_err());
+        assert_eq!(data, original);
+        data = absolute;
+        data[8..12].copy_from_slice(&1u32.to_le_bytes());
+        let invalid = data.clone();
+        assert!(relocate(&mut data, 0x2000_0000, false).is_err());
+        assert_eq!(data, invalid);
+    }
+    #[test]
     fn empty_glyph_frames_retain_their_index_and_origin() {
         let mut data = b"S25\0".to_vec();
         for word in [1u32, 12, 0, 0, 4, 9, 0] {
             data.extend(word.to_le_bytes());
         }
         let frame = decode(&data, 0).unwrap();
-        assert_eq!((frame.info.index, frame.info.width, frame.info.height), (0, 0, 0));
+        assert_eq!(
+            (frame.info.index, frame.info.width, frame.info.height),
+            (0, 0, 0)
+        );
         assert_eq!((frame.info.x, frame.info.y), (4, 9));
         assert!(frame.rgba.is_empty());
         assert!(frame.methods.is_empty());

@@ -357,9 +357,19 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::BindImageMemory { id, address } = &request {
+                let memory = vm.share_allocation(*address)?;
+                resources.bind_image_memory(*id, *address, memory)?;
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::CreateAudioStream { address, flags } = &request {
                 let handle = resources
-                    .create_audio_stream(vm.allocation_bytes(*address)?, *flags)
+                    .create_audio_stream(&vm.allocation_bytes(*address)?, *flags)
                     .with_context(|| {
                         format!(
                             "{}:{:#x}: create audio stream",
@@ -680,7 +690,6 @@ impl Session {
                     location.scenario, location.offset
                 )
             })?;
-            // Bulk drawing modifies the working DIB until SCN invalidates it.
             if matches!(&request, PlatformRequest::ClearSurface { id: 0 }) {
                 let rect = [
                     0,
@@ -691,6 +700,7 @@ impl Session {
                 resources.commit_display(rect);
                 host.respond(&PlatformRequest::InvalidateRect { rect })?;
             }
+            // Bulk drawing modifies the working DIB until SCN invalidates it.
             // Text also submits its own glyph rectangles at TextTick, matching
             // the native text renderer without exposing the rest of the DIB.
             if let PlatformRequest::LoadSound { id, .. } = &request {
