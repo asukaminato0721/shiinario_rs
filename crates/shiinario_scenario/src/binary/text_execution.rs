@@ -24,6 +24,7 @@ pub(super) struct AsyncText {
     pub location: Location,
     pub ticking: bool,
     pub immediate: bool,
+    pub staged_destination: Option<Destination>,
     coroutine: Option<Coroutine<TextYield>>,
     reply: Option<PlatformReply>,
 }
@@ -37,10 +38,17 @@ impl AsyncText {
             location,
             ticking: false,
             immediate: false,
+            staged_destination: None,
             coroutine: Some(Coroutine::new(run_text)),
             reply: None,
         }
     }
+}
+
+pub(super) struct StagedText {
+    text: Option<AsyncText>,
+    context: TextContext,
+    completed: bool,
 }
 
 struct TextCo(Co<TextYield>);
@@ -199,6 +207,73 @@ struct TextGlyph {
 }
 
 impl BinaryVm {
+    fn text_snapshot(&self) -> TextContext {
+        TextContext {
+            style: self.text_style.clone(),
+            image_offset: self.text_image_offset,
+            cursor: self.text_cursor,
+            layout: self.text_layout.clone(),
+        }
+    }
+    pub(super) fn stage_text(&mut self, address: u32, location: Location) -> Result<()> {
+        ensure!(
+            self.async_text.is_none(),
+            "text coroutine is already active"
+        );
+        self.string_bytes(address)?;
+        self.text_layout.begin(self.text_cursor);
+        self.staged_texts.insert(
+            self.text_context,
+            StagedText {
+                text: Some(AsyncText::new(
+                    self.current_task,
+                    u32::MAX,
+                    address,
+                    location,
+                )),
+                context: self.text_snapshot(),
+                completed: false,
+            },
+        );
+        Ok(())
+    }
+    pub(super) fn resume_staged_text(
+        &mut self,
+        task: u32,
+        destination: Destination,
+        location: Location,
+    ) -> Result<()> {
+        ensure!(
+            self.async_text.is_none(),
+            "text coroutine is already active"
+        );
+        let staged = self
+            .staged_texts
+            .get_mut(&self.text_context)
+            .context("text has not been staged")?;
+        self.text_style = staged.context.style.clone();
+        self.text_image_offset = staged.context.image_offset;
+        self.text_cursor = staged.context.cursor;
+        self.text_layout = staged.context.layout.clone();
+        if staged.completed {
+            return self.write(destination, 0);
+        }
+        let mut text = staged
+            .text
+            .take()
+            .context("staged text is already active")?;
+        text.surface = if task == self.current_task {
+            self.text_surface
+        } else {
+            self.tasks.get(&task).map_or(0, |task| task.text_surface)
+        };
+        text.owner = self.current_task;
+        text.location = location;
+        text.staged_destination = Some(destination);
+        self.async_text = Some(text);
+        self.context_flags |= 8;
+        Ok(())
+    }
     pub(super) fn text_response(&mut self, event: &Event, value: u32) -> Result<()> {
         let Some(text) = self.async_text.as_mut().filter(|text| text.ticking) else {
             return Ok(());
@@ -231,7 +306,13 @@ impl BinaryVm {
                     "{}:{:#x}: {error:#}; opcode=0x{:04x}, task={}, text_byte={:#x}",
                     text.location.scenario,
                     text.location.offset,
-                    if text.immediate { 0x84 } else { 0x83 },
+                    if text.staged_destination.is_some() {
+                        0xa1
+                    } else if text.immediate {
+                        0x84
+                    } else {
+                        0x83
+                    },
                     text.owner,
                     text.offset
                 );
@@ -248,8 +329,16 @@ impl BinaryVm {
             "text task changed during a pending tick"
         );
         let mut coroutine = text.coroutine.take().context("missing text coroutine")?;
+        let staged = text.staged_destination.is_some();
         let result = self.resume_text(&mut coroutine);
         if let Some(text) = &mut self.async_text {
+            text.coroutine = Some(coroutine);
+        } else if staged
+            && let Some(text) = self
+                .staged_texts
+                .get_mut(&self.text_context)
+                .and_then(|staged| staged.text.as_mut())
+        {
             text.coroutine = Some(coroutine);
         }
         result
@@ -263,20 +352,33 @@ impl BinaryVm {
                     self.async_text.as_mut().unwrap().reply = Some(reply);
                     return Ok(self.text_request(*request));
                 }
-                Resume::Yielded(TextYield::Tick) => return Ok(self.text_tick(false)),
-                Resume::Complete => return Ok(self.text_tick(true)),
+                Resume::Yielded(TextYield::Tick) => return self.text_tick(false),
+                Resume::Complete => return self.text_tick(true),
             }
         }
     }
 
-    fn text_tick(&mut self, completed: bool) -> Event {
+    fn text_tick(&mut self, completed: bool) -> Result<Event> {
         let text = self.async_text.as_mut().unwrap();
         let event = Event::TextTick {
             task: text.owner,
             completed,
             cursor: [self.text_cursor[1], self.text_cursor[2]],
         };
-        if completed {
+        if let Some(destination) = text.staged_destination.take() {
+            self.write(destination, if completed { 0 } else { 2 })?;
+            let text = self.async_text.take();
+            let context = self.text_snapshot();
+            self.staged_texts.insert(
+                self.text_context,
+                StagedText {
+                    text: if completed { None } else { text },
+                    context,
+                    completed,
+                },
+            );
+            self.context_flags &= !8;
+        } else if completed {
             self.context_flags &= !8;
             self.async_text = None;
         } else {
@@ -285,7 +387,7 @@ impl BinaryVm {
         self.scheduler.dispatching = false;
         self.scheduler.pass_live |= self.context_flags & 1 != 0;
         self.scheduler.scan = self.current_task + 1;
-        event
+        Ok(event)
     }
 
     fn text_bytes(&self) -> Result<Vec<u8>> {
@@ -441,6 +543,58 @@ fn cp932_len(first: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn staged_text_returns_to_the_script_between_timed_glyphs() {
+        let mut code = 0x00a0u16.to_le_bytes().to_vec();
+        code.extend(b"\x10AB\0");
+        for index in 0..4u16 {
+            code.extend(0x00a1u16.to_le_bytes());
+            code.extend(immediate(0));
+            code.push(12);
+            code.extend(index.to_le_bytes());
+        }
+        code.extend(0u16.to_le_bytes());
+        code.extend(immediate(0));
+        let mut vm = BinaryVm::new("staged.scn", code).unwrap();
+        vm.text_style.fullwidth_ascii = false;
+        vm.text_style.character_delay = 10;
+        let mut now = 0u32;
+        let mut glyphs = Vec::new();
+        let mut ended = false;
+        for _ in 0..100 {
+            match vm.scheduled_step().unwrap() {
+                Event::Platform {
+                    request: PlatformRequest::ClockMilliseconds,
+                    ..
+                } => {
+                    now += 10;
+                    vm.respond(now).unwrap();
+                }
+                Event::Platform {
+                    request:
+                        PlatformRequest::DrawGlyph {
+                            character, surface, ..
+                        },
+                    ..
+                } => {
+                    assert_eq!(surface, 0);
+                    glyphs.push(character);
+                    vm.respond(1).unwrap();
+                }
+                Event::Platform { .. } | Event::SchedulerPoll => vm.respond(1).unwrap(),
+                Event::End => {
+                    ended = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(ended);
+        assert_eq!(glyphs, ['A', 'B']);
+        assert_eq!(&vm.banks[&12][..4], &[2, 2, 0, 0]);
+        assert!(vm.async_text.is_none());
+        assert_eq!(vm.context_flags & 8, 0);
+    }
 
     fn immediate(value: u32) -> Vec<u8> {
         let mut bytes = vec![4];

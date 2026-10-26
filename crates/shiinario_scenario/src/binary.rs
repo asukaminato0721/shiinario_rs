@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod native_helper;
 mod text_execution;
-use text_execution::AsyncText;
+use text_execution::{AsyncText, StagedText};
 
 /// The original engine stores the full operand and treats every nonzero value as
 /// swapped. Input bits 0, 1 and 2 represent the first three physical mouse buttons.
@@ -495,6 +495,7 @@ struct TaskState {
     scopes: Vec<NamedScope>,
     parameters: Vec<u32>,
     text_context: u32,
+    text_surface: u32,
 }
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
@@ -508,6 +509,7 @@ impl TaskState {
             scopes: Vec::new(),
             parameters: Vec::new(),
             text_context: 0,
+            text_surface: 0,
         }
     }
     fn bank(&self, tag: u8) -> &[u32] {
@@ -662,6 +664,8 @@ pub struct BinaryVm {
     archive_paths: Vec<String>,
     text_context: u32,
     text_contexts: std::collections::BTreeMap<u32, TextContext>,
+    staged_texts: std::collections::BTreeMap<u32, StagedText>,
+    text_surface: u32,
     text_style: crate::text::TextStyle,
     text_image_offset: [u32; 2],
     /// Line-start X, current X, current Y in the selected text context.
@@ -670,6 +674,7 @@ pub struct BinaryVm {
     async_text: Option<AsyncText>,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
+#[derive(Clone)]
 struct TextContext {
     style: crate::text::TextStyle,
     image_offset: [u32; 2],
@@ -759,6 +764,8 @@ impl BinaryVm {
             text_style: Default::default(),
             text_context: 0,
             text_contexts: Default::default(),
+            staged_texts: Default::default(),
+            text_surface: 0,
             text_image_offset: [0; 2],
             text_cursor: [0; 3],
             text_layout: crate::text_layout::TextLayout::new([0; 3]),
@@ -825,6 +832,7 @@ impl BinaryVm {
             scopes: std::mem::replace(&mut self.named_scopes, task.scopes),
             parameters: std::mem::replace(&mut self.parameters, task.parameters),
             text_context: self.text_context,
+            text_surface: self.text_surface,
         };
         self.tasks.insert(self.current_task, old);
         self.switch_scenario(task.base);
@@ -832,6 +840,7 @@ impl BinaryVm {
         self.sp = task.sp;
         self.context_flags = task.flags;
         self.current_task = id;
+        self.text_surface = task.text_surface;
         self.select_text_context(task.text_context);
     }
     fn select_text_context(&mut self, id: u32) {
@@ -2145,6 +2154,8 @@ impl BinaryVm {
         let mut new_draw_list = None;
         let mut draw_item = None;
         let mut new_text_context = None;
+        let mut staged_text_address = None;
+        let mut staged_text_step = None;
         let mut file_destinations = None;
         let mut timer_reply = None;
         let mut delay = None;
@@ -3249,6 +3260,7 @@ impl BinaryVm {
             0x0083 => {
                 let surface = self.read(&mut cursor)?;
                 let address = self.read(&mut cursor)?;
+                self.text_surface = surface;
                 ensure!(
                     surface < 256 || surface == u32::MAX,
                     "text surface out of bounds"
@@ -3315,6 +3327,15 @@ impl BinaryVm {
                         self.text_style = style;
                     }
                 }
+            }
+            0x00a0 => {
+                staged_text_address = Some(self.read(&mut cursor)?);
+            }
+            0x00a1 => {
+                let task = self.read(&mut cursor)?;
+                ensure!(task < CELLS as u32, "text task slot out of bounds");
+                let destination = self.destination(&mut cursor)?;
+                staged_text_step = Some((task, destination));
             }
             0x0547 => {
                 let id = self.read(&mut cursor)?;
@@ -4250,6 +4271,12 @@ impl BinaryVm {
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
         let next_pc = cursor.pc;
+        if let Some(address) = staged_text_address {
+            self.stage_text(address, location.clone())?;
+        }
+        if let Some((task, destination)) = staged_text_step {
+            self.resume_staged_text(task, destination, location.clone())?;
+        }
         if let Some(id) = new_text_context {
             self.select_text_context(id);
         }
