@@ -176,6 +176,7 @@ pub enum PlatformRequest {
         key: u32,
     },
     ReadControls,
+    ReadRepeatedControls,
     CursorPosition,
     MapCursor {
         point: [i32; 2],
@@ -2321,9 +2322,13 @@ impl BinaryVm {
                     self.destination(&mut cursor)?,
                 ]);
             }
-            0x03e9 => {
+            0x03e9 | 0x03ea => {
                 response_destination = Some(self.destination(&mut cursor)?);
-                request = Some(PlatformRequest::ReadControls);
+                request = Some(if opcode == 0x03ea {
+                    PlatformRequest::ReadRepeatedControls
+                } else {
+                    PlatformRequest::ReadControls
+                });
             }
             0x07e5 => self.background_mode = 1,
             0x07e6 => self.background_mode = 0,
