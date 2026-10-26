@@ -366,6 +366,11 @@ pub enum PlatformRequest {
         name: String,
         flags: u32,
     },
+    LoadSoundMemory {
+        id: u32,
+        address: u32,
+        flags: u32,
+    },
     CreateImage {
         id: u32,
         width: u32,
@@ -1078,6 +1083,7 @@ impl BinaryVm {
                     | PlatformRequest::CreateImage { .. }
                     | PlatformRequest::FillImage { .. }
                     | PlatformRequest::LoadSound { .. }
+                    | PlatformRequest::LoadSoundMemory { .. }
             ) {
                 ensure!(
                     value != 0,
@@ -1145,7 +1151,8 @@ impl BinaryVm {
         if matches!(
             &event,
             Event::Platform {
-                request: PlatformRequest::LoadSound { .. },
+                request: PlatformRequest::LoadSound { .. }
+                    | PlatformRequest::LoadSoundMemory { .. },
                 ..
             }
         ) && self.background_mode != 0
@@ -2674,6 +2681,17 @@ impl BinaryVm {
                 request = Some(PlatformRequest::LoadSound {
                     id,
                     name,
+                    flags: self.media_flags | if self.background_mode != 0 { 0x8000 } else { 0 },
+                });
+            }
+            0x06b1 => {
+                // v2.48 422830 decodes a memory buffer before creating sound.
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 256, "sound slot {id} out of bounds");
+                let address = self.read(&mut cursor)?;
+                request = Some(PlatformRequest::LoadSoundMemory {
+                    id,
+                    address,
                     flags: self.media_flags | if self.background_mode != 0 { 0x8000 } else { 0 },
                 });
             }

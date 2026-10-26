@@ -1276,7 +1276,7 @@ impl Resources {
         self.resident = resident;
         Ok(())
     }
-    fn load_sound(&mut self, id: u32, data: &[u8], flags: u32) -> Result<()> {
+    pub(crate) fn load_sound(&mut self, id: u32, data: &[u8], flags: u32) -> Result<()> {
         ensure!(id < 256, "sound slot out of bounds");
         // Both foreground-only (Wana) and global-focus buffers use the same
         // decoded PCM. Background input/audio policy belongs to the host.
@@ -1777,6 +1777,20 @@ mod tests {
         assert!(matches!(&resources.images[&10], Image::Encoded(bytes) if bytes == &data));
         assert_eq!(resources.resident_bytes(), 8);
         assert!(resources.frame(10, 0).is_err());
+    }
+    #[test]
+    fn loaded_sound_owns_pcm_after_the_input_buffer_changes() {
+        let mut data =
+            include_bytes!("../../shiinario_assets/tests/fixtures/garbro/pad-1.pad").to_vec();
+        let mut resources = Resources::default();
+        resources.load_sound(1, &data, 0x8000).unwrap();
+        let sound = resources.sound_buffer(1).unwrap().clone();
+        let samples = sound.samples.clone();
+        data.fill(0);
+        assert!(resources.load_sound(1, &data, 0).is_err());
+        assert_eq!(resources.sound_buffer(1).unwrap().samples, samples);
+        assert_eq!(sound.samples, samples);
+        assert!(!samples.is_empty());
     }
     #[test]
     fn frame_existence_distinguishes_empty_frames_and_missing_table_entries() {
