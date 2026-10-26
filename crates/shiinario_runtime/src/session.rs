@@ -354,6 +354,15 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::ImageOrigin { id, frame } = &request {
+                let [x, y, _, _] = resources.image_bounds(*id, *frame)?;
+                vm.respond_point([x, y])?;
+                emit(&Event::PointReply {
+                    point: [x, y],
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::ImageBounds { id, frame } = &request {
                 let bounds = resources.image_bounds(*id, *frame).with_context(|| {
                     format!("{}:{:#x}: image bounds", location.scenario, location.offset)
