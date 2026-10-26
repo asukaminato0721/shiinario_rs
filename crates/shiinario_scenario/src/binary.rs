@@ -3376,14 +3376,18 @@ impl BinaryVm {
                 );
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0304 | 0x030a | 0x030c => {
+            0x0304 | 0x0306 | 0x030a | 0x030c => {
                 let address = self.read(&mut cursor)?;
-                let offset = if opcode == 0x0304 {
+                let offset = if matches!(opcode, 0x0304 | 0x0306) {
                     0
                 } else {
                     self.read(&mut cursor)?
                 };
-                let width = if opcode == 0x030c { 2 } else { 1 };
+                let width = if matches!(opcode, 0x0306 | 0x030c) {
+                    2
+                } else {
+                    1
+                };
                 let bytes = self.memory_read(address.wrapping_add(offset), width)?;
                 let value = if width == 1 {
                     u32::from(bytes[0])
@@ -3392,14 +3396,18 @@ impl BinaryVm {
                 };
                 writes.push((self.destination(&mut cursor)?, value));
             }
-            0x0305 | 0x030b | 0x030d => {
+            0x0305 | 0x0307 | 0x030b | 0x030d => {
                 let address = self.read(&mut cursor)?;
-                let offset = if opcode == 0x0305 {
+                let offset = if matches!(opcode, 0x0305 | 0x0307) {
                     0
                 } else {
                     self.read(&mut cursor)?
                 };
-                let width = if opcode == 0x030d { 2 } else { 1 };
+                let width = if matches!(opcode, 0x0307 | 0x030d) {
+                    2
+                } else {
+                    1
+                };
                 let value = self.read(&mut cursor)?;
                 memory_write = Some((
                     self.memory_range(address.wrapping_add(offset), width)?,
@@ -4285,6 +4293,32 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn direct_word_access_is_unaligned_unsigned_and_bounded() {
+        let address = 0x2000_0000u32;
+        let mut code = instruction(
+            0x0307,
+            &[immediate(address + 1), immediate(0x1234_abcd)].concat(),
+        );
+        code.extend(instruction(
+            0x0306,
+            &[immediate(address + 1), vec![12, 0, 0]].concat(),
+        ));
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("words.scn", code).unwrap();
+        vm.allocations.insert(address, vec![99; 4]);
+        while !matches!(vm.step().unwrap(), Event::End) {}
+        assert_eq!(vm.allocations[&address], [99, 0xcd, 0xab, 99]);
+        assert_eq!(vm.banks[&12][0], 0xabcd);
+        for opcode in [0x0306, 0x0307] {
+            let mut code = instruction(opcode, &immediate(address + 3));
+            code.extend(immediate(0));
+            let mut vm = BinaryVm::new("bounds.scn", code).unwrap();
+            vm.allocations.insert(address, vec![99; 4]);
+            assert!(vm.step().is_err());
+            assert_eq!(vm.allocations[&address], [99; 4]);
+        }
+    }
 
     #[test]
     fn shared_heap_binding_preserves_writes_and_reuses_memory_after_free() {
