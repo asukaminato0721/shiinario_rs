@@ -474,10 +474,28 @@ impl BinaryVm {
         Ok(bytes)
     }
 
+    /// Precondition: this task owns an active text coroutine.
+    /// Postcondition: a valid control updates its state and consumes only its bytes.
+    /// An invalid control leaves the marker, cursor, and text offset unchanged.
     fn text_item(&mut self) -> Result<TextItem> {
         let bytes = self.text_bytes()?;
         if bytes.is_empty() {
             return Ok(TextItem::End);
+        }
+        if bytes.starts_with(b"~") && !bytes.starts_with(b"~~") {
+            // v2.48 4337ac: an omitted number is zero. An immediate + or -
+            // selects addition and is removed before parsing the number.
+            // Both signs therefore add, matching the original implementation.
+            let relative = matches!(bytes.get(1), Some(b'+' | b'-'));
+            let mut consumed = if relative { 2 } else { 1 };
+            let value = crate::text::parse_number(&bytes, &mut consumed, true)?;
+            self.text_marker = if relative {
+                self.text_marker.wrapping_add(value)
+            } else {
+                value
+            };
+            self.async_text.as_mut().unwrap().offset += consumed;
+            return Ok(TextItem::Control { clock: false });
         }
         if !bytes.starts_with(b"_") || bytes.starts_with(b"__") {
             return Ok(TextItem::Glyph);
@@ -624,6 +642,85 @@ impl BinaryVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_markers_match_native_numbers_and_remain_available_to_opcode_0069() {
+        // v2.48 4337ac and 431d60. Offsets include the leading tilde.
+        for (source, initial, expected, consumed) in [
+            (b"~!".as_slice(), 99, 0, 1),
+            (b"~7A", 99, 7, 2),
+            (b"~+2B", u32::MAX, 1, 3),
+            (b"~-3C", 7, 10, 3),
+            (b"~ xF,D", 99, 15, 5),
+            (b"~ -4E", 99, (-4i32) as u32, 4),
+            (b"~--5F", 7, 2, 4),
+            (b"~", 99, 0, 1),
+        ] {
+            let mut vm = BinaryVm::new("marker.scn", vec![0x69, 0, 12, 0, 0]).unwrap();
+            let address = 0x2000_0000;
+            vm.allocations.insert(address, [source, &[0]].concat());
+            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            vm.text_marker = initial;
+            let cursor = vm.text_cursor;
+            let layout = vm.text_layout.clone();
+            assert!(matches!(
+                vm.text_item().unwrap(),
+                TextItem::Control { clock: false }
+            ));
+            assert_eq!(vm.text_marker, expected, "{source:?}");
+            assert_eq!(vm.async_text.as_ref().unwrap().offset, consumed);
+            assert_eq!(vm.text_cursor, cursor);
+            assert_eq!(vm.text_layout, layout);
+            vm.step().unwrap();
+            assert_eq!(vm.banks[&12][0], expected);
+        }
+        let mut vm = BinaryVm::new("marker.scn", vec![0; 7]).unwrap();
+        let address = 0x2000_0000;
+        vm.allocations.insert(address, b"~{1}\0".to_vec());
+        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.text_marker = 42;
+        assert!(vm.text_item().is_err());
+        assert_eq!(vm.text_marker, 42);
+        assert_eq!(vm.async_text.as_ref().unwrap().offset, 0);
+        vm.allocations.insert(address, b"~~\0".to_vec());
+        vm.text_style.fullwidth_ascii = false;
+        assert!(matches!(vm.text_item().unwrap(), TextItem::Glyph));
+        assert_eq!(vm.text_glyph().unwrap().unwrap().character, '~');
+        assert_eq!(vm.text_marker, 42);
+    }
+
+    #[test]
+    fn hanaoto_big5_dialogue_continues_after_a_marker_without_a_number() {
+        let text = "那裡不行~！那、那裡到底是……啊啊！";
+        let (encoded, _, bad) = encoding_rs::BIG5.encode(text);
+        assert!(!bad);
+        let mut code = vec![0x84, 0, 4, 0, 0, 0, 0, 0x10];
+        code.extend_from_slice(&encoded);
+        code.extend([0, 0, 0, 4, 0, 0, 0, 0]);
+        let mut vm = BinaryVm::new("hanaoto.scn", code).unwrap();
+        vm.set_text_encoding(crate::TextEncoding::Big5);
+        let mut glyphs = String::new();
+        let ended = (0..1000).any(|_| match vm.scheduled_step().unwrap() {
+            Event::End => true,
+            Event::SchedulerPoll => {
+                vm.respond(1).unwrap();
+                false
+            }
+            Event::Platform {
+                request: PlatformRequest::DrawGlyph { character, .. },
+                ..
+            } => {
+                glyphs.push(character);
+                vm.respond(1).unwrap();
+                false
+            }
+            Event::Platform { request, .. } => panic!("unexpected text request: {request:?}"),
+            _ => false,
+        });
+        assert!(ended);
+        assert_eq!(glyphs, text.replace('~', ""));
+        assert_eq!(vm.text_marker, 0);
+    }
+
     #[test]
     fn short_big5_sources_keep_the_encoding_of_the_previous_story() {
         let mut vm = BinaryVm::new("localized.scn", vec![0; 7]).unwrap();

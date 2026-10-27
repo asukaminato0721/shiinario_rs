@@ -736,6 +736,8 @@ pub struct BinaryVm {
     async_text: Option<AsyncText>,
     text_callback: Option<TextCallback>,
     text_callback_result: u32,
+    // The inline ~ control and opcode 0069 share one value across text contexts.
+    text_marker: u32,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
 #[derive(Clone)]
@@ -839,6 +841,7 @@ impl BinaryVm {
             async_text: None,
             text_callback: None,
             text_callback_result: 0,
+            text_marker: 0,
             pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
@@ -4379,6 +4382,8 @@ impl BinaryVm {
             0xd382 => self.file_read_marker = 0xd382,
             0xaa82 => self.file_write_marker = 0xaa82,
             0x0048 => self.input_latches = [0; 2],
+            // v2.48 4244ee reads the value set by the inline ~ control.
+            0x0069 => writes.push((self.destination(&mut cursor)?, self.text_marker)),
             0x0316 | 0x0317 => {
                 let count = self.read(&mut cursor)? as usize;
                 let sp = if opcode == 0x0316 {
