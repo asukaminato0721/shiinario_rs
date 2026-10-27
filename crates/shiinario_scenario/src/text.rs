@@ -9,19 +9,29 @@ pub enum TextEncoding {
     Big5,
 }
 impl TextEncoding {
-    /// Prefer CP932. Select Big5 only when the complete source is invalid
-    /// CP932 and valid Big5. Keep source bytes and offsets unchanged.
+    /// Prefer CP932 when there is no established source encoding.
     pub fn detect(bytes: &[u8]) -> Self {
-        if encoding_rs::SHIFT_JIS
+        Self::detect_with_preference(bytes, Self::Cp932)
+    }
+    /// Keep the established encoding for ambiguous or ASCII-only sources.
+    /// Change it only when the other encoding alone can decode the source.
+    pub fn detect_with_preference(bytes: &[u8], preference: Self) -> Self {
+        let other = match preference {
+            Self::Cp932 => Self::Big5,
+            Self::Big5 => Self::Cp932,
+        };
+        if preference
+            .codec()
             .decode_without_bom_handling_and_without_replacement(bytes)
             .is_none()
-            && encoding_rs::BIG5
+            && other
+                .codec()
                 .decode_without_bom_handling_and_without_replacement(bytes)
                 .is_some()
         {
-            Self::Big5
+            other
         } else {
-            Self::Cp932
+            preference
         }
     }
     pub(crate) fn character_length(self, first: u8) -> usize {

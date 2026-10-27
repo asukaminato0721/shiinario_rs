@@ -625,6 +625,38 @@ impl BinaryVm {
 mod tests {
     use super::*;
     #[test]
+    fn short_big5_sources_keep_the_encoding_of_the_previous_story() {
+        let mut vm = BinaryVm::new("localized.scn", vec![0; 7]).unwrap();
+        let (source, _, bad) = encoding_rs::BIG5.encode("善意的虛偽，勝於引起爭端的事實。");
+        assert!(!bad);
+        vm.detect_text_encoding(&source);
+        assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
+        // These two Big5 characters also form four valid CP932 halfwidth glyphs.
+        let short = b"\xb4\xab\xc0\xc9\0";
+        assert!(
+            encoding_rs::SHIFT_JIS
+                .decode_without_bom_handling_and_without_replacement(short)
+                .is_some()
+        );
+        vm.detect_text_encoding(short);
+        vm.detect_text_encoding(b"; ASCII comment\r\n");
+        assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
+        let address = 0x2000_0000;
+        vm.allocations.insert(address, short.to_vec());
+        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        for expected in ['換', '檔'] {
+            let glyph = vm.text_glyph().unwrap().unwrap();
+            assert_eq!(glyph.character, expected);
+            vm.commit_text_glyph(glyph.layout, glyph.offset, false)
+                .unwrap();
+        }
+        assert!(vm.text_glyph().unwrap().is_none());
+        let (japanese, _, _) = encoding_rs::SHIFT_JIS.encode("日本語の文章です。");
+        vm.detect_text_encoding(&japanese);
+        assert_eq!(vm.text_encoding, crate::TextEncoding::Cp932);
+    }
+
+    #[test]
     fn immediate_surface_text_draws_without_input_or_character_delays() {
         for surface in [0, 7, u32::MAX] {
             let mut code = 0x0084u16.to_le_bytes().to_vec();
