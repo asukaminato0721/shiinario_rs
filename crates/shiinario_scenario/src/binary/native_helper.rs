@@ -6,6 +6,24 @@ use sha2::{Digest, Sha256};
 pub(super) const THUMBNAIL_CODE_SIZES: [usize; 3] = [114, 115, 117];
 pub(super) const SOURCE_SIZE: usize = 800 * 600 * 3;
 pub(super) const TARGET_SIZE: usize = 100 * 75 * 3;
+pub(super) const SAVE_XOR_CODE_SIZE: usize = 57;
+pub(super) const SAVE_XOR_SIZE: usize = 0x367d10;
+
+pub(super) fn is_save_xor(code: &[u8]) -> bool {
+    code.len() == SAVE_XOR_CODE_SIZE
+        && format!("{:x}", Sha256::digest(code))
+            == "e6d8dab28fab59f3b93740e16b1965efd8d70f6174c578637611361c934073e2"
+}
+
+pub(super) fn save_xor(bytes: &mut [u8], mut key: u32) -> Result<()> {
+    ensure!(bytes.len() == SAVE_XOR_SIZE, "invalid native save XOR size");
+    for word in bytes.as_chunks_mut::<4>().0 {
+        let value = u32::from_le_bytes(*word) ^ key;
+        word.copy_from_slice(&value.to_le_bytes());
+        key = key.wrapping_add(1).rotate_left(3).swap_bytes();
+    }
+    Ok(())
+}
 
 /// Return the bank and the source/destination operand indices.
 pub(super) fn thumbnail_arguments(code: &[u8]) -> Option<(u8, [u16; 2])> {
@@ -46,6 +64,26 @@ pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_xor_matches_original_hanaoto_machine_code_and_reverses_itself() {
+        // The original 57-byte helper produced this digest on Linux i386.
+        let original: Vec<_> = (0..SAVE_XOR_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        let mut bytes = original.clone();
+        save_xor(&mut bytes, 0x8765_4321).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "a09129ecc17781f702c24e0ec7cd78e44e1f5f242a93f12ff81c2430d4d8f416"
+        );
+        save_xor(&mut bytes, 0x8765_4321).unwrap();
+        assert_eq!(bytes, original);
+        bytes.pop();
+        let unchanged = bytes.clone();
+        assert!(save_xor(&mut bytes, 0).is_err());
+        assert_eq!(bytes, unchanged);
+    }
 
     #[test]
     fn thumbnail_matches_original_v248_pixels() {
