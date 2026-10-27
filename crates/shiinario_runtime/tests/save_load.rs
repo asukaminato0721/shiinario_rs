@@ -34,6 +34,50 @@ impl Drop for Game {
 }
 
 #[test]
+fn audio_release_stops_loaded_sounds_and_allows_reload_in_a_session() {
+    use shiinario_scenario::{Event, PlatformRequest, SoundCommand};
+    let game = Game::new();
+    std::fs::write(
+        game.0.join("sound.pad"),
+        include_bytes!("../../shiinario_assets/tests/fixtures/garbro/pad-1.pad"),
+    )
+    .unwrap();
+    let mut code = vec![0xa5, 6]; // Release before initialization is valid.
+    code.extend(b"\xc9\0\x10sound.pad\0\x0c\0\0");
+    for _ in 0..2 {
+        code.extend([0xb1, 6, 4, 0, 0, 0, 0, 12, 0, 0]);
+        code.extend([0xa7, 6, 4, 0, 0, 0, 0, 4, 1, 0, 0, 0]);
+        code.extend([0xaf, 6, 4, 0, 0, 0, 0, 12, 1, 0]);
+        code.extend([0xa5, 6, 0xa5, 6]);
+        code.extend([0xaf, 6, 4, 0, 0, 0, 0, 12, 1, 0]);
+    }
+    code.extend([0, 0, 4, 0, 0, 0, 0]);
+    std::fs::write(game.0.join("audio.scn"), code).unwrap();
+    let mut status_pending = false;
+    let mut statuses = Vec::new();
+    shiinario_runtime::trace_with_platform(&game.project(), "audio.scn", 1000, true, |event| {
+        match event {
+            Event::Platform {
+                request:
+                    PlatformRequest::Sound {
+                        command: SoundCommand::Status,
+                        ..
+                    },
+                ..
+            } => status_pending = true,
+            Event::PlatformReply { value, .. } if status_pending => {
+                statuses.push(*value);
+                status_pending = false;
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(statuses, [5, u32::MAX, 5, u32::MAX]);
+}
+
+#[test]
 fn deletion_removes_loose_files_and_reveals_registered_archive_entries() {
     for simulated in [false, true] {
         let game = Game::new();

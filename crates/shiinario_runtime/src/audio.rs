@@ -154,6 +154,12 @@ pub struct Mixer {
     buffers: BTreeMap<u32, BufferVoice>,
 }
 impl Mixer {
+    /// Precondition: the caller has exclusive access to the mixer.
+    /// Postcondition: static buffers are absent. Stream voices retain their state.
+    pub fn release_sounds(&mut self) {
+        self.buffers.clear();
+    }
+
     pub fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()> {
         ensure!(
             id < 256
@@ -379,6 +385,15 @@ impl AudioOutput {
             .lock()
             .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
             .sound_command(id, command)
+    }
+    /// Precondition: the audio mixer lock is available.
+    /// Postcondition: no static sound buffer remains in the device mixer.
+    pub fn release_sounds(&self) -> Result<()> {
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .release_sounds();
+        Ok(())
     }
     pub fn open() -> Result<Self> {
         let device = cpal::default_host()
@@ -623,6 +638,44 @@ mod tests {
         let mut output = [1.0; 8];
         mixer.render(&mut output, 48000, 1).unwrap();
         assert_eq!(output, [0.0; 8]);
+    }
+    #[test]
+    fn releasing_all_sounds_preserves_streams_and_allows_new_buffers() {
+        let sound = Arc::new(Sound {
+            channels: 1,
+            sample_rate: 48000,
+            samples: vec![1234; 16],
+        });
+        let stream = synthetic();
+        let mut mixer = Mixer::default();
+        mixer.play(1, stream, 2).unwrap();
+        for id in [0, 127, 255] {
+            mixer.install_sound(id, sound.clone()).unwrap();
+            mixer
+                .sound_command(id, &SoundCommand::Play { flags: 1 })
+                .unwrap();
+        }
+        assert_eq!(Arc::strong_count(&sound), 4);
+        mixer.release_sounds();
+        mixer.release_sounds();
+        assert_eq!(Arc::strong_count(&sound), 1);
+        assert_eq!(mixer.stream_status(1), 0x11);
+        for id in [0, 127, 255] {
+            assert_eq!(
+                mixer.sound_command(id, &SoundCommand::Status).unwrap(),
+                u32::MAX
+            );
+        }
+        mixer.stop(1);
+        let mut output = [1.0; 8];
+        mixer.render(&mut output, 48000, 1).unwrap();
+        assert_eq!(output, [0.0; 8]);
+        mixer.install_sound(255, sound).unwrap();
+        mixer
+            .sound_command(255, &SoundCommand::Play { flags: 1 })
+            .unwrap();
+        mixer.render(&mut output, 48000, 1).unwrap();
+        assert!(output.iter().all(|&sample| sample > 0.0));
     }
     #[test]
     fn static_buffers_restart_loop_stop_replace_and_mix_with_streams() {

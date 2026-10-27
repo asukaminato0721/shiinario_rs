@@ -141,6 +141,10 @@ impl Host for BrowserHost {
             // Browser pages do not control the browser window's title-bar buttons.
             PlatformRequest::SetMinimizeButton { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } => Ok(1),
+            PlatformRequest::ReleaseAudio => {
+                self.audio.release_sounds();
+                Ok(1)
+            }
             PlatformRequest::InitializeGraphics | PlatformRequest::ReleaseGraphics => Ok(1),
             // Select the verified scalar renderer; SIMD CPU flags describe the original x86 host.
             PlatformRequest::CpuFeatures => Ok(0),

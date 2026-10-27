@@ -1359,6 +1359,16 @@ impl Resources {
             self.resident -= sound.samples.len() * 2;
         }
     }
+    /// Precondition: `resident` includes the PCM bytes in `sounds`.
+    /// Postcondition: all static sounds are absent and their PCM budget is free.
+    pub(crate) fn release_sounds(&mut self) {
+        self.resident -= self
+            .sounds
+            .values()
+            .map(|sound| sound.samples.len() * 2)
+            .sum::<usize>();
+        self.sounds.clear();
+    }
     fn create_image(
         &mut self,
         id: u32,
@@ -2023,6 +2033,29 @@ mod tests {
         assert!(resources.sound_buffer(1).is_none());
         assert_eq!(resources.resident_bytes(), 0);
         resources.release_sound(1);
+    }
+    #[test]
+    fn releasing_all_sounds_returns_only_the_static_sound_budget() {
+        let data = include_bytes!("../../shiinario_assets/tests/fixtures/garbro/pad-1.pad");
+        let mut resources = Resources::default();
+        resources.create_surface(0, 2, 2, 0).unwrap();
+        let retained = resources.resident_bytes();
+        for id in [0, 127, 255] {
+            resources.load_sound(id, data, 0).unwrap();
+        }
+        let sound = resources.sound_buffer(255).unwrap();
+        assert_eq!(Arc::strong_count(&sound), 2);
+        assert!(resources.resident_bytes() > retained);
+        resources.release_sounds();
+        resources.release_sounds();
+        assert_eq!(resources.resident_bytes(), retained);
+        assert_eq!(Arc::strong_count(&sound), 1);
+        for id in [0, 127, 255] {
+            assert!(resources.sound_buffer(id).is_none());
+        }
+        assert_eq!(resources.surface(0).unwrap().rgba.len(), 16);
+        resources.load_sound(255, data, 0).unwrap();
+        assert!(resources.sound_buffer(255).is_some());
     }
     #[test]
     fn image_origins_affect_bounds_rendering_and_reset_on_replacement() {
