@@ -2244,27 +2244,42 @@ impl BinaryVm {
             }
             0x0276 => {
                 let address = self.read(&mut cursor)?;
-                let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
-                    .iter()
-                    .find_map(|&size| {
-                        self.memory_read(address, size)
-                            .ok()
-                            .and_then(|code| native_helper::thumbnail_arguments(&code))
-                    })
-                    .with_context(|| format!("unsupported native SCN helper at {address:#x}"))?;
-                let source = self.banks[&bank][self.bank_index(bank, source_index)?];
-                let target = self.banks[&bank][self.bank_index(bank, target_index)?];
-                ensure!(
-                    u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
-                        || u64::from(target) + native_helper::TARGET_SIZE as u64
-                            <= u64::from(source),
-                    "overlapping native thumbnail buffers are unresolved"
-                );
-                let destination = self.memory_range(target, native_helper::TARGET_SIZE)?;
-                let bytes = native_helper::thumbnail(
-                    &self.memory_read(source, native_helper::SOURCE_SIZE)?,
-                )?;
-                memory_write = Some((destination, bytes));
+                if self
+                    .memory_read(address, native_helper::SAVE_XOR_CODE_SIZE)
+                    .is_ok_and(|code| native_helper::is_save_xor(&code))
+                {
+                    // HANAOTO start.SCN:0x48a98 uses the current task stack.
+                    let key = self.banks[&8][self.bank_index(8, 0)?];
+                    let buffer = self.banks[&8][self.bank_index(8, 1)?];
+                    let destination = self.memory_range(buffer, native_helper::SAVE_XOR_SIZE)?;
+                    let mut bytes = self.memory_read(buffer, native_helper::SAVE_XOR_SIZE)?;
+                    native_helper::save_xor(&mut bytes, key)?;
+                    memory_write = Some((destination, bytes));
+                } else {
+                    let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
+                        .iter()
+                        .find_map(|&size| {
+                            self.memory_read(address, size)
+                                .ok()
+                                .and_then(|code| native_helper::thumbnail_arguments(&code))
+                        })
+                        .with_context(|| {
+                            format!("unsupported native SCN helper at {address:#x}")
+                        })?;
+                    let source = self.banks[&bank][self.bank_index(bank, source_index)?];
+                    let target = self.banks[&bank][self.bank_index(bank, target_index)?];
+                    ensure!(
+                        u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
+                            || u64::from(target) + native_helper::TARGET_SIZE as u64
+                                <= u64::from(source),
+                        "overlapping native thumbnail buffers are unresolved"
+                    );
+                    let destination = self.memory_range(target, native_helper::TARGET_SIZE)?;
+                    let bytes = native_helper::thumbnail(
+                        &self.memory_read(source, native_helper::SOURCE_SIZE)?,
+                    )?;
+                    memory_write = Some((destination, bytes));
+                }
             }
             0x05b4..=0x05c3 => {
                 if opcode == 0x05be {
@@ -4672,6 +4687,56 @@ mod tests {
             12,
             [0, 1],
         )
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_save_xor_checks_code_and_buffers_before_writing() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let original = std::fs::read(path)?;
+        let source: Vec<_> = (0..native_helper::SAVE_XOR_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        for (corrupt, short_buffer) in [(false, false), (true, false), (false, true)] {
+            // Recognize the helper even when it ends at the script boundary.
+            let mut code = original[..0x48a98 + native_helper::SAVE_XOR_CODE_SIZE].to_vec();
+            if corrupt {
+                code[0x48a98 + 50] ^= 1;
+            }
+            let mut vm = BinaryVm::new("start.scn", code)?;
+            vm.pc = 0x13ead;
+            vm.sp = 965;
+            vm.banks.get_mut(&8).unwrap()[965..967].copy_from_slice(&[0x8765_4321, 0x2000_0010]);
+            let mut allocation = vec![0xa5; 16];
+            allocation.extend_from_slice(&source);
+            if short_buffer {
+                allocation.pop();
+            } else {
+                allocation.extend_from_slice(&[0xa5; 16]);
+            }
+            vm.allocations.insert(0x2000_0000, allocation.clone());
+            let banks = vm.banks.clone();
+            if corrupt || short_buffer {
+                assert!(vm.step().is_err());
+                assert_eq!(vm.pc, 0x13ead);
+                assert_eq!(vm.allocations[&0x2000_0000], allocation);
+            } else {
+                vm.step()?;
+                assert_eq!(vm.pc, 0x13eb4);
+                let result = &vm.allocations[&0x2000_0000];
+                assert_eq!(&result[..16], &[0xa5; 16]);
+                assert_eq!(&result[result.len() - 16..], &[0xa5; 16]);
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&result[16..result.len() - 16])),
+                    "a09129ecc17781f702c24e0ec7cd78e44e1f5f242a93f12ff81c2430d4d8f416"
+                );
+            }
+            assert_eq!(vm.sp, 965);
+            assert_eq!(vm.banks, banks);
+        }
+        Ok(())
     }
 
     #[test]
