@@ -1460,10 +1460,24 @@ impl Resources {
             .sample_rate)
     }
 
+    fn audio_stream_duration(&self, handle: u32) -> Result<u32> {
+        // Original 455850 truncates decoded PCM bytes * 1000 / bytes per second.
+        let sound = &self
+            .streams
+            .get(&handle)
+            .context("unknown audio stream in duration query")?
+            .sound;
+        let frames = sound.samples.len() / usize::from(sound.channels);
+        Ok((frames as u64 * 1000 / u64::from(sound.sample_rate)) as u32)
+    }
+
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
         if let PlatformRequest::GetAudioStreamFrequency { handle } = request {
             return Ok(Some(self.audio_stream_frequency(*handle)?));
+        }
+        if let PlatformRequest::GetAudioStreamDuration { handle } = request {
+            return Ok(Some(self.audio_stream_duration(*handle)?));
         }
         if let PlatformRequest::ImageFrameExists { id, frame } = request {
             return Ok(Some(u32::from(self.image_frame_exists(*id, *frame)?)));
@@ -1637,6 +1651,30 @@ mod tests {
                 }),
             );
             assert_eq!(resources.audio_stream_frequency(1).unwrap(), rate);
+        }
+    }
+
+    #[test]
+    fn stream_duration_uses_frames_and_truncates_partial_milliseconds() {
+        let mut resources = Resources::default();
+        assert!(resources.audio_stream_duration(0).is_err());
+        for channels in [1, 2] {
+            for (frames, expected) in [(0, 0), (44, 0), (45, 1), (44123, 1000), (88200, 2000)] {
+                resources.streams.insert(
+                    1,
+                    Arc::new(AudioStream {
+                        sound: Sound {
+                            sample_rate: 44100,
+                            channels,
+                            samples: vec![0; frames * usize::from(channels)],
+                        },
+                        loop_start_frame: 0,
+                        first_block_frames: frames,
+                        volume: StreamVolume::default(),
+                    }),
+                );
+                assert_eq!(resources.audio_stream_duration(1).unwrap(), expected);
+            }
         }
     }
 
