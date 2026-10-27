@@ -4,7 +4,7 @@ use anyhow::{Result, ensure};
 use serde::Deserialize;
 use shiinario_scenario::MouseButtonMapping;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InputFrame {
     pub at_ms: u64,
@@ -37,6 +37,22 @@ pub(crate) struct Replay {
     pub window_messages: Vec<[u32; 3]>,
 }
 impl Replay {
+    pub fn replace_pending(&mut self, frames: Vec<InputFrame>) -> Result<()> {
+        let replacement = Self::new(frames)?;
+        ensure!(
+            replacement.frames.get(..self.next) == self.frames.get(..self.next),
+            "updated replay changes inputs that already ran"
+        );
+        ensure!(
+            replacement
+                .frames
+                .get(self.next)
+                .is_none_or(|frame| frame.at_ms > self.elapsed_ms),
+            "updated replay adds an input before the current clock"
+        );
+        self.frames = replacement.frames;
+        Ok(())
+    }
     pub fn new(frames: Vec<InputFrame>) -> Result<Self> {
         ensure!(
             frames.windows(2).all(|w| w[0].at_ms < w[1].at_ms),
@@ -118,9 +134,76 @@ impl Replay {
     }
 }
 
+pub(crate) struct InputReload {
+    path: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    length: u64,
+}
+impl InputReload {
+    pub fn new(path: std::path::PathBuf) -> Result<Self> {
+        let metadata = std::fs::metadata(&path)?;
+        Ok(Self {
+            path,
+            modified: metadata.modified()?,
+            length: metadata.len(),
+        })
+    }
+    pub fn refresh(&mut self, replay: &mut Replay) -> Result<bool> {
+        let metadata = std::fs::metadata(&self.path)?;
+        let modified = metadata.modified()?;
+        if modified == self.modified && metadata.len() == self.length {
+            return Ok(false);
+        }
+        let frames = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+        replay.replace_pending(frames)?;
+        self.modified = modified;
+        self.length = metadata.len();
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reload_changes_future_inputs_without_resetting_current_keys_or_cursor() {
+        let original =
+            r#"[{"at_ms":0,"cursor":[10,20],"keys":[13]},{"at_ms":20,"cursor":[30,40]}]"#;
+        let path = std::env::temp_dir().join(format!(
+            "shiinario-reload-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, original).unwrap();
+        let mut source = InputReload::new(path.clone()).unwrap();
+        let mut replay = Replay::new(serde_json::from_str(original).unwrap()).unwrap();
+        replay.advance(10);
+        replay.cursor = [100, 200];
+        let changed = r#"[{"at_ms":0,"cursor":[10,20],"keys":[13]},{"at_ms":20,"cursor":[300,400],"keys":[40]},{"at_ms":30}]"#;
+        std::fs::write(&path, changed).unwrap();
+        source.refresh(&mut replay).unwrap();
+        assert_eq!(replay.cursor, [100, 200]);
+        assert_eq!(replay.keys.query(13, true), 0xffff8001);
+        replay.advance(20);
+        assert_eq!(replay.cursor, [300, 400]);
+        assert!(replay.keys.is_down(40));
+        let mut past = serde_json::from_str::<Vec<InputFrame>>(changed).unwrap();
+        past[0].cursor = None;
+        assert!(replay.replace_pending(past).is_err());
+        assert_eq!(replay.cursor, [300, 400]);
+        let late = r#"[{"at_ms":0,"cursor":[10,20],"keys":[13]},{"at_ms":20,"cursor":[300,400],"keys":[40]},{"at_ms":21}]"#;
+        replay.advance(22);
+        assert!(
+            replay
+                .replace_pending(serde_json::from_str(late).unwrap())
+                .is_err()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn keyboard_frames_without_cursor_preserve_script_pointer_warps() {
         let frames = serde_json::from_str(

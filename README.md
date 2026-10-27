@@ -145,6 +145,9 @@ engine's u32 clock wrap. `--summary --tail-events 2000` keeps recent events for
 diagnosing a stalled replay.
 Summary mode writes progress to stderr after each five million binary instructions.
 Each update includes the glyph count, simulated elapsed time, and script position.
+Add `--reload-input` to apply future input edits during a running replay.
+Replace the JSON file atomically. Keep completed frames identical, and place
+changed frames after the current simulated time. Invalid edits stop the replay.
 
 Configured audio loops use decoded PCM frame boundaries. Native decoder block
 effects at configured loop endpoints do not have sample-by-sample verification.

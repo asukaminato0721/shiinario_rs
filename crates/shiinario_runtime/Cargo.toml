@@ -14,6 +14,7 @@ async-executor = { version = "1.14", default-features = false }
 shiinario_assets.workspace = true
 shiinario_scenario.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 libc = "0.2"
 ab_glyph = "0.2.32"
@@ -36,5 +37,4 @@ js-sys = "0.3"
 console_error_panic_hook = "0.1"
 
 [dev-dependencies]
-serde_json.workspace = true
 flate2.workspace = true

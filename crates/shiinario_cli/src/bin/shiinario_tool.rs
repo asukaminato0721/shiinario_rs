@@ -48,6 +48,9 @@ enum Command {
         /// JSON array of timestamped mouse/key snapshots for deterministic replay.
         #[arg(long, requires = "simulate_platform")]
         input: Option<PathBuf>,
+        /// Reload changed input files. Completed frames must remain identical.
+        #[arg(long, requires = "input")]
+        reload_input: bool,
         /// Print coverage totals instead of every interpreter event.
         #[arg(long)]
         summary: bool,
@@ -178,12 +181,14 @@ fn main() -> Result<()> {
             simulate_platform,
             tick_ms,
             input,
+            reload_input,
             summary,
             final_frame,
             tail_events,
         } => {
             anyhow::ensure!(tail_events <= 10000, "tail-events exceeds 10000");
             let p = open_project()?;
+            let input_reload = if reload_input { input.clone() } else { None };
             let input = input
                 .map(|path| -> Result<_> { Ok(serde_json::from_slice(&std::fs::read(path)?)?) })
                 .transpose()?
@@ -208,6 +213,7 @@ fn main() -> Result<()> {
                     simulate_platform,
                     tick_ms,
                     input,
+                    input_reload,
                     final_frame: final_frame.map(
                         |path| -> Box<
                             dyn FnOnce(shiinario_runtime::resources::Surface) -> Result<()>,

@@ -78,6 +78,8 @@ pub struct TraceOptions {
     pub simulate_platform: bool,
     pub tick_ms: u32,
     pub input: Vec<replay::InputFrame>,
+    /// Reload future input frames from this file during binary replay.
+    pub input_reload: Option<std::path::PathBuf>,
     /// Receive the last presented frame when binary replay stops.
     pub final_frame: Option<Box<dyn FnOnce(resources::Surface) -> Result<()>>>,
 }
@@ -93,6 +95,7 @@ pub fn trace_with_options(
         simulate_platform,
         tick_ms,
         input,
+        input_reload,
         final_frame,
     } = options;
     anyhow::ensure!(
@@ -103,6 +106,10 @@ pub fn trace_with_options(
         simulate_platform || tick_ms == 0,
         "trace clock requires a simulated platform"
     );
+    anyhow::ensure!(
+        input_reload.is_none() || (simulate_platform && tick_ms > 0),
+        "input reload requires a simulated advancing clock"
+    );
     if name.to_ascii_lowercase().ends_with(".scn") {
         let mut session = session::Session::new(project, name)?;
         let mut platform = TracePlatform {
@@ -111,8 +118,15 @@ pub fn trace_with_options(
             enabled: simulate_platform,
             ..Default::default()
         };
+        let mut input_reload = input_reload.map(replay::InputReload::new).transpose()?;
         let result = (|| {
-            for _ in 0..max_steps {
+            for step in 0..max_steps {
+                if step.is_multiple_of(100_000)
+                    && let Some(source) = &mut input_reload
+                    && source.refresh(&mut platform.replay)?
+                {
+                    eprintln!("REPLAY input updated at {} ms", platform.clock_ms);
+                }
                 if !session.step(project, &mut platform, &mut emit)? {
                     return Ok(());
                 }
@@ -144,8 +158,8 @@ pub fn trace_with_options(
         return result;
     }
     anyhow::ensure!(
-        final_frame.is_none(),
-        "frame capture requires binary SCN execution"
+        final_frame.is_none() && input_reload.is_none(),
+        "frame capture and input reload require binary SCN execution"
     );
     let script = TextScript::parse(name, &project.read(name)?)?;
     let mut vm = TextVm::new(script);
