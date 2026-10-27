@@ -546,6 +546,13 @@ struct TaskState {
     text_surface: u32,
     read_cursor: u32,
 }
+
+/// A restart plan contains a defined task and a validated scenario entry.
+struct TaskRestart {
+    id: u32,
+    base: u32,
+    entry: usize,
+}
 impl TaskState {
     fn new(base: u32, pc: usize) -> Self {
         Self {
@@ -876,6 +883,36 @@ impl BinaryVm {
         task.parameters.clear();
         self.task_entries.insert(id, (base, pc));
         self.collect_retired_scopes();
+    }
+    /// Precondition: none. Task numbers and entries can be invalid.
+    /// Postcondition: return a valid restart plan or an error. VM state is unchanged.
+    fn prepare_task_restart(&self, id: u32) -> Result<TaskRestart> {
+        ensure!(id < CELLS as u32, "task restart slot out of bounds");
+        let &(base, entry) = self
+            .task_entries
+            .get(&id)
+            .with_context(|| format!("restart of undefined task {id}"))?;
+        ensure!(
+            entry < self.scenario_size(base)?,
+            "task restart entry outside scenario"
+        );
+        Ok(TaskRestart { id, base, entry })
+    }
+
+    /// Precondition: the plan came from `prepare_task_restart` in this step.
+    /// Postcondition: reset PC, parameter count, SP and flags. Keep banks and text state.
+    fn apply_task_restart(&mut self, restart: TaskRestart) {
+        if restart.id == self.current_task {
+            self.switch_scenario(restart.base);
+            self.pc = restart.entry;
+            self.sp = CELLS;
+            self.parameters.clear();
+            self.context_flags = 1;
+            self.collect_retired_scopes();
+        } else {
+            self.define_task(restart.id, restart.base, restart.entry, true);
+        }
+        self.rescan_tasks();
     }
     fn select_task(&mut self, id: u32) {
         if id == self.current_task {
@@ -2315,6 +2352,7 @@ impl BinaryVm {
         let mut delay = None;
         let mut next_base = self.script_base;
         let mut definition = None;
+        let mut task_restart = None;
         let mut rescan = false;
         let mut event = Event::BinaryInstruction {
             location: location.clone(),
@@ -4248,6 +4286,11 @@ impl BinaryVm {
                 // A later definition supplies a new entry and resets the stack.
                 rescan = true;
             }
+            0x000d => {
+                // v2.48 424197 restores the registered entry, clears the
+                // parameter count, resets SP to 1000 and sets flags to one.
+                task_restart = Some(self.prepare_task_restart(self.read(&mut cursor)?)?);
+            }
             0x000c => {
                 let task = self.read(&mut cursor)?;
                 ensure!(
@@ -4705,6 +4748,9 @@ impl BinaryVm {
             self.rescan_tasks();
         }
         self.switch_scenario(next_base);
+        if let Some(restart) = task_restart {
+            self.apply_task_restart(restart);
+        }
         self.steps += 1;
         if let Some(request) = request {
             event = Event::Platform { location, request };
@@ -5020,6 +5066,176 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    fn task_restart_resets_execution_state_and_preserves_task_data() -> Result<()> {
+        for (current, override_limit) in [(false, false), (true, false), (false, true)] {
+            let id = if current { 0 } else { 255 };
+            let mut code = instruction(0x000d, &immediate(id));
+            code.extend(instruction(0, &immediate(0)));
+            let entry = code.len();
+            code.extend(instruction(
+                0x038e,
+                &[immediate(42), vec![12, 0, 0]].concat(),
+            ));
+            code.extend(instruction(0, &immediate(0)));
+            let mut vm = BinaryVm::new("restart.scn", code)?;
+            vm.thread_limit = 2;
+            vm.thread_limit_override = u32::from(override_limit);
+            if current {
+                vm.task_entries.insert(id, (vm.script_base, entry));
+                vm.sp = 969;
+                vm.context_flags = 5;
+                vm.parameters = vec![11, 22];
+                vm.banks.get_mut(&8).unwrap()[10] = 0xabcdef;
+                vm.banks.get_mut(&12).unwrap()[7] = 0x123456;
+                vm.text_context = 17;
+                vm.text_surface = 19;
+                vm.read_cursor = 23;
+            } else {
+                vm.define_task(id, vm.script_base, entry, false);
+                let task = vm.tasks.get_mut(&id).unwrap();
+                task.pc = entry + 1;
+                task.sp = 969;
+                task.flags = 0xb;
+                task.parameters = vec![11, 22];
+                task.stack[10] = 0xabcdef;
+                task.locals[7] = 0x123456;
+                task.text_context = 17;
+                task.text_surface = 19;
+                task.read_cursor = 23;
+            }
+            vm.step()?;
+            // Original 424197 and 415bd0 produced the same four resets,
+            // preserved all other task bytes, and respected scan overrides.
+            if current {
+                assert_eq!(vm.pc, entry);
+                assert_eq!(vm.sp, CELLS);
+                assert_eq!(vm.context_flags, 1);
+                assert!(vm.parameters.is_empty());
+                assert_eq!(vm.banks[&8][10], 0xabcdef);
+                assert_eq!(vm.banks[&12][7], 0x123456);
+                assert_eq!(
+                    (vm.text_context, vm.text_surface, vm.read_cursor),
+                    (17, 19, 23)
+                );
+                assert!(!vm.tasks.contains_key(&id));
+            } else {
+                assert_eq!(vm.pc, 7);
+                let task = &vm.tasks[&id];
+                assert_eq!(task.pc, entry);
+                assert_eq!(task.sp, CELLS);
+                assert_eq!(task.flags, 1);
+                assert!(task.parameters.is_empty());
+                assert_eq!(task.stack[10], 0xabcdef);
+                assert_eq!(task.locals[7], 0x123456);
+                assert_eq!(
+                    (task.text_context, task.text_surface, task.read_cursor),
+                    (17, 19, 23)
+                );
+            }
+            assert_eq!(vm.thread_limit, if override_limit { 2 } else { id + 1 });
+            if !override_limit {
+                assert!((0..100).any(|_| match vm.scheduled_step().unwrap() {
+                    Event::SchedulerPoll => {
+                        vm.respond(1).unwrap();
+                        false
+                    }
+                    Event::End => true,
+                    _ => false,
+                }));
+                assert_eq!(
+                    vm.memory_read(task_bank_base(id, 12), 4)?,
+                    42u32.to_le_bytes()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_restart_restores_the_registered_scenario() -> Result<()> {
+        for id in [0, 255] {
+            let mut vm = BinaryVm::new("caller.scn", instruction(0x000d, &immediate(id)))?;
+            let worker = instruction(0, &immediate(0));
+            vm.scenarios.insert(
+                0x4000_0000,
+                Scenario {
+                    name: "worker.scn".into(),
+                    data: worker,
+                },
+            );
+            vm.task_entries.insert(id, (0x4000_0000, 0));
+            vm.step()?;
+            if id == 0 {
+                assert_eq!(vm.name, "worker.scn");
+                assert_eq!(vm.script_base, 0x4000_0000);
+                assert_eq!(vm.pc, 0);
+            } else {
+                assert_eq!(vm.name, "caller.scn");
+                assert_eq!(vm.tasks[&id].base, 0x4000_0000);
+                assert_eq!(vm.tasks[&id].pc, 0);
+                assert_eq!(vm.tasks[&id].flags, 1);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn task_restart_validates_entries_before_changing_state() -> Result<()> {
+        for case in 0..5 {
+            let id = if case == 0 { CELLS as u32 } else { 255 };
+            let mut code = instruction(0x000d, &immediate(id));
+            if case == 4 {
+                code.pop();
+            }
+            let mut vm = BinaryVm::new("restart.scn", code)?;
+            if case >= 2 {
+                let base = if case == 2 {
+                    0x4000_0000
+                } else {
+                    vm.script_base
+                };
+                vm.define_task(id, base, 9999, false);
+            }
+            vm.sp = 969;
+            vm.parameters = vec![11, 22];
+            let banks = vm.banks.clone();
+            let entries = vm.task_entries.clone();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+            assert_eq!(vm.sp, 969);
+            assert_eq!(vm.context_flags, 1);
+            assert_eq!(vm.parameters, [11, 22]);
+            assert_eq!(vm.banks, banks);
+            assert_eq!(vm.task_entries, entries);
+            assert_eq!(vm.thread_limit, 1);
+            assert!(vm.tasks.get(&id).is_none_or(|task| task.flags == 0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_task_restart_activates_task_255() -> Result<()> {
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let mut vm = BinaryVm::new("start.scn", std::fs::read(path)?)?;
+        vm.pc = 0x8a9;
+        vm.step()?;
+        assert_eq!(vm.task_entries[&255], (vm.script_base, 0x122d));
+        assert_eq!(vm.tasks[&255].flags, 0);
+        vm.pc = 0x2762f;
+        vm.sp = 969;
+        vm.step()?;
+        assert_eq!(vm.pc, 0x27636);
+        assert_eq!(vm.sp, 969);
+        assert_eq!(vm.thread_limit, 256);
+        assert_eq!(vm.tasks[&255].pc, 0x122d);
+        assert_eq!(vm.tasks[&255].sp, CELLS);
+        assert_eq!(vm.tasks[&255].flags, 1);
+        Ok(())
     }
 
     #[test]
