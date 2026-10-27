@@ -1132,17 +1132,12 @@ impl Resources {
                     continue;
                 }
                 let write = (y as usize * dst.width as usize + x as usize) * 4;
-                let alpha = i32::from(frame.surface.rgba[src + 3]);
-                for channel in 0..3 {
-                    let source = frame.surface.rgba[src + channel];
-                    let old = dst.rgba[write + channel];
-                    dst.rgba[write + channel] = if alpha == 255 && method != 5 {
-                        source
-                    } else {
-                        (i32::from(old) + (((i32::from(source) - i32::from(old)) * alpha) >> 8))
-                            as u8
-                    };
+                let mut source: [u8; 4] = frame.surface.rgba[src..src + 4].try_into().unwrap();
+                if method <= 3 {
+                    source[3] = 255;
                 }
+                let target = dst.rgba[write..write + 4].try_into().unwrap();
+                dst.rgba[write..write + 4].copy_from_slice(&graphics::compose_rgba(source, target));
             }
         }
         Ok(())
@@ -1830,7 +1825,7 @@ mod tests {
         );
     }
     #[test]
-    fn image_composition_clips_blends_and_preserves_destination_alpha() {
+    fn image_composition_clips_and_combines_color_and_alpha() {
         let mut resources = Resources::default();
         resources.create_image(1, 3, 1, 4, 1).unwrap();
         resources.create_image(2, 2, 1, 4, 1).unwrap();
@@ -1845,7 +1840,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             resources.frame(1, 0).unwrap().surface.rgba,
-            [80, 64, 48, 64, 32, 32, 32, 64, 32, 32, 32, 64]
+            [108, 82, 57, 160, 32, 32, 32, 64, 32, 32, 32, 64]
         );
         let before = resources.frame(1, 0).unwrap().surface;
         assert!(
@@ -1862,7 +1857,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             &resources.frame(1, 0).unwrap().surface.rgba[4..8],
-            &[0xaa, 0xbb, 0xcc, 64]
+            &[0xaa, 0xbb, 0xcc, 255]
         );
     }
     #[test]

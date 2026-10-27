@@ -1,6 +1,30 @@
 //! Portable implementations of the 0564 and 0574 graphics kernels.
 use super::*;
 
+/// Match the original 444600/44446d straight-alpha composition kernels.
+pub(super) fn compose_rgba(source: [u8; 4], target: [u8; 4]) -> [u8; 4] {
+    let a = u32::from(source[3]);
+    let b = u32::from(target[3]);
+    if a == 0 {
+        return target;
+    }
+    if a == 255 || b == 0 {
+        return source;
+    }
+    let alpha = ((65025 - (255 - a) * (255 - b)) * 0x10203) >> 24;
+    let factor = (1 << 24) / alpha;
+    let mut result = [0; 4];
+    for channel in 0..3 {
+        let numerator =
+            u32::from(source[channel]) * a * 255 + u32::from(target[channel]) * (255 - a) * b;
+        // The native kernel stores the low byte, including its wrap at very
+        // small combined alpha values. Do not replace this with saturation.
+        result[channel] = ((u64::from(numerator) * u64::from(factor)) >> 32) as u8;
+    }
+    result[3] = alpha as u8;
+    result
+}
+
 impl Resources {
     pub(super) fn pixelate_surface(&mut self, copy: &SurfaceCopy, block: i32) -> Result<()> {
         if block <= 0 {
@@ -181,6 +205,36 @@ impl Resources {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_composition_matches_original_for_every_alpha_pair() {
+        use sha2::{Digest, Sha256};
+        let mut pixels = Vec::with_capacity(256 * 256 * 4);
+        for a in 0..256usize {
+            for b in 0..256usize {
+                let i = a * 256 + b;
+                let source = [
+                    (i / 31 * 53) as u8,
+                    (i / 7 * 13) as u8,
+                    (i * 37) as u8,
+                    a as u8,
+                ];
+                let target = [
+                    (i / 43 * 47) as u8,
+                    (i / 11 * 17) as u8,
+                    (i * 23) as u8,
+                    b as u8,
+                ];
+                pixels.extend(super::compose_rgba(source, target));
+            }
+        }
+        // Original 4440c0, with synthetic S25 method-4 rows on Linux i386.
+        // The probe checked all row guards and converted native ABGR to RGBA.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&pixels)),
+            "9bcd1ef843442ff678b70811d87e00d0fbed0b458144aaf2f4f90437e39f0298"
+        );
+    }
+
     use super::*;
     use shiinario_scenario::SurfacePoint;
 
