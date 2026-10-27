@@ -810,7 +810,8 @@ impl Session {
                 ];
                 resources.invalidate_display(rect);
             }
-            if let PlatformRequest::BitBlt { copy, .. } = &request
+            if let PlatformRequest::BitBlt { copy, .. }
+            | PlatformRequest::CopySurfaceAndInvalidate(copy) = &request
                 && copy.destination.id == 0
             {
                 let rect = [
@@ -819,11 +820,11 @@ impl Session {
                     copy.destination
                         .x
                         .checked_add(copy.size[0])
-                        .context("BitBlt rectangle overflow")?,
+                        .context("screen copy rectangle overflow")?,
                     copy.destination
                         .y
                         .checked_add(copy.size[1])
-                        .context("BitBlt rectangle overflow")?,
+                        .context("screen copy rectangle overflow")?,
                 ];
                 resources.invalidate_display(rect);
             }

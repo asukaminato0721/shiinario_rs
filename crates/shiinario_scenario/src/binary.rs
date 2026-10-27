@@ -240,7 +240,10 @@ pub enum PlatformRequest {
     UpdateWindow,
     BlendSurfaces(SurfaceBlend),
     BlendImages(ImageBlend),
+    /// Copy working pixels without requesting a window paint (e.g. 0500).
     CopySurface(SurfaceCopy),
+    /// Native 04e2 also invalidates the copied screen rectangle.
+    CopySurfaceAndInvalidate(SurfaceCopy),
     BitBlt {
         copy: SurfaceCopy,
         raster_operation: u32,
@@ -3008,7 +3011,9 @@ impl BinaryVm {
                         PlatformRequest::CopySurface(copy)
                     }
                 } else {
-                    PlatformRequest::CopySurface(copy)
+                    // v2.48 418280 -> 418424 queues a window invalidation
+                    // when the destination is the screen surface.
+                    PlatformRequest::CopySurfaceAndInvalidate(copy)
                 });
             }
             0x04f6 => {

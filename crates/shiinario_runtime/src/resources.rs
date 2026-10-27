@@ -1675,7 +1675,8 @@ impl Resources {
             } => self.set_image_origin(*id, *frame, *position)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::BlendImages(blend) => self.blend_images(blend)?,
-            PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::CopySurface(copy)
+            | PlatformRequest::CopySurfaceAndInvalidate(copy) => self.copy_surface(copy)?,
             PlatformRequest::BitBlt {
                 copy,
                 raster_operation,

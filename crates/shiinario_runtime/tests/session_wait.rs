@@ -280,6 +280,88 @@ fn physical_key_repeats_keep_separate_state_for_left_and_right_keys() {
 }
 
 #[test]
+fn skipped_transition_paints_its_final_screen_copy() {
+    let game = Game::new();
+    let mut code = Vec::new();
+    for (opcode, values) in [
+        (0x04d8u16, vec![0u32, 0, 0, 3, 1, 255, 0, 0]),
+        (0x04d8, vec![1, 0, 0, 3, 1, 0, 255, 0]),
+        (0x07d0, vec![0, 0, 3, 1]),
+        (0x07d1, vec![]),
+        // The initial pump paints the old transition frame. The skip branch
+        // then copies its destination and pumps without an explicit 07d0.
+        (0x04d8, vec![0, 0, 0, 3, 1, 0, 0, 255]),
+        (0x07d0, vec![0, 0, 3, 1]),
+        (0x0034, vec![]),
+        (0x04e2, vec![0, 0, 0, 3, 1, 1, 0, 0]),
+        (0x0034, vec![]),
+        // An offscreen copy and the 0500 helper do not request a paint.
+        (0x04d8, vec![0, 0, 0, 3, 1, 0, 0, 255]),
+        (0x04e2, vec![1, 0, 0, 3, 1, 0, 0, 0]),
+        (0x07d1, vec![]),
+        (0x0500, vec![255]),
+        (0x07d1, vec![]),
+        (0x049d, vec![42]),
+        (0x07d0, vec![0, 0, 1, 1]),
+        (0x07d1, vec![]),
+        (0, vec![0]),
+    ] {
+        code.extend(opcode.to_le_bytes());
+        for value in values {
+            code.push(4);
+            code.extend(value.to_le_bytes());
+        }
+    }
+    std::fs::write(game.0.join("wait.scn"), code).unwrap();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost::default();
+    let mut running = true;
+    let mut steps = 0;
+    let mut frames = Vec::new();
+    let mut checked_helpers = false;
+    while running && steps < 1000 {
+        let mut screen_copy = false;
+        let mut check_helpers = false;
+        running = session
+            .step(&project, &mut host, |event| {
+                screen_copy = matches!(event, Event::Platform {
+                    request: PlatformRequest::CopySurfaceAndInvalidate(copy), ..
+                } if copy.destination.id == 0);
+                check_helpers = matches!(event, Event::MouseButtonMapping { value: 42, .. });
+                Ok(())
+            })
+            .unwrap();
+        steps += 1;
+        let pixel: [u8; 4] = session.display().unwrap().rgba[..4].try_into().unwrap();
+        if frames.last() != Some(&pixel) {
+            frames.push(pixel);
+        }
+        if screen_copy {
+            assert_eq!(pixel, [0, 0, 255, 255], "copy must wait for a paint");
+        }
+        if check_helpers {
+            checked_helpers = true;
+            assert_eq!(&session.surface(0).unwrap().rgba[..4], &[0, 0, 255, 255]);
+            assert_eq!(pixel, [0, 255, 0, 255]);
+            assert_eq!(host.invalidates, 3);
+        }
+    }
+    assert!(!running && checked_helpers);
+    assert_eq!(
+        frames,
+        [
+            [0, 0, 0, 255],
+            [255, 0, 0, 255],
+            [0, 0, 255, 255],
+            [0, 255, 0, 255],
+            [0, 0, 255, 255],
+        ]
+    );
+    assert_eq!(&session.display().unwrap().rgba[4..8], &[0, 255, 0, 255]);
+}
+
+#[test]
 fn menu_composition_stays_hidden_until_the_script_paints() {
     // Exercise explicit message dispatch, UpdateWindow, and scheduler dispatch.
     for boundary in [0x0034u16, 0x07d1, 0x0033] {
