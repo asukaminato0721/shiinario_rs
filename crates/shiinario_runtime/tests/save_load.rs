@@ -134,7 +134,7 @@ fn deletion_removes_loose_files_and_reveals_registered_archive_entries() {
         );
         assert_eq!(
             resources.asset_sizes(&project, "fixture.txt").unwrap(),
-            [0, 3]
+            [3, 0]
         );
         assert!(
             resources
@@ -364,12 +364,18 @@ fn asset_reads_reload_saves_and_respect_file_precedence() {
         restarted.read_asset(&reopened, "save\\system.bin").unwrap(),
         save
     );
+    assert_eq!(
+        restarted
+            .asset_sizes(&reopened, "save\\system.bin")
+            .unwrap(),
+        [save.len() as u32, 0]
+    );
     restarted
         .write_file(&reopened, "SAVE/system.bin", vec![7; 12], true)
         .unwrap();
     assert_eq!(
         restarted.asset_sizes(&reopened, "save/system.bin").unwrap(),
-        [0, 12]
+        [12, 0]
     );
     assert_eq!(
         restarted.read_asset(&reopened, "save/system.bin").unwrap(),
@@ -441,12 +447,26 @@ fn native_slots_survive_restart_and_case_insensitive_overwrite() {
     assert!(resources.file_exists(&project, "SAVE000.dat").unwrap());
     assert_eq!(
         resources.asset_sizes(&project, "save000.dat").unwrap(),
-        [0, 43132]
+        [43132, 0]
     );
     assert_eq!(project.read("save000.dat").unwrap(), slot);
     drop(resources);
     let mut restarted = Resources::default();
     let reopened = game.project();
+    // HANAOTO compares the first opcode 0158 result with its exact save size.
+    // A zero here makes the original script delete a valid slot on startup.
+    let mut code = b"\x58\x01\x10SAVE000.DAT\0\x0c\0\0\x0c\x01\0".to_vec();
+    code.extend([0, 0, 4, 0, 0, 0, 0]);
+    std::fs::write(game.0.join("sizes.scn"), code).unwrap();
+    let mut sizes = Vec::new();
+    shiinario_runtime::trace_with_platform(&reopened, "sizes.scn", 30, true, |event| {
+        if let shiinario_scenario::Event::AssetSizesReply { sizes: reply } = event {
+            sizes.push(*reply);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(sizes, [[43132, 0]]);
     let metadata = restarted
         .open_file(&reopened, "SAVE000.DAT", 0x80000000)
         .unwrap();
@@ -494,14 +514,14 @@ fn seek_partial_reads_sparse_writes_and_simulation() {
             .unwrap(),
         0
     );
-    assert_eq!(resources.asset_sizes(&project, "save.dat").unwrap(), [0, 4]);
+    assert_eq!(resources.asset_sizes(&project, "save.dat").unwrap(), [4, 0]);
     assert_eq!(
         resources
             .write_file_handle(&project, handle, vec![8, 9], true)
             .unwrap(),
         2
     );
-    assert_eq!(resources.asset_sizes(&project, "save.dat").unwrap(), [0, 8]);
+    assert_eq!(resources.asset_sizes(&project, "save.dat").unwrap(), [8, 0]);
     resources.close_file(handle).unwrap();
     let handle = resources
         .open_file(&project, "SAVE.DAT", 0x80000000)

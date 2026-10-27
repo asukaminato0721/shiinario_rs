@@ -243,12 +243,14 @@ impl Project {
         let (archive, entry) = self.registered_entry(name, paths)?;
         archive.read(entry)
     }
-    /// Original WARC index fields, in decoded-size / stored-size order.
+    /// Precondition: `name` is a valid game-relative path.
+    /// Postcondition: return the logical size first and the packed size second.
+    /// A plain file has no packed payload, so its packed size is zero.
     pub fn sizes_with_archives(&self, name: &str, paths: &[String]) -> Result<[u32; 2]> {
         if let Some(path) = self.loose_path(name, false)? {
             let size = crate::fs::metadata(path)?.len();
             ensure!(size <= MAX_OUTPUT as u64, "file exceeds cap");
-            return Ok([0, size as u32]);
+            return Ok([size as u32, 0]);
         }
         self.sizes_in_archives(name, paths)
     }
