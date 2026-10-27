@@ -13,6 +13,29 @@ pub(super) const IMAGE_COPY_CODE_SIZE: usize = 158;
 // The helper writes 600 rows of 2400 bytes, with four untouched bytes
 // between rows. It does not access the padding after the final row.
 pub(super) const IMAGE_COPY_TARGET_SIZE: usize = 599 * 2404 + 2400;
+pub(super) const THUMBNAIL_COPY_CODE_SIZE: usize = 75;
+pub(super) const THUMBNAIL_COPY_TARGET_SIZE: usize = 74 * 2400 + 300;
+
+pub(super) fn is_thumbnail_copy(code: &[u8]) -> bool {
+    code.len() == THUMBNAIL_COPY_CODE_SIZE
+        && format!("{:x}", Sha256::digest(code))
+            == "da17d745174ffd1ae2662996337d38f744644015d10f9f0dc234468a69bf13b6"
+}
+
+pub(super) fn copy_thumbnail_rows(source: &[u8], target: &mut [u8]) -> Result<()> {
+    ensure!(
+        source.len() == TARGET_SIZE,
+        "invalid native thumbnail copy source size"
+    );
+    ensure!(
+        target.len() == THUMBNAIL_COPY_TARGET_SIZE,
+        "invalid native thumbnail copy target size"
+    );
+    for row in 0..75 {
+        target[row * 2400..row * 2400 + 300].copy_from_slice(&source[row * 300..(row + 1) * 300]);
+    }
+    Ok(())
+}
 
 pub(super) fn is_image_copy(code: &[u8]) -> bool {
     code.len() == IMAGE_COPY_CODE_SIZE
@@ -97,6 +120,27 @@ pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn thumbnail_copy_matches_original_hanaoto_machine_code() {
+        // The original i386 helper produced this digest for all four target
+        // alignments. It left the source, other image columns and guards intact.
+        let source: Vec<_> = (0..TARGET_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        let mut target = vec![0xa5; THUMBNAIL_COPY_TARGET_SIZE];
+        copy_thumbnail_rows(&source, &mut target).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&target)),
+            "f5f0c3d474566787ca1543fe168da47a655edc3f78fdceda87dc62e90fbe71bb"
+        );
+        let original = target.clone();
+        assert!(copy_thumbnail_rows(&source[..TARGET_SIZE - 1], &mut target).is_err());
+        assert!(
+            copy_thumbnail_rows(&source, &mut target[..THUMBNAIL_COPY_TARGET_SIZE - 1]).is_err()
+        );
+        assert_eq!(target, original);
+    }
 
     #[test]
     fn image_copy_matches_original_hanaoto_machine_code() {

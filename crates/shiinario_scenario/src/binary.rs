@@ -2364,6 +2364,29 @@ impl BinaryVm {
                         &mut bytes,
                     )?;
                     memory_write = Some((destination, bytes));
+                } else if self
+                    .memory_read(address, native_helper::THUMBNAIL_COPY_CODE_SIZE)
+                    .is_ok_and(|code| native_helper::is_thumbnail_copy(&code))
+                {
+                    // HANAOTO start.SCN:0x48d21 copies packed 100x75 BGR24
+                    // into an 800-pixel-wide surface at the supplied pointer.
+                    let source = self.banks[&8][self.bank_index(8, 0)?];
+                    let target = self.banks[&8][self.bank_index(8, 1)?];
+                    ensure!(
+                        u64::from(source) + native_helper::TARGET_SIZE as u64 <= u64::from(target)
+                            || u64::from(target) + native_helper::THUMBNAIL_COPY_TARGET_SIZE as u64
+                                <= u64::from(source),
+                        "overlapping native thumbnail copy buffers are unresolved"
+                    );
+                    let destination =
+                        self.memory_range(target, native_helper::THUMBNAIL_COPY_TARGET_SIZE)?;
+                    let mut bytes =
+                        self.memory_read(target, native_helper::THUMBNAIL_COPY_TARGET_SIZE)?;
+                    native_helper::copy_thumbnail_rows(
+                        &self.memory_read(source, native_helper::TARGET_SIZE)?,
+                        &mut bytes,
+                    )?;
+                    memory_write = Some((destination, bytes));
                 } else {
                     let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
                         .iter()
@@ -4924,33 +4947,69 @@ mod tests {
     #[test]
     #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
     fn original_hanaoto_image_copy_checks_code_and_preserves_padding() -> Result<()> {
+        check_original_image_copy(false)
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_thumbnail_copy_checks_code_and_preserves_other_columns() -> Result<()> {
+        check_original_image_copy(true)
+    }
+
+    fn check_original_image_copy(thumbnail: bool) -> Result<()> {
         use sha2::{Digest, Sha256};
+        let (helper, code_size, call, sp, source_size, target_size, digest) = if thumbnail {
+            (
+                0x48d21,
+                native_helper::THUMBNAIL_COPY_CODE_SIZE,
+                0x23c09,
+                863,
+                native_helper::TARGET_SIZE,
+                native_helper::THUMBNAIL_COPY_TARGET_SIZE,
+                "f5f0c3d474566787ca1543fe168da47a655edc3f78fdceda87dc62e90fbe71bb",
+            )
+        } else {
+            (
+                0x48c83,
+                native_helper::IMAGE_COPY_CODE_SIZE,
+                0xe1a1,
+                962,
+                native_helper::SOURCE_SIZE,
+                native_helper::IMAGE_COPY_TARGET_SIZE,
+                "d6bfb24b587525c1d890152ab8fbe5dce1e62d997b150934a2dc512a96dd86a3",
+            )
+        };
         let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
             .context("set SHIINARIO_HANAOTO_START_SCN")?;
         let original = std::fs::read(path)?;
-        let source: Vec<_> = (0..native_helper::SOURCE_SIZE)
+        let source: Vec<_> = (0..source_size)
             .map(|i| (i * 37 + (i / 97) * 13) as u8)
             .collect();
         for alignment in 0..4 {
             // 0: normal, 1: changed code, 2: incomplete code, 3/4: short
             // source/target, 5: overlapping buffers, 6: exact target extent.
             for case in 0..7 {
-                let mut code = original[..0x48c83 + native_helper::IMAGE_COPY_CODE_SIZE].to_vec();
+                let mut code = original[..helper + code_size].to_vec();
                 if case == 1 {
-                    code[0x48c83 + 50] ^= 1;
+                    code[helper + 50] ^= 1;
                 } else if case == 2 {
                     code.pop();
                 }
                 let mut vm = BinaryVm::new("start.scn", code)?;
-                vm.pc = 0xe1a1;
-                vm.sp = 962;
+                vm.pc = call;
+                vm.sp = sp;
                 let target_offset = 16 + alignment;
                 let target = if case == 5 {
                     0x5000_0020
                 } else {
                     0x6000_0000 + target_offset as u32
                 };
-                vm.banks.get_mut(&8).unwrap()[962..964].copy_from_slice(&[target, 0x5000_0010]);
+                let arguments = if thumbnail {
+                    [0x5000_0010, target]
+                } else {
+                    [target, 0x5000_0010]
+                };
+                vm.banks.get_mut(&8).unwrap()[sp..sp + 2].copy_from_slice(&arguments);
                 let mut input = vec![0xa5; 16];
                 input.extend_from_slice(&source);
                 if case == 3 {
@@ -4958,7 +5017,7 @@ mod tests {
                 } else {
                     input.extend_from_slice(&[0xa5; 16]);
                 }
-                let extent = target_offset + native_helper::IMAGE_COPY_TARGET_SIZE;
+                let extent = target_offset + target_size;
                 let output_size = match case {
                     4 => extent - 1,
                     6 => extent,
@@ -4970,23 +5029,22 @@ mod tests {
                 let banks = vm.banks.clone();
                 if (1..=5).contains(&case) {
                     assert!(vm.step().is_err());
-                    assert_eq!(vm.pc, 0xe1a1);
+                    assert_eq!(vm.pc, call);
                     assert_eq!(vm.allocations, allocations);
                 } else {
                     vm.step()?;
-                    assert_eq!(vm.pc, 0xe1a8);
+                    assert_eq!(vm.pc, call + 7);
                     let output = &vm.allocations[&0x6000_0000];
                     assert!(output[..target_offset].iter().all(|&b| b == 0xa5));
                     assert!(output[extent..].iter().all(|&b| b == 0xa5));
                     let mut image = output[target_offset..extent].to_vec();
-                    image.extend_from_slice(&[0xa5; 4]);
-                    assert_eq!(
-                        format!("{:x}", Sha256::digest(&image)),
-                        "d6bfb24b587525c1d890152ab8fbe5dce1e62d997b150934a2dc512a96dd86a3"
-                    );
+                    if !thumbnail {
+                        image.extend_from_slice(&[0xa5; 4]);
+                    }
+                    assert_eq!(format!("{:x}", Sha256::digest(&image)), digest);
                     assert_eq!(vm.allocations[&0x5000_0000], allocations[&0x5000_0000]);
                 }
-                assert_eq!(vm.sp, 962);
+                assert_eq!(vm.sp, sp);
                 assert_eq!(vm.banks, banks);
             }
         }
