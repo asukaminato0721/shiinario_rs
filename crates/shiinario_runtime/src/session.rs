@@ -242,6 +242,21 @@ impl Session {
             host.mouse_mapping(*value);
         }
         emit(&event)?;
+        // InvalidateRect queues damage. Native 413160 dispatches paints only
+        // in message mode. Explicit 0034 and UpdateWindow also dispatch paints.
+        // Host execution budgets can end inside a composition, so they must
+        // retain the last painted frame until one of these script boundaries.
+        let paint = (event == Event::SchedulerPoll && vm.message_pump_enabled())
+            || matches!(
+                &event,
+                Event::Platform {
+                    request: PlatformRequest::PumpMessages | PlatformRequest::UpdateWindow,
+                    ..
+                }
+            );
+        if paint && let Some(rect) = resources.paint_display() {
+            host.respond(&PlatformRequest::InvalidateRect { rect })?;
+        }
         if matches!(event, Event::TextTick { .. })
             && let Some(rect) = resources.commit_text_display()
         {
@@ -793,10 +808,10 @@ impl Session {
                     project.config.width as i32,
                     project.config.height as i32,
                 ];
-                resources.commit_display(rect);
-                host.respond(&PlatformRequest::InvalidateRect { rect })?;
+                resources.invalidate_display(rect);
             }
-            if let PlatformRequest::BitBlt { copy, .. } = &request
+            if let PlatformRequest::BitBlt { copy, .. }
+            | PlatformRequest::CopySurfaceAndInvalidate(copy) = &request
                 && copy.destination.id == 0
             {
                 let rect = [
@@ -805,16 +820,15 @@ impl Session {
                     copy.destination
                         .x
                         .checked_add(copy.size[0])
-                        .context("BitBlt rectangle overflow")?,
+                        .context("screen copy rectangle overflow")?,
                     copy.destination
                         .y
                         .checked_add(copy.size[1])
-                        .context("BitBlt rectangle overflow")?,
+                        .context("screen copy rectangle overflow")?,
                 ];
-                resources.commit_display(rect);
-                host.respond(&PlatformRequest::InvalidateRect { rect })?;
+                resources.invalidate_display(rect);
             }
-            // Bulk drawing modifies the working DIB until SCN invalidates it.
+            // Bulk drawing modifies the working DIB until a queued paint runs.
             // Text also submits its own glyph rectangles at TextTick, matching
             // the native text renderer without exposing the rest of the DIB.
             if let PlatformRequest::LoadSound { id, .. } = &request {
@@ -843,6 +857,9 @@ impl Session {
             }
             let value = if let Some(value) = resource_reply {
                 value
+            } else if let PlatformRequest::InvalidateRect { rect } = &request {
+                resources.invalidate_display(*rect);
+                1
             } else if let PlatformRequest::FileExists { path } = &request {
                 u32::from(resources.file_exists(project, path)?)
             } else if let PlatformRequest::CreateDirectory { path } = &request {
@@ -850,9 +867,6 @@ impl Session {
             } else if let PlatformRequest::DeleteFile { path } = &request {
                 u32::from(resources.delete_file(project, path, host.simulated())?)
             } else {
-                if let PlatformRequest::InvalidateRect { rect } = &request {
-                    resources.commit_display(*rect);
-                }
                 host.respond(&request)?
             };
             // A task can remain in a timer retry without reaching another

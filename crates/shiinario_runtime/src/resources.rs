@@ -138,11 +138,16 @@ struct OpenFile {
     position: usize,
     access: u32,
 }
+/// Exact invalidated regions. Their bounding box can contain unfinished pixels.
+#[derive(Default)]
+struct DisplayDamage(Vec<[i32; 4]>);
+
 #[derive(Default)]
 pub struct Resources {
     text_renderer: crate::text_render::TextRenderer,
     surfaces: BTreeMap<u32, DrawingSurface>,
     display: Option<Surface>,
+    display_damage: DisplayDamage,
     text_damage: Vec<[i32; 4]>,
     images: BTreeMap<u32, Image>,
     image_origins: BTreeMap<(u32, u32), [i32; 2]>,
@@ -505,6 +510,49 @@ impl Resources {
             union[3] = union[3].max(rect[3]);
         }
         self.text_damage = damage;
+        invalidated
+    }
+    /// Queue a Windows RECT without publishing the working pixels.
+    /// Paint reads these pixels when the script dispatches window messages.
+    pub(crate) fn invalidate_display(&mut self, rect: [i32; 4]) {
+        let Some(surface) = self.surfaces.get(&0) else {
+            return;
+        };
+        let [left, top, right, bottom] = rect;
+        let rect = [
+            left.clamp(0, surface.width as i32),
+            top.clamp(0, surface.height as i32),
+            right.clamp(0, surface.width as i32),
+            bottom.clamp(0, surface.height as i32),
+        ];
+        let contains = |outer: &[i32; 4], inner: &[i32; 4]| {
+            outer[0] <= inner[0]
+                && outer[1] <= inner[1]
+                && outer[2] >= inner[2]
+                && outer[3] >= inner[3]
+        };
+        if rect[0] < rect[2]
+            && rect[1] < rect[3]
+            && !self.display_damage.0.iter().any(|old| contains(old, &rect))
+        {
+            self.display_damage.0.retain(|old| !contains(&rect, old));
+            self.display_damage.0.push(rect);
+        }
+    }
+    /// Publish queued regions at a native paint boundary. Keep holes unchanged.
+    /// Return their union only for the host's redraw notification.
+    pub(crate) fn paint_display(&mut self) -> Option<[i32; 4]> {
+        let mut damage = std::mem::take(&mut self.display_damage.0);
+        let mut invalidated: Option<[i32; 4]> = None;
+        for rect in damage.drain(..) {
+            self.commit_display(rect);
+            let union = invalidated.get_or_insert(rect);
+            union[0] = union[0].min(rect[0]);
+            union[1] = union[1].min(rect[1]);
+            union[2] = union[2].max(rect[2]);
+            union[3] = union[3].max(rect[3]);
+        }
+        self.display_damage.0 = damage;
         invalidated
     }
     /// Copy a submitted Windows RECT into the retained display. Pixels outside
@@ -1627,7 +1675,8 @@ impl Resources {
             } => self.set_image_origin(*id, *frame, *position)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::BlendImages(blend) => self.blend_images(blend)?,
-            PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
+            PlatformRequest::CopySurface(copy)
+            | PlatformRequest::CopySurfaceAndInvalidate(copy) => self.copy_surface(copy)?,
             PlatformRequest::BitBlt {
                 copy,
                 raster_operation,
@@ -1941,6 +1990,31 @@ mod tests {
         assert_eq!(resources.resident_bytes(), 4);
         assert_eq!(resources.frame(1, 0).unwrap().surface.rgba, [0, 0, 0, 255]);
         assert!(resources.frame(1, 1).is_err());
+    }
+    #[test]
+    fn queued_display_damage_reads_current_pixels_and_preserves_holes() {
+        let mut resources = Resources::default();
+        resources.create_surface(0, 3, 1, 0).unwrap();
+        resources.fill_surface(0, [0, 0, 3, 1], [255; 3]).unwrap();
+        resources.commit_display([0, 0, 3, 1]);
+        let previous = resources.display().unwrap().clone();
+        resources.fill_surface(0, [0, 0, 3, 1], [0; 3]).unwrap();
+        for rect in [[-10, -10, 1, 1], [0, 0, 1, 1], [2, 0, 9, 9], [1, 0, 1, 1]] {
+            resources.invalidate_display(rect);
+        }
+        assert_eq!(resources.display(), Some(&previous));
+        assert_eq!(resources.display_damage.0.len(), 2);
+        resources
+            .fill_surface(0, [0, 0, 1, 1], [12, 34, 56])
+            .unwrap();
+        assert_eq!(resources.paint_display(), Some([0, 0, 3, 1]));
+        assert_eq!(
+            resources.display().unwrap().rgba,
+            [12, 34, 56, 255, 255, 255, 255, 255, 0, 0, 0, 255]
+        );
+        resources.fill_surface(0, [0, 0, 3, 1], [99; 3]).unwrap();
+        assert_eq!(resources.paint_display(), None);
+        assert_eq!(&resources.display().unwrap().rgba[..4], &[12, 34, 56, 255]);
     }
     #[test]
     fn display_retains_text_outside_invalidated_rect_and_unfinished_drawing() {

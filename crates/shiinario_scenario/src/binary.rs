@@ -240,7 +240,10 @@ pub enum PlatformRequest {
     UpdateWindow,
     BlendSurfaces(SurfaceBlend),
     BlendImages(ImageBlend),
+    /// Copy working pixels without requesting a window paint (e.g. 0500).
     CopySurface(SurfaceCopy),
+    /// Native 04e2 also invalidates the copied screen rectangle.
+    CopySurfaceAndInvalidate(SurfaceCopy),
     BitBlt {
         copy: SurfaceCopy,
         raster_operation: u32,
@@ -1181,6 +1184,11 @@ impl BinaryVm {
     }
     pub fn mouse_mapping(&self) -> MouseButtonMapping {
         self.mouse_mapping
+    }
+    /// Native 413160 dispatches queued window paints only in message mode.
+    /// Explicit 0034 pumps messages regardless of this mode.
+    pub fn message_pump_enabled(&self) -> bool {
+        self.message_mode != 0
     }
     pub fn set_background_mode(&mut self, value: u32) {
         self.background_mode = value;
@@ -3003,7 +3011,9 @@ impl BinaryVm {
                         PlatformRequest::CopySurface(copy)
                     }
                 } else {
-                    PlatformRequest::CopySurface(copy)
+                    // v2.48 418280 -> 418424 queues a window invalidation
+                    // when the destination is the screen surface.
+                    PlatformRequest::CopySurfaceAndInvalidate(copy)
                 });
             }
             0x04f6 => {
@@ -3734,16 +3744,17 @@ impl BinaryVm {
                     self.async_text.is_none(),
                     "shared concurrent text contexts are unresolved"
                 );
-                ensure!(
-                    self.string_bytes(address)?.len() <= 65536,
-                    "text exceeds 64 KiB"
-                );
+                let source = self.string_bytes(address)?;
+                ensure!(source.len() <= 65536, "text exceeds 64 KiB");
+                let encoding =
+                    crate::TextEncoding::detect_with_preference(&source, self.text_encoding);
                 self.text_layout.begin(self.text_cursor);
                 self.async_text = Some(AsyncText::new(
                     self.current_task,
                     surface,
                     address,
                     location.clone(),
+                    encoding,
                 ));
                 self.context_flags |= 8;
                 if self.text_style.skip_mask & 8 != 0 {
@@ -3776,8 +3787,15 @@ impl BinaryVm {
                         "shared concurrent text contexts are unresolved"
                     );
                     self.text_layout.begin(self.text_cursor);
-                    let mut text =
-                        AsyncText::new(self.current_task, surface, address, location.clone());
+                    let encoding =
+                        crate::TextEncoding::detect_with_preference(&controls, self.text_encoding);
+                    let mut text = AsyncText::new(
+                        self.current_task,
+                        surface,
+                        address,
+                        location.clone(),
+                        encoding,
+                    );
                     text.immediate = true;
                     self.async_text = Some(text);
                     self.context_flags |= 8;
