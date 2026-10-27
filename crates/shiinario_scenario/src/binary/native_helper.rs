@@ -8,6 +8,13 @@ pub(super) const SOURCE_SIZE: usize = 800 * 600 * 3;
 pub(super) const TARGET_SIZE: usize = 100 * 75 * 3;
 pub(super) const SAVE_XOR_CODE_SIZE: usize = 57;
 pub(super) const SAVE_XOR_SIZE: usize = 0x367d10;
+pub(super) const INVERT_COPY_CODE_SIZE: usize = 92;
+
+pub(super) fn is_invert_copy(code: &[u8]) -> bool {
+    code.len() == INVERT_COPY_CODE_SIZE
+        && format!("{:x}", Sha256::digest(code))
+            == "28e0556b4dd601958221c44661eac54acbb7897374dbabacf80cbc14315621ec"
+}
 
 pub(super) fn is_save_xor(code: &[u8]) -> bool {
     code.len() == SAVE_XOR_CODE_SIZE

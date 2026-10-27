@@ -2260,6 +2260,32 @@ impl BinaryVm {
                     let mut bytes = self.memory_read(buffer, native_helper::SAVE_XOR_SIZE)?;
                     native_helper::save_xor(&mut bytes, key)?;
                     memory_write = Some((destination, bytes));
+                } else if self
+                    .memory_read(address, native_helper::INVERT_COPY_CODE_SIZE)
+                    .is_ok_and(|code| native_helper::is_invert_copy(&code))
+                {
+                    // HANAOTO start.SCN:0x48df4 inverts complete 8-byte or
+                    // 4-byte groups. The native loop leaves the tail unchanged.
+                    let argument =
+                        |index| -> Result<u32> { Ok(self.banks[&8][self.bank_index(8, index)?]) };
+                    let target = argument(0)?;
+                    let source = argument(1)?;
+                    let count = argument(2)? as usize;
+                    let group = if argument(3)? == 0 { 8 } else { 4 };
+                    let count = count / group * group;
+                    ensure!(count != 0, "native invert copy has no complete groups");
+                    ensure!(
+                        source == target
+                            || u64::from(source) + count as u64 <= u64::from(target)
+                            || u64::from(target) + count as u64 <= u64::from(source),
+                        "overlapping native invert copy buffers are unresolved"
+                    );
+                    let destination = self.memory_range(target, count)?;
+                    let mut bytes = self.memory_read(source, count)?;
+                    for byte in &mut bytes {
+                        *byte = !*byte;
+                    }
+                    memory_write = Some((destination, bytes));
                 } else {
                     let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
                         .iter()
@@ -4692,6 +4718,58 @@ mod tests {
             12,
             [0, 1],
         )
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_invert_copy_preserves_tail_and_validates_ranges() -> Result<()> {
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let original = std::fs::read(path)?;
+        for mode in [0, 1, 5] {
+            for in_place in [false, true] {
+                for length in [4, 12, 15] {
+                    let mut code = original[..0x48e50].to_vec();
+                    code[0..2].copy_from_slice(&0x0276u16.to_le_bytes());
+                    code[2..7].copy_from_slice(&[0x84, 0xf4, 0x8d, 4, 0]);
+                    let mut vm = BinaryVm::new("invert.scn", code)?;
+                    vm.sp = 980;
+                    let source = 0x2000_0000u32;
+                    let target = if in_place { source } else { 0x2000_0100 };
+                    vm.banks.get_mut(&8).unwrap()[980..984]
+                        .copy_from_slice(&[target, source, 12, mode]);
+                    let bytes: Vec<u8> = (0..length).collect();
+                    vm.allocations.insert(source, bytes.clone());
+                    if !in_place {
+                        vm.allocations.insert(target, vec![0xa5; 15]);
+                    }
+                    let original_memory = vm.allocations.clone();
+                    let count = if mode == 0 { 8 } else { 12 };
+                    if length < count {
+                        assert!(vm.step().is_err());
+                        assert_eq!(vm.pc, 0);
+                        assert_eq!(vm.allocations, original_memory);
+                    } else {
+                        vm.step()?;
+                        let result = &vm.allocations[&target];
+                        assert_eq!(
+                            &result[..count as usize],
+                            &(0..count).map(|b| !b).collect::<Vec<u8>>()
+                        );
+                        assert_eq!(
+                            &result[count as usize..],
+                            &original_memory[&target][count as usize..]
+                        );
+                        if !in_place {
+                            assert_eq!(vm.allocations[&source], bytes);
+                        }
+                        assert_eq!(vm.pc, 7);
+                    }
+                    assert_eq!(vm.sp, 980);
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
