@@ -147,7 +147,10 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
                 }
                 let name = &self.bytes[start..self.at];
                 ensure!(
-                    matches!(name, b"abs" | b"sqrt" | b"pow"),
+                    matches!(
+                        name,
+                        b"abs" | b"sqrt" | b"pow" | b"sin" | b"cos" | b"tan" | b"atan"
+                    ),
                     "unsupported expression function"
                 );
                 self.spaces();
@@ -169,6 +172,11 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
                         first.powf(second)
                     }
                     b"sqrt" => first.sqrt(),
+                    // Native 401d73/401dc6/401e19/401e45 use x87 radians.
+                    b"sin" => first.sin(),
+                    b"cos" => first.cos(),
+                    b"tan" => first.tan(),
+                    b"atan" => first.atan(),
                     _ => f64::from((first as i64 as i32).wrapping_abs()),
                 };
                 self.spaces();
@@ -288,6 +296,40 @@ impl<F: Fn(Variable<'_>) -> Result<u32>> Parser<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn trigonometric_functions_use_radians_and_accept_nested_float_variables() {
+        for (expression, expected) in [
+            ("sin(0)", 0.0),
+            ("cos(0)", 1.0),
+            ("tan(0)", 0.0),
+            ("atan(0)", 0.0),
+            ("sin(1)", 0.8414709848078965),
+            ("cos(1)", 0.5403023058681398),
+            ("tan(1)", 1.5574077246549023),
+            ("atan(1)", std::f64::consts::FRAC_PI_4),
+            ("sin(-1)", -0.8414709848078965),
+            ("sin(atan(1))", std::f64::consts::FRAC_1_SQRT_2),
+        ] {
+            let result = evaluate_real(expression.as_bytes(), |_| Ok(0)).unwrap();
+            assert!((result - expected).abs() < 1e-12, "{expression}: {result}");
+        }
+        let result =
+            evaluate_real(
+                b"(sin(_Z012f)*(_Z016i-_Z014i))+_Z014i",
+                |variable| match variable {
+                    Variable::Bank { bank: 8, index: 12 } => Ok(1.0f32.to_bits()),
+                    Variable::Bank { bank: 8, index: 14 } => Ok((-100i32) as u32),
+                    Variable::Bank { bank: 8, index: 16 } => Ok(100),
+                    _ => bail!("unexpected variable"),
+                },
+            )
+            .unwrap();
+        assert!((result - 68.2941969615793).abs() < 1e-12);
+        for invalid in ["sin()", "cos(1,2)", "tan(1", "atan(1,2)"] {
+            assert!(evaluate_real(invalid.as_bytes(), |_| Ok(0)).is_err());
+        }
+    }
+
     #[test]
     fn comparisons_and_logical_operators_use_native_precedence_and_eager_operands() {
         for value in [0, 100, 50] {
