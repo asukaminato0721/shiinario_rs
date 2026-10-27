@@ -15,6 +15,15 @@ pub(super) const IMAGE_COPY_CODE_SIZE: usize = 158;
 pub(super) const IMAGE_COPY_TARGET_SIZE: usize = 599 * 2404 + 2400;
 pub(super) const THUMBNAIL_COPY_CODE_SIZE: usize = 75;
 pub(super) const THUMBNAIL_COPY_TARGET_SIZE: usize = 74 * 2400 + 300;
+pub(super) const CHARACTER_SEARCH_CODE_SIZES: [usize; 2] = [65, 71];
+
+pub(super) fn character_search_width(code: &[u8]) -> Option<usize> {
+    match (code.len(), format!("{:x}", Sha256::digest(code)).as_str()) {
+        (65, "d4ba291199dd872cb3f037c725cd566f267efcc8465986f1908d430477fd4220") => Some(1),
+        (71, "faee5dee6a7cacf9dee86922a97f0c3bb4008952d24300810d3e7c3e25748149") => Some(2),
+        _ => None,
+    }
+}
 
 pub(super) fn is_thumbnail_copy(code: &[u8]) -> bool {
     code.len() == THUMBNAIL_COPY_CODE_SIZE

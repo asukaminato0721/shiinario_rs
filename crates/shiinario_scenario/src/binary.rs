@@ -1931,6 +1931,29 @@ impl BinaryVm {
         }
         bail!("unterminated string within 64 KiB cap")
     }
+    fn native_character_index(&self, source: u32, needle: u32, width: usize) -> Result<u32> {
+        ensure!(matches!(width, 1 | 2), "invalid native character width");
+        let needle = needle & if width == 1 { 0xff } else { 0xffff };
+        for index in 0..65536u32 {
+            let address = source
+                .checked_add(index * width as u32)
+                .context("native character search address overflow")?;
+            let bytes = self.memory_read(address, width)?;
+            let value = if width == 1 {
+                u32::from(bytes[0])
+            } else {
+                u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
+            };
+            // Both native routines check the terminator before the needle.
+            if value == 0 {
+                return Ok(u32::MAX);
+            }
+            if value == needle {
+                return Ok(index);
+            }
+        }
+        bail!("native character search exceeds 65536 elements")
+    }
     fn expression_variable(&self, variable: crate::expression::Variable<'_>) -> Result<u32> {
         match variable {
             crate::expression::Variable::Named(name) => self.named_value(name),
@@ -2387,6 +2410,20 @@ impl BinaryVm {
                         &mut bytes,
                     )?;
                     memory_write = Some((destination, bytes));
+                } else if let Some(width) = native_helper::CHARACTER_SEARCH_CODE_SIZES
+                    .iter()
+                    .find_map(|&size| {
+                        self.memory_read(address, size)
+                            .ok()
+                            .and_then(|code| native_helper::character_search_width(&code))
+                    })
+                {
+                    // HANAOTO start.SCN:0x48db3/0x48d6c use local bank 12,
+                    // independent of the current task stack pointer.
+                    let needle = self.banks[&12][0];
+                    let source = self.banks[&12][1];
+                    let index = self.native_character_index(source, needle, width)?;
+                    writes.push((Destination::Bank(12, 2), index));
                 } else {
                     let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
                         .iter()
@@ -4942,6 +4979,106 @@ mod tests {
             12,
             [0, 1],
         )
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_character_search_uses_local_bank_and_matches_native_results() -> Result<()>
+    {
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let original = std::fs::read(path)?;
+        for (width, helper, size, call) in [(1, 0x48db3, 65, 0x1457d), (2, 0x48d6c, 71, 0x14595)] {
+            // These results come from the two original i386 helpers.
+            for (needle, expected) in [
+                (0x61, 0),
+                (0x62, 1),
+                (0xff, 3),
+                (0, u32::MAX),
+                (0x12340062, 1),
+            ] {
+                for case in 0..4 {
+                    let mut code = original[..helper + size].to_vec();
+                    if case == 1 {
+                        code[helper + 40] ^= 1;
+                    } else if case == 2 {
+                        code.pop();
+                    }
+                    let mut vm = BinaryVm::new("start.scn", code)?;
+                    vm.pc = call;
+                    vm.sp = 863;
+                    vm.banks.get_mut(&12).unwrap()[..3].copy_from_slice(&[
+                        needle,
+                        0x5000_0011,
+                        0xdeadbeef,
+                    ]);
+                    vm.banks.get_mut(&8).unwrap()[863..866].fill(0xbad);
+                    let values: &[u16] = if case == 3 {
+                        &[0x70]
+                    } else {
+                        &[0x61, 0x62, 0x61, 0xff, 0, 0x62]
+                    };
+                    let mut input = vec![0xa5; 17];
+                    for value in values {
+                        input.extend_from_slice(&value.to_le_bytes()[..width]);
+                    }
+                    vm.allocations.insert(0x5000_0000, input);
+                    let allocations = vm.allocations.clone();
+                    let mut banks = vm.banks.clone();
+                    if case == 0 {
+                        vm.step()?;
+                        assert_eq!(vm.pc, call + 7);
+                        banks.get_mut(&12).unwrap()[2] = expected;
+                    } else {
+                        assert!(vm.step().is_err());
+                        assert_eq!(vm.pc, call);
+                    }
+                    assert_eq!(vm.banks, banks);
+                    assert_eq!(vm.sp, 863);
+                    assert_eq!(vm.allocations, allocations);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn native_character_search_checks_units_terminators_addresses_and_limit() -> Result<()> {
+        let mut vm = BinaryVm::new("search.scn", vec![0, 0])?;
+        let base = 0x5000_0000;
+        for width in [1, 2] {
+            let values: [u16; 6] = [0x61, 0x62, 0x61, 0xff, 0, 0x63];
+            let input = values
+                .iter()
+                .flat_map(|v| v.to_le_bytes()[..width].to_vec())
+                .collect();
+            vm.allocations.insert(base, input);
+            for (needle, expected) in [
+                (0x61, 0),
+                (0x62, 1),
+                (0xff, 3),
+                (0, u32::MAX),
+                (0x63, u32::MAX),
+                (0x12340062, 1),
+            ] {
+                assert_eq!(vm.native_character_index(base, needle, width)?, expected);
+            }
+        }
+        vm.allocations.insert(base, vec![0x34, 0x12, 0, 0]);
+        assert_eq!(vm.native_character_index(base, 0x1234, 2)?, 0);
+        assert_eq!(vm.native_character_index(base, 0x34, 2)?, u32::MAX);
+        vm.allocations.insert(base, vec![0x62]);
+        assert_eq!(vm.native_character_index(base, 0x62, 1)?, 0);
+        assert!(vm.native_character_index(base, 0x63, 1).is_err());
+        assert!(vm.native_character_index(base, 0x62, 2).is_err());
+        assert!(vm.native_character_index(base, 0x62, 3).is_err());
+        vm.allocations.insert(u32::MAX, vec![0x61]);
+        assert!(vm.native_character_index(u32::MAX, 0x62, 1).is_err());
+        vm.allocations.insert(base, vec![0x61; 65537]);
+        assert!(vm.native_character_index(base, 0x62, 1).is_err());
+        vm.allocations.get_mut(&base).unwrap()[65535] = 0;
+        assert_eq!(vm.native_character_index(base, 0x62, 1)?, u32::MAX);
+        Ok(())
     }
 
     #[test]
