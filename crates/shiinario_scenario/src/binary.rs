@@ -1288,6 +1288,11 @@ impl BinaryVm {
     pub fn set_text_encoding(&mut self, encoding: crate::text::TextEncoding) {
         self.text_encoding = encoding;
     }
+
+    pub fn detect_text_encoding(&mut self, source: &[u8]) {
+        self.text_encoding =
+            crate::text::TextEncoding::detect_with_preference(source, self.text_encoding);
+    }
     /// Read a whole VM allocation for a pending resource operation.
     pub fn allocation_bytes(&self, address: u32) -> Result<Vec<u8>> {
         if let Some(data) = self.allocations.get(&address) {

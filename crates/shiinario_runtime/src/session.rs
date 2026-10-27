@@ -620,7 +620,7 @@ impl Session {
                     )
                 })?;
                 if name.to_ascii_lowercase().ends_with(".txt") {
-                    vm.set_text_encoding(shiinario_scenario::TextEncoding::detect(&bytes));
+                    vm.detect_text_encoding(&bytes);
                 }
                 vm.respond_asset_into(&bytes).with_context(|| {
                     format!(
@@ -644,7 +644,7 @@ impl Session {
                     )
                 })?;
                 if name.to_ascii_lowercase().ends_with(".txt") {
-                    vm.set_text_encoding(shiinario_scenario::TextEncoding::detect(&bytes));
+                    vm.detect_text_encoding(&bytes);
                 }
                 let address = vm.respond_asset(bytes)?;
                 emit(&Event::PlatformReply {
