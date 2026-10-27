@@ -189,6 +189,7 @@ fn main() -> Result<()> {
                 .transpose()?
                 .unwrap_or_default();
             let mut instructions = std::collections::BTreeMap::<u16, usize>::new();
+            let mut executed_instructions = 0u64;
             let mut glyphs = 0usize;
             let mut events = 0usize;
             let mut recent = std::collections::VecDeque::with_capacity(tail_events);
@@ -249,8 +250,15 @@ fn main() -> Result<()> {
                         recent.push_back(event.clone());
                     }
                     match event {
-                        Event::BinaryInstruction { opcode, .. } => {
-                            *instructions.entry(*opcode).or_default() += 1
+                        Event::BinaryInstruction { opcode, location } => {
+                            *instructions.entry(*opcode).or_default() += 1;
+                            executed_instructions += 1;
+                            if summary && executed_instructions.is_multiple_of(5_000_000) {
+                                eprintln!(
+                                    "PROGRESS instructions={executed_instructions} glyphs={glyphs} elapsed_ms={elapsed_clock_replies} at={}:{:#x}",
+                                    location.scenario, location.offset
+                                );
+                            }
                         }
                         Event::Platform {
                             request:

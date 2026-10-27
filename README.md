@@ -139,6 +139,8 @@ the first two menus to accept selection; holding it continuously leaves them
 waiting. Input timestamps use elapsed u64 milliseconds and continue across the
 engine's u32 clock wrap. `--summary --tail-events 2000` keeps recent events for
 diagnosing a stalled replay.
+Summary mode writes progress to stderr after each five million binary instructions.
+Each update includes the glyph count, simulated elapsed time, and script position.
 
 Configured audio loops use decoded PCM frame boundaries. Native decoder block
 effects at configured loop endpoints do not have sample-by-sample verification.
