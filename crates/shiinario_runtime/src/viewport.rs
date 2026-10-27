@@ -66,6 +66,10 @@ impl ViewportTransform {
         }
         Ok(result)
     }
+    pub fn to_window_point(self, point: [i32; 2]) -> Result<[i32; 2]> {
+        let rect = self.to_window_rect([point[0], point[1], point[0], point[1]])?;
+        Ok([rect[0], rect[1]])
+    }
 }
 fn integer(value: f64) -> Result<i32> {
     let value = value.trunc();
@@ -88,6 +92,7 @@ mod tests {
             ([400, 300], [0, 0, 400, 300], [200, 150]),
         ] {
             let transform = ViewportTransform::fit([800, 600], physical).unwrap();
+            assert_eq!(transform.to_window_point([400, 300]).unwrap(), center);
             assert_eq!(transform.to_window_rect([0, 0, 800, 600]).unwrap(), rect);
             assert_eq!(transform.to_logical(center).unwrap(), [400, 300]);
             assert_eq!(

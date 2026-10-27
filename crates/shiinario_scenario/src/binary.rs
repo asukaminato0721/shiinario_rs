@@ -274,6 +274,9 @@ pub enum PlatformRequest {
         end_ms: u32,
         repeats: u32,
     },
+    SetCursorPosition {
+        position: [i32; 2],
+    },
     FadeAudioStream {
         handle: u32,
         interval: u32,
@@ -2448,6 +2451,14 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadMouseButtons);
             }
+            0x0457 => {
+                request = Some(PlatformRequest::SetCursorPosition {
+                    position: [
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                    ],
+                });
+            }
             0x0456 | 0x0458 | 0x0492 => {
                 let begin = cursor.pc;
                 request = Some(if opcode == 0x0492 {
@@ -4547,6 +4558,31 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cursor_warp_reads_signed_coordinates_without_destination_operands() {
+        let mut code = instruction(
+            0x0457,
+            &[immediate((-12i32) as u32), immediate(160)].concat(),
+        );
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("cursor.scn", code).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::SetCursorPosition {
+                    position: [-12, 160]
+                },
+                ..
+            }
+        ));
+        vm.respond(1).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::BinaryInstruction { opcode: 0, .. }
+        ));
+        assert_eq!(vm.step().unwrap(), Event::End);
+    }
+
     #[test]
     fn audio_frequency_query_waits_for_the_host_and_writes_its_result() {
         let mut code = instruction(0x06e6, &[immediate(0x7000_0001), vec![12, 0, 0]].concat());

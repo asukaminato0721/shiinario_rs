@@ -8,7 +8,8 @@ use shiinario_scenario::MouseButtonMapping;
 #[serde(deny_unknown_fields)]
 pub struct InputFrame {
     pub at_ms: u64,
-    pub cursor: [i32; 2],
+    #[serde(default)]
+    pub cursor: Option<[i32; 2]>,
     #[serde(default)]
     pub mouse_buttons: u8,
     /// Additional engine control bits, e.g. 0x100 for the reading skip key.
@@ -58,7 +59,9 @@ impl Replay {
             .get(self.next)
             .filter(|f| f.at_ms <= self.elapsed_ms)
         {
-            self.cursor = frame.cursor;
+            if let Some(cursor) = frame.cursor {
+                self.cursor = cursor;
+            }
             for (button, message) in [(1, 0x201), (2, 0x204), (4, 0x207)] {
                 if (self.mouse ^ frame.mouse_buttons) & button != 0 {
                     self.window_messages.push([
@@ -119,11 +122,32 @@ impl Replay {
 mod tests {
     use super::*;
     #[test]
+    fn keyboard_frames_without_cursor_preserve_script_pointer_warps() {
+        let frames = serde_json::from_str(
+            r#"[
+            {"at_ms":0,"cursor":[10,20]},
+            {"at_ms":10,"keys":[40]},
+            {"at_ms":20,"cursor":[30,40]}
+        ]"#,
+        )
+        .unwrap();
+        let mut replay = Replay::new(frames).unwrap();
+        replay.advance(0);
+        assert_eq!(replay.cursor, [10, 20]);
+        replay.cursor = [200, 150];
+        replay.advance(10);
+        assert_eq!(replay.cursor, [200, 150]);
+        assert!(replay.keys.is_down(40));
+        replay.advance(20);
+        assert_eq!(replay.cursor, [30, 40]);
+    }
+
+    #[test]
     fn scan_code_snapshots_do_not_consume_or_synthesize_virtual_keys() {
         let mut replay = Replay::new(vec![
             InputFrame {
                 at_ms: 0,
-                cursor: [0; 2],
+                cursor: Some([0; 2]),
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
@@ -131,7 +155,7 @@ mod tests {
             },
             InputFrame {
                 at_ms: 10,
-                cursor: [0; 2],
+                cursor: Some([0; 2]),
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![17],
@@ -153,7 +177,7 @@ mod tests {
         let mut replay = Replay::new(vec![
             InputFrame {
                 at_ms: 10,
-                cursor: [0, 0],
+                cursor: Some([0, 0]),
                 mouse_buttons: 1,
                 control_mask: 256,
                 keys: vec![17],
@@ -161,7 +185,7 @@ mod tests {
             },
             InputFrame {
                 at_ms: 20,
-                cursor: [0, 0],
+                cursor: Some([0, 0]),
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
@@ -189,7 +213,7 @@ mod tests {
         let mut replay = Replay::new(vec![
             InputFrame {
                 at_ms: u64::from(u32::MAX) - 1,
-                cursor: [1, 2],
+                cursor: Some([1, 2]),
                 mouse_buttons: 1,
                 control_mask: 0,
                 keys: vec![],
@@ -197,7 +221,7 @@ mod tests {
             },
             InputFrame {
                 at_ms: u64::from(u32::MAX) + 2,
-                cursor: [3, 4],
+                cursor: Some([3, 4]),
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
@@ -219,7 +243,7 @@ mod tests {
         let mut replay = Replay::new(vec![
             InputFrame {
                 at_ms: 10,
-                cursor: [690, 65],
+                cursor: Some([690, 65]),
                 mouse_buttons: 1,
                 control_mask: 0x100,
                 keys: vec![],
@@ -227,7 +251,7 @@ mod tests {
             },
             InputFrame {
                 at_ms: 20,
-                cursor: [400, 500],
+                cursor: Some([400, 500]),
                 mouse_buttons: 0,
                 control_mask: 0,
                 keys: vec![],
