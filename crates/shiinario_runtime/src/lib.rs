@@ -296,6 +296,10 @@ impl Host for TracePlatform {
             | PlatformRequest::SetFullscreen { .. }
             | PlatformRequest::SetMinimizeButton { .. } => Ok(1),
             PlatformRequest::InitializeAudio { .. } | PlatformRequest::InitializeGraphics => Ok(1),
+            PlatformRequest::ReleaseAudio => {
+                self.mixer.release_sounds();
+                Ok(1)
+            }
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
             PlatformRequest::ClockMilliseconds => Ok(self.clock_ms),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {

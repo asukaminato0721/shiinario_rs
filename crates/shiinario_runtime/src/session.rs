@@ -498,6 +498,16 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if matches!(request, PlatformRequest::ReleaseAudio) {
+                host.respond(&request)?;
+                resources.release_sounds();
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
             if let PlatformRequest::Sound { id, command } = &request {
                 let value = host.sound_command(*id, command).with_context(|| {
                     format!(

@@ -306,6 +306,13 @@ impl Host for NativeHost {
                 }
                 Ok(1)
             }
+            PlatformRequest::ReleaseAudio => {
+                if let Some(audio) = &self.audio {
+                    // The portable device also serves independent OGV streams.
+                    audio.release_sounds()?;
+                }
+                Ok(1)
+            }
             PlatformRequest::InitializeGraphics | PlatformRequest::ReleaseGraphics => Ok(1),
             // Select the verified scalar renderer; SIMD CPU flags describe the original x86 host.
             PlatformRequest::CpuFeatures => Ok(0),

@@ -373,6 +373,8 @@ pub enum PlatformRequest {
     InitializeAudio {
         flags: u32,
     },
+    /// Release static sound buffers. OGV streams use a separate subsystem.
+    ReleaseAudio,
     InitializeGraphics,
     ReleaseGraphics,
     SetFullscreen {
@@ -3487,6 +3489,7 @@ impl BinaryVm {
                     enabled: self.read(&mut cursor)? != 0,
                 })
             }
+            0x06a5 => request = Some(PlatformRequest::ReleaseAudio),
             0x06c3 => request = Some(PlatformRequest::ReleaseGraphics),
             0x0546 => {
                 let operand = self.read(&mut cursor)?;
@@ -5235,6 +5238,57 @@ mod tests {
         assert_eq!(vm.tasks[&255].pc, 0x122d);
         assert_eq!(vm.tasks[&255].sp, CELLS);
         assert_eq!(vm.tasks[&255].flags, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn audio_release_has_no_operands_and_preserves_the_next_instruction() -> Result<()> {
+        let mut vm = BinaryVm::new("release.scn", vec![0xa5, 6, 0xc3, 6])?;
+        assert!(matches!(
+            vm.step()?,
+            Event::Platform {
+                request: PlatformRequest::ReleaseAudio,
+                ..
+            }
+        ));
+        vm.respond(1)?;
+        assert_eq!(vm.pc, 2);
+        assert!(matches!(
+            vm.step()?,
+            Event::Platform {
+                request: PlatformRequest::ReleaseGraphics,
+                ..
+            }
+        ));
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_task_255_releases_audio_before_graphics() -> Result<()> {
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let mut vm = BinaryVm::new("start.scn", std::fs::read(path)?)?;
+        vm.pc = 0x1287;
+        vm.current_task = 255;
+        vm.thread_limit = 256;
+        assert!(matches!(
+            vm.step()?,
+            Event::Platform {
+                request: PlatformRequest::ReleaseAudio,
+                ..
+            }
+        ));
+        vm.respond(1)?;
+        assert_eq!(vm.pc, 0x1289);
+        assert_eq!(vm.sp, CELLS);
+        assert!(matches!(
+            vm.step()?,
+            Event::Platform {
+                request: PlatformRequest::ReleaseGraphics,
+                ..
+            }
+        ));
         Ok(())
     }
 
