@@ -230,7 +230,7 @@ impl Resources {
             .transient_files
             .get(&shiinario_assets::project::normalize(name)?)
         {
-            return Ok([0, bytes.len() as u32]);
+            return Ok([bytes.len() as u32, 0]);
         }
         if self
             .deleted_files
