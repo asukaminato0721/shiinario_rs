@@ -262,6 +262,9 @@ pub enum PlatformRequest {
     GetAudioStreamStatus {
         handle: u32,
     },
+    GetAudioStreamFrequency {
+        handle: u32,
+    },
     FadeAudioStream {
         handle: u32,
         interval: u32,
@@ -2753,13 +2756,13 @@ impl BinaryVm {
                 }
                 request = Some(PlatformRequest::FillSurface { id, rect, color });
             }
-            0x06e3 | 0x06e8 => {
+            0x06e3 | 0x06e6 | 0x06e8 => {
                 let handle = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
-                request = Some(if opcode == 0x06e8 {
-                    PlatformRequest::GetAudioStreamStatus { handle }
-                } else {
-                    PlatformRequest::GetAudioStreamVolume { handle }
+                request = Some(match opcode {
+                    0x06e6 => PlatformRequest::GetAudioStreamFrequency { handle },
+                    0x06e8 => PlatformRequest::GetAudioStreamStatus { handle },
+                    _ => PlatformRequest::GetAudioStreamVolume { handle },
                 });
             }
             0x06ec => {
@@ -4522,6 +4525,30 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn audio_frequency_query_waits_for_the_host_and_writes_its_result() {
+        let mut code = instruction(0x06e6, &[immediate(0x7000_0001), vec![12, 0, 0]].concat());
+        code.extend(instruction(0, &immediate(0)));
+        let mut vm = BinaryVm::new("frequency.scn", code).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::GetAudioStreamFrequency {
+                    handle: 0x7000_0001
+                },
+                ..
+            }
+        ));
+        assert_eq!(vm.banks[&12][0], 0);
+        vm.respond(44100).unwrap();
+        assert_eq!(vm.banks[&12][0], 44100);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::BinaryInstruction { opcode: 0, .. }
+        ));
+        assert_eq!(vm.step().unwrap(), Event::End);
+    }
+
     #[test]
     fn rotations_wrap_bits_and_accept_counts_above_word_width() {
         for (count, right, left) in [
