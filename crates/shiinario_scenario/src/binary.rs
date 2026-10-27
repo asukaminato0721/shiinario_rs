@@ -1934,6 +1934,18 @@ impl BinaryVm {
         ensure!(!bad, "invalid CP932 string at {value:#x}");
         Ok(text.into_owned())
     }
+    /// Precondition: `value` points to a terminated title within VM memory.
+    /// Postcondition: return Unicode text or an error. VM state remains unchanged.
+    fn window_title(&self, value: u32) -> Result<String> {
+        let bytes = self.string_bytes(value)?;
+        let encoding =
+            crate::text::TextEncoding::detect_with_preference(&bytes, self.text_encoding);
+        encoding
+            .codec()
+            .decode_without_bom_handling_and_without_replacement(&bytes)
+            .map(|text| text.into_owned())
+            .with_context(|| format!("invalid window title at {value:#x}"))
+    }
     fn string_bytes(&self, address: u32) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         for index in 0..65536u32 {
@@ -4620,13 +4632,13 @@ impl BinaryVm {
             }
             0x07b2 => {
                 let class = self.string(self.read(&mut cursor)?)?;
-                let title = self.string(self.read(&mut cursor)?)?;
+                let title = self.window_title(self.read(&mut cursor)?)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::FindWindow { class, title });
             }
             0x07a8 => {
                 let window = self.read(&mut cursor)?;
-                let title = self.string(self.read(&mut cursor)?)?;
+                let title = self.window_title(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::SetWindowTitle { window, title });
             }
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),

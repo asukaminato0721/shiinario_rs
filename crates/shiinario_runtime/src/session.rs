@@ -56,9 +56,34 @@ pub struct Session {
     control_repeat: crate::input::ControlRepeat,
     scan_repeats: std::collections::BTreeMap<u32, crate::input::ControlRepeat>,
 }
+
+/// Precondition: `project` contains the resolved game archives.
+/// Postcondition: return an unambiguous story encoding, or the CP932 default.
+/// Inspect at most 16 eligible entries. Optional probe failures do not block startup.
+fn initial_text_encoding(project: &Project) -> shiinario_scenario::TextEncoding {
+    project
+        .archives
+        .iter()
+        .flat_map(|archive| &archive.entries)
+        .filter(|entry| {
+            entry.name.to_ascii_lowercase().ends_with(".txt")
+                && entry.unpacked_size.max(entry.size) <= 1024 * 1024
+        })
+        .take(16)
+        .find_map(|entry| {
+            project
+                .read(&entry.name)
+                .ok()
+                .and_then(|bytes| shiinario_scenario::TextEncoding::detect_unambiguous(&bytes))
+        })
+        .unwrap_or_default()
+}
+
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
         let mut vm = BinaryVm::with_version(name, project.read(name)?, project.config.version)?;
+        // Titles can precede the first story load.
+        vm.set_text_encoding(initial_text_encoding(project));
         vm.set_viewport(project.config.width, project.config.height)?;
         if let Some(value) = project.config.values.get("background") {
             let value: i32 = value.parse().context("invalid Background configuration")?;

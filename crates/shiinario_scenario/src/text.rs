@@ -9,6 +9,21 @@ pub enum TextEncoding {
     Big5,
 }
 impl TextEncoding {
+    /// Precondition: none. The source can contain arbitrary bytes.
+    /// Postcondition: return Some only when exactly one supported codec accepts the source.
+    pub fn detect_unambiguous(bytes: &[u8]) -> Option<Self> {
+        let accepts = |encoding: Self| {
+            encoding
+                .codec()
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .is_some()
+        };
+        match (accepts(Self::Cp932), accepts(Self::Big5)) {
+            (true, false) => Some(Self::Cp932),
+            (false, true) => Some(Self::Big5),
+            _ => None,
+        }
+    }
     /// Prefer CP932 when there is no established source encoding.
     pub fn detect(bytes: &[u8]) -> Self {
         Self::detect_with_preference(bytes, Self::Cp932)
@@ -16,23 +31,7 @@ impl TextEncoding {
     /// Keep the established encoding for ambiguous or ASCII-only sources.
     /// Change it only when the other encoding alone can decode the source.
     pub fn detect_with_preference(bytes: &[u8], preference: Self) -> Self {
-        let other = match preference {
-            Self::Cp932 => Self::Big5,
-            Self::Big5 => Self::Cp932,
-        };
-        if preference
-            .codec()
-            .decode_without_bom_handling_and_without_replacement(bytes)
-            .is_none()
-            && other
-                .codec()
-                .decode_without_bom_handling_and_without_replacement(bytes)
-                .is_some()
-        {
-            other
-        } else {
-            preference
-        }
+        Self::detect_unambiguous(bytes).unwrap_or(preference)
     }
     pub(crate) fn character_length(self, first: u8) -> usize {
         let double = match self {
@@ -388,10 +387,16 @@ mod tests {
         let (big5, _, bad) = encoding_rs::BIG5.encode("善意的虛偽，勝於引起爭端的事實。");
         assert!(!bad);
         assert_eq!(TextEncoding::detect(&big5), TextEncoding::Big5);
+        assert_eq!(
+            TextEncoding::detect_unambiguous(&big5),
+            Some(TextEncoding::Big5)
+        );
         let (japanese, _, bad) = encoding_rs::SHIFT_JIS.encode("日本語の文章です。");
         assert!(!bad);
         assert_eq!(TextEncoding::detect(&japanese), TextEncoding::Cp932);
         assert_eq!(TextEncoding::detect(b"ASCII"), TextEncoding::Cp932);
+        assert_eq!(TextEncoding::detect_unambiguous(b"ASCII"), None);
+        assert_eq!(TextEncoding::detect_unambiguous(&[0x81]), None);
         assert_eq!(TextEncoding::detect(&[0x81]), TextEncoding::Cp932);
         assert_eq!(TextEncoding::Big5.character_length(0xb4), 2);
         assert_eq!(TextEncoding::Cp932.character_length(0xb4), 1);
