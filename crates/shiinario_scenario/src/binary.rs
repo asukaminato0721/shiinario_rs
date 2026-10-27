@@ -36,6 +36,22 @@ pub struct SurfaceBlend {
     pub size: [i32; 2],
     pub weights: [u32; 2],
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImagePoint {
+    pub id: u32,
+    pub frame: u32,
+    pub x: i32,
+    pub y: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageBlend {
+    pub destination: ImagePoint,
+    pub sources: [ImagePoint; 2],
+    pub size: [i32; 2],
+    pub weights: [u32; 2],
+}
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SurfaceCopy {
     pub destination: SurfacePoint,
@@ -223,6 +239,7 @@ pub enum PlatformRequest {
     },
     UpdateWindow,
     BlendSurfaces(SurfaceBlend),
+    BlendImages(ImageBlend),
     CopySurface(SurfaceCopy),
     BitBlt {
         copy: SurfaceCopy,
@@ -2693,6 +2710,31 @@ impl BinaryVm {
                     background: arguments[18],
                 }));
             }
+            0x0563 => {
+                // v2.48 41fa10 reads three image/frame/position groups,
+                // width/height, then two independent 8-bit fixed-point weights.
+                let mut point = || -> Result<ImagePoint> {
+                    let id = self.read(&mut cursor)?;
+                    ensure!(id < 256, "image blend slot out of bounds");
+                    Ok(ImagePoint {
+                        id,
+                        frame: self.read(&mut cursor)?,
+                        x: self.read(&mut cursor)? as i32,
+                        y: self.read(&mut cursor)? as i32,
+                    })
+                };
+                let destination = point()?;
+                let sources = [point()?, point()?];
+                request = Some(PlatformRequest::BlendImages(ImageBlend {
+                    destination,
+                    sources,
+                    size: [
+                        self.read(&mut cursor)? as i32,
+                        self.read(&mut cursor)? as i32,
+                    ],
+                    weights: [self.read(&mut cursor)?, self.read(&mut cursor)?],
+                }));
+            }
             0x0562 => {
                 let destination = [self.read(&mut cursor)?, self.read(&mut cursor)?];
                 let position = [
@@ -4966,6 +5008,143 @@ mod tests {
         let mut bytes = vec![4];
         bytes.extend(value.to_le_bytes());
         bytes
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_image_blend_resolves_all_operands() -> Result<()> {
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let mut vm = BinaryVm::new("start.scn", std::fs::read(path)?)?;
+        vm.pc = 0x13154;
+        vm.sp = 956;
+        for (name, value) in [(b"xfl", 3), (b"xff", 128)] {
+            let mut key = [0; 32];
+            key[..name.len()].copy_from_slice(name);
+            vm.write(Destination::NewGlobal(key), value)?;
+        }
+        let Event::Platform {
+            request: PlatformRequest::BlendImages(blend),
+            ..
+        } = vm.step()?
+        else {
+            panic!("expected image blend")
+        };
+        assert_eq!(
+            blend.destination,
+            ImagePoint {
+                id: 19,
+                frame: 3,
+                x: 0,
+                y: 0
+            }
+        );
+        assert_eq!(
+            blend.sources,
+            [
+                ImagePoint {
+                    id: 19,
+                    frame: 11,
+                    x: 0,
+                    y: 0
+                },
+                ImagePoint {
+                    id: 19,
+                    frame: 10,
+                    x: 0,
+                    y: 0
+                }
+            ]
+        );
+        assert_eq!(blend.size, [800, 620]);
+        assert_eq!(blend.weights, [128, 128]);
+        assert_eq!(vm.pc, 0x131ac);
+        assert_eq!(vm.sp, 956);
+        Ok(())
+    }
+
+    #[test]
+    fn image_blend_reads_sixteen_operands_and_rejects_invalid_slots() -> Result<()> {
+        let arguments = [
+            19,
+            3,
+            u32::MAX,
+            2,
+            20,
+            11,
+            3,
+            4,
+            21,
+            10,
+            5,
+            6,
+            800,
+            620,
+            128,
+            256,
+        ];
+        let code = instruction(
+            0x0563,
+            &arguments
+                .into_iter()
+                .flat_map(immediate)
+                .collect::<Vec<_>>(),
+        );
+        let mut vm = BinaryVm::new("blend.scn", code.clone())?;
+        let Event::Platform {
+            request: PlatformRequest::BlendImages(blend),
+            ..
+        } = vm.step()?
+        else {
+            panic!("expected image blend")
+        };
+        assert_eq!(
+            blend.destination,
+            ImagePoint {
+                id: 19,
+                frame: 3,
+                x: -1,
+                y: 2
+            }
+        );
+        assert_eq!(
+            blend.sources,
+            [
+                ImagePoint {
+                    id: 20,
+                    frame: 11,
+                    x: 3,
+                    y: 4
+                },
+                ImagePoint {
+                    id: 21,
+                    frame: 10,
+                    x: 5,
+                    y: 6
+                }
+            ]
+        );
+        assert_eq!(blend.size, [800, 620]);
+        assert_eq!(blend.weights, [128, 256]);
+        assert_eq!(vm.pc, code.len());
+        for index in [0, 4, 8] {
+            let mut arguments = arguments;
+            arguments[index] = 256;
+            let code = instruction(
+                0x0563,
+                &arguments
+                    .into_iter()
+                    .flat_map(immediate)
+                    .collect::<Vec<_>>(),
+            );
+            let mut vm = BinaryVm::new("blend.scn", code)?;
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+        }
+        let mut vm = BinaryVm::new("blend.scn", code[..code.len() - 1].to_vec())?;
+        assert!(vm.step().is_err());
+        assert_eq!(vm.pc, 0);
+        Ok(())
     }
 
     #[test]
