@@ -268,6 +268,12 @@ pub enum PlatformRequest {
     GetAudioStreamDuration {
         handle: u32,
     },
+    SetAudioStreamLoop {
+        handle: u32,
+        start_ms: u32,
+        end_ms: u32,
+        repeats: u32,
+    },
     FadeAudioStream {
         handle: u32,
         interval: u32,
@@ -2779,6 +2785,18 @@ impl BinaryVm {
                     interval,
                     step,
                     target,
+                });
+            }
+            0x06ef => {
+                let handle = self.read(&mut cursor)?;
+                let start_ms = self.read(&mut cursor)?;
+                let end_ms = self.read(&mut cursor)?;
+                let repeats = self.read(&mut cursor)?;
+                request = Some(PlatformRequest::SetAudioStreamLoop {
+                    handle,
+                    start_ms,
+                    end_ms,
+                    repeats,
                 });
             }
             0x06df => {
