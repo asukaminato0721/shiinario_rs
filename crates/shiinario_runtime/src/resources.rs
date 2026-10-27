@@ -2,8 +2,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use shiinario_assets::{audio, image, project::Project};
 use shiinario_scenario::{
-    ImageAffine, ImageDraw, MaskTransition, PlatformRequest, SharedMemory, SurfaceBlend,
-    SurfaceCapture, SurfaceCopy, SurfaceStretch,
+    ImageAffine, ImageBlend, ImageDraw, MaskTransition, PlatformRequest, SharedMemory,
+    SurfaceBlend, SurfaceCapture, SurfaceCopy, SurfaceStretch,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1616,6 +1616,7 @@ impl Resources {
                 position,
             } => self.set_image_origin(*id, *frame, *position)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
+            PlatformRequest::BlendImages(blend) => self.blend_images(blend)?,
             PlatformRequest::CopySurface(copy) => self.copy_surface(copy)?,
             PlatformRequest::BitBlt {
                 copy,

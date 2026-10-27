@@ -1,4 +1,4 @@
-//! Portable implementations of the 0564 and 0574 graphics kernels.
+//! Portable implementations of the 0562, 0563, 0564 and 0574 graphics kernels.
 use super::*;
 
 /// Match the original 444600/44446d straight-alpha composition kernels.
@@ -26,6 +26,80 @@ pub(super) fn compose_rgba(source: [u8; 4], target: [u8; 4]) -> [u8; 4] {
 }
 
 impl Resources {
+    pub(super) fn blend_images(&mut self, blend: &ImageBlend) -> Result<()> {
+        let frame = |point: &shiinario_scenario::ImagePoint| -> Result<&Surface> {
+            let Some(Image::Mutable {
+                frames,
+                bytes_per_pixel: 4,
+            }) = self.images.get(&point.id)
+            else {
+                bail!("image blend requires mutable four-byte images");
+            };
+            frames
+                .get(point.frame as usize)
+                .context("image blend frame missing")
+        };
+        let dst = frame(&blend.destination)?;
+        let [width, height] = blend.size.map(i64::from);
+        ensure!(
+            [width, height].iter().all(|v| (0..=16384).contains(v)),
+            "invalid image blend dimensions"
+        );
+        let [a, b] = blend.weights;
+        ensure!(a <= 256 && b <= 256, "unsupported image blend weights");
+        let dx = i64::from(blend.destination.x);
+        let dy = i64::from(blend.destination.y);
+        let left = dx.max(0);
+        let top = dy.max(0);
+        let right = (dx + width).min(i64::from(dst.width));
+        let bottom = (dy + height).min(i64::from(dst.height));
+        if right <= left || bottom <= top {
+            return Ok(());
+        }
+        let mut sources = Vec::with_capacity(2);
+        for point in &blend.sources {
+            let src = frame(point)?;
+            let sx = i64::from(point.x) + left - dx;
+            let sy = i64::from(point.y) + top - dy;
+            ensure!(
+                sx >= 0
+                    && sy >= 0
+                    && sx + right - left <= i64::from(src.width)
+                    && sy + bottom - top <= i64::from(src.height),
+                "image blend source rectangle outside frame"
+            );
+            let same_frame =
+                point.id == blend.destination.id && point.frame == blend.destination.frame;
+            let overlaps =
+                sx < right && left < sx + right - left && sy < bottom && top < sy + bottom - top;
+            ensure!(
+                !same_frame || !overlaps || (sx == left && sy == top),
+                "overlapping image blend rectangles are unresolved"
+            );
+            sources.push((src, sx as usize, sy as usize));
+        }
+        let mut output = dst.rgba.clone();
+        for y in 0..(bottom - top) as usize {
+            for x in 0..(right - left) as usize {
+                let offset = ((top as usize + y) * dst.width as usize + left as usize + x) * 4;
+                for channel in 0..4 {
+                    let read = |(src, sx, sy): &(&Surface, usize, usize)| {
+                        u32::from(src.rgba[((sy + y) * src.width as usize + sx + x) * 4 + channel])
+                    };
+                    output[offset + channel] = (((read(&sources[0]) * a) >> 8)
+                        + ((read(&sources[1]) * b) >> 8))
+                        .min(255) as u8;
+                }
+            }
+        }
+        let Image::Mutable { frames, .. } = self.images.get_mut(&blend.destination.id).unwrap()
+        else {
+            unreachable!()
+        };
+        frames[blend.destination.frame as usize].rgba = output;
+        Ok(())
+    }
+
     pub(super) fn pixelate_surface(&mut self, copy: &SurfaceCopy, block: i32) -> Result<()> {
         if block <= 0 {
             return self.copy_surface(copy);
@@ -205,6 +279,110 @@ impl Resources {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn image_blend_matches_original_scalar_and_mmx_with_clipped_destination() {
+        use sha2::{Digest, Sha256};
+        use shiinario_scenario::{ImageBlend, ImagePoint};
+        let mut resources = Resources::default();
+        for (id, width, height) in [(1, 4, 3), (2, 5, 4), (3, 6, 5)] {
+            resources.create_image(id, width, height, 4, 1).unwrap();
+        }
+        for (id, k) in [(2, 7), (3, 29)] {
+            let Image::Mutable { frames, .. } = resources.images.get_mut(&id).unwrap() else {
+                unreachable!()
+            };
+            for (i, pixel) in frames[0].rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                *pixel = [
+                    (i * 37 + k) as u8,
+                    (i * 17 + k + 4) as u8,
+                    (i * 13 + k + 12) as u8,
+                    (i * 43 + k + 16) as u8,
+                ];
+            }
+        }
+        // Origins do not change the raw coordinates used by native 411a00.
+        resources.set_image_origin(2, 0, [100, -100]).unwrap();
+        let mut output = Vec::new();
+        let mut blend = ImageBlend {
+            destination: ImagePoint {
+                id: 1,
+                frame: 0,
+                x: -1,
+                y: 1,
+            },
+            sources: [
+                ImagePoint {
+                    id: 2,
+                    frame: 0,
+                    x: 0,
+                    y: 0,
+                },
+                ImagePoint {
+                    id: 3,
+                    frame: 0,
+                    x: 1,
+                    y: 1,
+                },
+            ],
+            size: [4, 3],
+            weights: [0, 0],
+        };
+        for weights in [
+            [0, 0],
+            [0, 256],
+            [256, 0],
+            [128, 128],
+            [1, 255],
+            [255, 1],
+            [256, 256],
+            [17, 73],
+        ] {
+            resources
+                .fill_image(1, 0, [0, 0, 4, 3], 0xa5a5a5a5)
+                .unwrap();
+            blend.weights = weights;
+            resources.blend_images(&blend).unwrap();
+            output.extend(resources.frame(1, 0).unwrap().surface.rgba);
+        }
+        // Both original branches produced this digest. Their row guards also
+        // remained unchanged. Each image used its own width and row stride.
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&output)),
+            "74a3ec22bc9d85648181cd6f9293e34041a8bfd69734ee9d6205a1df21d7e350"
+        );
+        let original = resources.frame(1, 0).unwrap().surface;
+        for case in 0..5 {
+            let mut bad = blend.clone();
+            match case {
+                0 => bad.sources[1].frame = 1,
+                1 => bad.sources[1].x = -5,
+                2 => bad.weights = [257, 0],
+                3 => bad.size = [-1, 2],
+                _ => {
+                    bad.sources[0] = ImagePoint {
+                        id: 1,
+                        frame: 0,
+                        x: -1,
+                        y: 0,
+                    }
+                }
+            }
+            assert!(resources.blend_images(&bad).is_err());
+            assert_eq!(resources.frame(1, 0).unwrap().surface, original);
+        }
+        blend.destination.x = 10;
+        blend.sources[0].frame = 100;
+        resources.blend_images(&blend).unwrap();
+        assert_eq!(resources.frame(1, 0).unwrap().surface, original);
+        blend.destination.x = 0;
+        blend.destination.y = 0;
+        blend.size = [4, 3];
+        blend.sources = [blend.destination.clone(), blend.destination.clone()];
+        blend.weights = [256, 0];
+        resources.blend_images(&blend).unwrap();
+        assert_eq!(resources.frame(1, 0).unwrap().surface, original);
+    }
+
     #[test]
     fn image_composition_matches_original_for_every_alpha_pair() {
         use sha2::{Digest, Sha256};
