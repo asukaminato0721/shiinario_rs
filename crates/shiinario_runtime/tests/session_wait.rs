@@ -94,6 +94,7 @@ impl Host for TestHost {
                 self.updates += 1;
                 Ok(1)
             }
+            PlatformRequest::PumpMessages => Ok(1),
             _ => bail!("unexpected request: {request:?}"),
         }
     }
@@ -279,6 +280,71 @@ fn physical_key_repeats_keep_separate_state_for_left_and_right_keys() {
 }
 
 #[test]
+fn menu_composition_stays_hidden_until_the_script_paints() {
+    // Exercise explicit message dispatch, UpdateWindow, and scheduler dispatch.
+    for boundary in [0x0034u16, 0x07d1, 0x0033] {
+        let game = Game::new();
+        let mut code = Vec::new();
+        let mut instruction = |opcode: u16, values: &[u32]| {
+            code.extend(opcode.to_le_bytes());
+            for value in values {
+                code.push(4);
+                code.extend(value.to_le_bytes());
+            }
+        };
+        instruction(0x04d8, &[0, 0, 0, 1, 1, 255, 0, 0]);
+        instruction(0x07d0, &[0, 0, 1, 1]);
+        instruction(0x07d1, &[]);
+        // The menu draws its destination before it restores the old frame.
+        // Neither this destination nor the cleared DIB is a visible frame.
+        instruction(0x04d8, &[0, 0, 0, 1, 1, 0, 0, 255]);
+        instruction(0x07d0, &[0, 0, 1, 1]);
+        instruction(0x04ce, &[0]);
+        instruction(0x04d8, &[0, 0, 0, 1, 1, 255, 0, 0]);
+        instruction(boundary, &[]);
+        if boundary == 0x0033 {
+            instruction(0x0032, &[]);
+        }
+        for color in [[128, 0, 128], [0, 0, 255]] {
+            instruction(0x04d8, &[0, 0, 0, 1, 1, color[0], color[1], color[2]]);
+            instruction(0x07d0, &[0, 0, 1, 1]);
+            instruction(boundary, &[]);
+            if boundary == 0x0033 {
+                instruction(0x0032, &[]);
+            }
+        }
+        instruction(0, &[0]);
+        std::fs::write(game.0.join("wait.scn"), code).unwrap();
+        let project = Project::open(&game.0).unwrap();
+        let mut session = Session::new(&project, "wait.scn").unwrap();
+        let mut host = TestHost::default();
+        let mut frames = Vec::new();
+        let mut running = true;
+        let mut steps = 0;
+        // A host budget can expire after any event, including InvalidateRect.
+        while running && steps < 1000 {
+            running = session.step(&project, &mut host, |_| Ok(())).unwrap();
+            steps += 1;
+            let pixel: [u8; 4] = session.display().unwrap().rgba[..4].try_into().unwrap();
+            if frames.last() != Some(&pixel) {
+                frames.push(pixel);
+            }
+        }
+        assert!(!running);
+        assert_eq!(
+            frames,
+            [
+                [0, 0, 0, 255],
+                [255, 0, 0, 255],
+                [128, 0, 128, 255],
+                [0, 0, 255, 255],
+            ],
+            "paint boundary {boundary:#06x}"
+        );
+    }
+}
+
+#[test]
 fn window_update_retains_the_committed_damage_and_has_no_operands() {
     let game = Game::new();
     let mut code = Vec::new();
@@ -325,6 +391,7 @@ fn bitblt_copies_pixels_and_presents_only_the_screen_destination() {
             (0x04d8u16, vec![1, 0, 0, 1, 1, 10, 20, 30]),
             (0x0514, vec![0, 5, 6, 1, 1, 1, 0, 0, raster_operation]),
             (0x0514, vec![1, 2, 3, 1, 1, 0, 5, 6, 0x00cc_0020]),
+            (0x07d1, vec![]),
             (0, vec![0]),
         ] {
             code.extend(opcode.to_le_bytes());
@@ -385,6 +452,7 @@ fn clear_surface_presents_only_surface_zero_and_sleep_waits_for_elapsed_time() {
         code.extend(0x04ceu16.to_le_bytes());
         code.extend(imm(id));
     }
+    code.extend(0x07d1u16.to_le_bytes());
     code.extend(0x002au16.to_le_bytes());
     code.extend(imm(20));
     code.extend(0u16.to_le_bytes());

@@ -1182,6 +1182,11 @@ impl BinaryVm {
     pub fn mouse_mapping(&self) -> MouseButtonMapping {
         self.mouse_mapping
     }
+    /// Native 413160 dispatches queued window paints only in message mode.
+    /// Explicit 0034 pumps messages regardless of this mode.
+    pub fn message_pump_enabled(&self) -> bool {
+        self.message_mode != 0
+    }
     pub fn set_background_mode(&mut self, value: u32) {
         self.background_mode = value;
     }
