@@ -9,6 +9,32 @@ pub(super) const TARGET_SIZE: usize = 100 * 75 * 3;
 pub(super) const SAVE_XOR_CODE_SIZE: usize = 57;
 pub(super) const SAVE_XOR_SIZE: usize = 0x367d10;
 pub(super) const INVERT_COPY_CODE_SIZE: usize = 92;
+pub(super) const IMAGE_COPY_CODE_SIZE: usize = 158;
+// The helper writes 600 rows of 2400 bytes, with four untouched bytes
+// between rows. It does not access the padding after the final row.
+pub(super) const IMAGE_COPY_TARGET_SIZE: usize = 599 * 2404 + 2400;
+
+pub(super) fn is_image_copy(code: &[u8]) -> bool {
+    code.len() == IMAGE_COPY_CODE_SIZE
+        && format!("{:x}", Sha256::digest(code))
+            == "d10b3166f97bba5ae8db2ccd314895f581dc458c7e150fc8b1478e8365e4a98b"
+}
+
+pub(super) fn copy_image_rows(source: &[u8], target: &mut [u8]) -> Result<()> {
+    ensure!(
+        source.len() == SOURCE_SIZE,
+        "invalid native image copy source size"
+    );
+    ensure!(
+        target.len() == IMAGE_COPY_TARGET_SIZE,
+        "invalid native image copy target size"
+    );
+    for row in 0..600 {
+        target[row * 2404..row * 2404 + 2400]
+            .copy_from_slice(&source[row * 2400..(row + 1) * 2400]);
+    }
+    Ok(())
+}
 
 pub(super) fn is_invert_copy(code: &[u8]) -> bool {
     code.len() == INVERT_COPY_CODE_SIZE
@@ -71,6 +97,32 @@ pub(super) fn thumbnail(source: &[u8]) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_copy_matches_original_hanaoto_machine_code() {
+        // Linux i386 ran the original 158-byte helper at each destination
+        // alignment modulo four. All four runs produced this digest.
+        // The probe also checked unchanged source, padding and guards.
+        let source: Vec<_> = (0..SOURCE_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        let mut target = vec![0xa5; IMAGE_COPY_TARGET_SIZE + 4];
+        copy_image_rows(&source, &mut target[..IMAGE_COPY_TARGET_SIZE]).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&target)),
+            "d6bfb24b587525c1d890152ab8fbe5dce1e62d997b150934a2dc512a96dd86a3"
+        );
+        let original = target.clone();
+        assert!(
+            copy_image_rows(
+                &source[..SOURCE_SIZE - 1],
+                &mut target[..IMAGE_COPY_TARGET_SIZE]
+            )
+            .is_err()
+        );
+        assert!(copy_image_rows(&source, &mut target[..IMAGE_COPY_TARGET_SIZE - 1]).is_err());
+        assert_eq!(target, original);
+    }
 
     #[test]
     fn save_xor_matches_original_hanaoto_machine_code_and_reverses_itself() {
