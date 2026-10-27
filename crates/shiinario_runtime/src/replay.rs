@@ -154,10 +154,12 @@ impl InputReload {
         if modified == self.modified && metadata.len() == self.length {
             return Ok(false);
         }
-        let frames = serde_json::from_slice(&std::fs::read(&self.path)?)?;
-        replay.replace_pending(frames)?;
+        // Observe each file version once, including rejected edits. A later
+        // replacement can recover without resetting the running replay.
         self.modified = modified;
         self.length = metadata.len();
+        let frames = serde_json::from_slice(&std::fs::read(&self.path)?)?;
+        replay.replace_pending(frames)?;
         Ok(true)
     }
 }
@@ -182,6 +184,11 @@ mod tests {
         let mut replay = Replay::new(serde_json::from_str(original).unwrap()).unwrap();
         replay.advance(10);
         replay.cursor = [100, 200];
+        std::fs::write(&path, "[").unwrap();
+        assert!(source.refresh(&mut replay).is_err());
+        assert!(!source.refresh(&mut replay).unwrap());
+        assert_eq!(replay.cursor, [100, 200]);
+        assert_eq!(replay.next, 1);
         let changed = r#"[{"at_ms":0,"cursor":[10,20],"keys":[13]},{"at_ms":20,"cursor":[300,400],"keys":[40]},{"at_ms":30}]"#;
         std::fs::write(&path, changed).unwrap();
         source.refresh(&mut replay).unwrap();
@@ -190,6 +197,15 @@ mod tests {
         replay.advance(20);
         assert_eq!(replay.cursor, [300, 400]);
         assert!(replay.keys.is_down(40));
+        std::fs::write(&path, original).unwrap();
+        assert!(source.refresh(&mut replay).is_err());
+        assert!(!source.refresh(&mut replay).unwrap());
+        assert_eq!(replay.next, 2);
+        assert_eq!(replay.cursor, [300, 400]);
+        let corrected = r#"[{"at_ms":0,"cursor":[10,20],"keys":[13]},{"at_ms":20,"cursor":[300,400],"keys":[40]},{"at_ms":40,"cursor":[400,500]}]"#;
+        std::fs::write(&path, corrected).unwrap();
+        assert!(source.refresh(&mut replay).unwrap());
+        assert_eq!(replay.elapsed_ms, 20);
         let mut past = serde_json::from_str::<Vec<InputFrame>>(changed).unwrap();
         past[0].cursor = None;
         assert!(replay.replace_pending(past).is_err());
@@ -201,6 +217,8 @@ mod tests {
                 .replace_pending(serde_json::from_str(late).unwrap())
                 .is_err()
         );
+        replay.advance(40);
+        assert_eq!(replay.cursor, [400, 500]);
         std::fs::remove_file(path).unwrap();
     }
 

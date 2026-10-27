@@ -119,13 +119,29 @@ pub fn trace_with_options(
             ..Default::default()
         };
         let mut input_reload = input_reload.map(replay::InputReload::new).transpose()?;
+        let mut reload_error = None;
         let result = (|| {
             for step in 0..max_steps {
                 if step.is_multiple_of(100_000)
                     && let Some(source) = &mut input_reload
-                    && source.refresh(&mut platform.replay)?
                 {
-                    eprintln!("REPLAY input updated at {} ms", platform.clock_ms);
+                    match source.refresh(&mut platform.replay) {
+                        Ok(true) => {
+                            reload_error = None;
+                            eprintln!("REPLAY input updated at {} ms", platform.clock_ms);
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            let error = format!("{error:#}");
+                            if reload_error.as_ref() != Some(&error) {
+                                eprintln!(
+                                    "REPLAY input rejected at {} ms: {error}",
+                                    platform.clock_ms
+                                );
+                                reload_error = Some(error);
+                            }
+                        }
+                    }
                 }
                 if !session.step(project, &mut platform, &mut emit)? {
                     return Ok(());

@@ -147,7 +147,8 @@ Summary mode writes progress to stderr after each five million binary instructio
 Each update includes the glyph count, simulated elapsed time, and script position.
 Add `--reload-input` to apply future input edits during a running replay.
 Replace the JSON file atomically. Keep completed frames identical, and place
-changed frames after the current simulated time. Invalid edits stop the replay.
+changed frames after the current simulated time. The replay reports invalid edits
+and continues with its previous input. A later valid replacement can recover.
 
 Configured audio loops use decoded PCM frame boundaries. Native decoder block
 effects at configured loop endpoints do not have sample-by-sample verification.
