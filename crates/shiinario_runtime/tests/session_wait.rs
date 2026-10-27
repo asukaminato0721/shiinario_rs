@@ -59,13 +59,14 @@ struct TestHost {
     polls: usize,
     messages: Vec<[u32; 3]>,
     scan_keys: Vec<u32>,
+    persistent: bool,
 }
 impl Host for TestHost {
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
         std::mem::take(&mut self.messages)
     }
     fn simulated(&self) -> bool {
-        true
+        !self.persistent
     }
     fn poll(&mut self) -> Result<()> {
         self.polls += 1;
@@ -114,6 +115,58 @@ impl Host for TestHost {
     fn play_stream(&mut self, _: u32, _: Arc<AudioStream>, _: u32) -> Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn window_close_runs_the_save_callback_before_ending_the_session() {
+    let game = Game::new();
+    // Define the inactive close task, disable flag encoding, and set a clear bit.
+    let mut code = vec![0x0c, 0, 4, 10, 0, 0, 0, 0x84, 0, 0, 0, 0];
+    code.extend([0x36, 1, 4, 0, 0, 0, 0]);
+    code.extend([0x8e, 3, 4, 1, 0, 0, 0, 14, 0xbc, 2]);
+    code.extend([0x8a, 7, 4, 10, 0, 0, 0]);
+    code.extend([0xbc, 7]);
+    for value in [0u32, 0x10, 0, 0] {
+        code.push(4);
+        code.extend(value.to_le_bytes());
+    }
+    let idle = code.len() as u32;
+    code.extend([0x58, 2, 0x84]);
+    code.extend(idle.to_le_bytes());
+    let callback = code.len() as u32;
+    code[8..12].copy_from_slice(&callback.to_le_bytes());
+    code.extend(b"\x3b\x01\x10flags.bin\0");
+    code.extend([0, 0, 4, 1, 0, 0, 0]);
+    std::fs::write(game.0.join("wait.scn"), code).unwrap();
+    let project = Project::open(&game.0).unwrap();
+    let mut session = Session::new(&project, "wait.scn").unwrap();
+    let mut host = TestHost {
+        persistent: true,
+        ..Default::default()
+    };
+    let mut writes = 0;
+    let ended = (0..500).any(|_| {
+        !session
+            .step(&project, &mut host, |event| {
+                if matches!(
+                    event,
+                    Event::Platform {
+                        request: PlatformRequest::WriteFlags { .. },
+                        ..
+                    }
+                ) {
+                    writes += 1;
+                }
+                Ok(())
+            })
+            .unwrap()
+    });
+    assert!(ended);
+    assert_eq!(writes, 1);
+    let reopened = Project::open(&game.0).unwrap();
+    let flags = reopened.read("FLAGS.BIN").unwrap();
+    assert_eq!(flags.len(), 4008);
+    assert_eq!(u32::from_le_bytes(flags[2800..2804].try_into().unwrap()), 1);
 }
 
 #[test]

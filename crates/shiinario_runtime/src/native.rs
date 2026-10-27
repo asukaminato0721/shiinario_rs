@@ -462,7 +462,10 @@ impl ApplicationHandler for App<'_> {
             host.wake_input = true;
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                host.window_messages.push([0x10, 0, 0]);
+                host.wake_input = true;
+            }
             WindowEvent::SurfaceResized(size) => {
                 presentation.resize(size);
                 match presentation.transform() {

@@ -523,6 +523,23 @@ enum MemoryRange {
     Heap(u32, std::ops::Range<usize>),
 }
 
+#[derive(Clone, Copy)]
+enum WindowCallbackKind {
+    Message(u32),
+    Close,
+}
+
+struct WindowCallback {
+    previous: u32,
+    stack_pointer: usize,
+    kind: WindowCallbackKind,
+}
+
+enum QueuedWindowMessage {
+    Message([u32; 4]),
+    CloseHook,
+}
+
 fn bank_base(tag: u8) -> u32 {
     0x1100_0000 + u32::from(tag) * 0x10000
 }
@@ -697,8 +714,8 @@ pub struct BinaryVm {
     scheduler: Scheduler,
     dispatch_quantum: u32,
     callback_tasks: std::collections::BTreeMap<u16, u32>,
-    window_messages: std::collections::VecDeque<[u32; 4]>,
-    window_callback: Option<(u32, usize, u32)>,
+    window_messages: std::collections::VecDeque<QueuedWindowMessage>,
+    window_callback: Option<WindowCallback>,
     ended: bool,
     named_scopes: Vec<NamedScope>,
     global_scope: Option<NamedScope>,
@@ -968,9 +985,10 @@ impl BinaryVm {
         self.pending = Some((event.clone(), None));
         event
     }
-    /// Deliver a Win32-style input message to the task registered by 07e4.
-    /// Original 4355b0 pushes hwnd/message/wparam/lparam; 42bf60 runs the
-    /// registered entry synchronously. Queue it until any pending reply is done.
+    /// Precondition: message values use the Win32 convention.
+    /// Postcondition: queue supported messages until any pending reply is done.
+    /// The 07e4 task receives hwnd/message/wparam/lparam. An unconsumed WM_CLOSE
+    /// then invokes the 078a task without arguments, as in v2.48 4362cc.
     pub fn window_message(&mut self, message: u32, wparam: u32, lparam: u32) {
         if message == 0x10
             || self.callback_tasks.contains_key(&0x07e4)
@@ -981,11 +999,12 @@ impl BinaryVm {
                 && self
                     .window_messages
                     .iter()
-                    .any(|args| args[1] == message && args[2] == wparam)
+                    .any(|item| matches!(item, QueuedWindowMessage::Message(args) if args[1] == message && args[2] == wparam))
             {
                 return;
             }
-            self.window_messages.push_back([0, message, wparam, lparam]);
+            self.window_messages
+                .push_back(QueuedWindowMessage::Message([0, message, wparam, lparam]));
         }
     }
     /// Advance the original cooperative scheduler, including explicit host polls.
@@ -1007,24 +1026,36 @@ impl BinaryVm {
         if self.async_text.as_ref().is_some_and(|text| text.ticking) {
             return self.text_step();
         }
-        if let Some((previous, sp, _)) = self.window_callback
+        if let Some(callback) = &self.window_callback
             && self.context_flags & 1 == 0
         {
-            self.sp = sp;
+            let previous = callback.previous;
+            self.sp = callback.stack_pointer;
             self.window_callback = None;
             self.select_task(previous);
         }
         if self.window_callback.is_none() {
-            while let Some(arguments) = self.window_messages.pop_front() {
+            while let Some(message) = self.window_messages.pop_front() {
+                let (arguments, close_hook) = match message {
+                    QueuedWindowMessage::Message(arguments) => (arguments, false),
+                    QueuedWindowMessage::CloseHook => ([0, 0x10, 0, 0], true),
+                };
                 // v2.48 4365e9 handles WM_SYSKEYDOWN/VK_RETURN by running
                 // the 0794 task synchronously, without window-message arguments.
                 let alt_enter = arguments[1] == 0x104
                     && arguments[2] == 0x0d
                     && self.callback_tasks.contains_key(&0x0794);
                 let timer = arguments[1] == 0x113 && self.callback_tasks.contains_key(&0x0af0);
+                let generic = self
+                    .callback_tasks
+                    .get(&0x07e4)
+                    .is_some_and(|task| self.task_entries.contains_key(task));
+                let close_hook = close_hook || (arguments[1] == 0x10 && !generic);
                 let callback = self
                     .callback_tasks
-                    .get(&if alt_enter {
+                    .get(&if close_hook {
+                        0x078a
+                    } else if alt_enter {
                         0x0794
                     } else if timer {
                         0x0af0
@@ -1042,9 +1073,21 @@ impl BinaryVm {
                 ensure!(id != self.current_task, "recursive window callback");
                 let previous = self.current_task;
                 self.select_task(id);
-                let count = if alt_enter || timer { 0 } else { 4 };
+                let count = if close_hook || alt_enter || timer {
+                    0
+                } else {
+                    4
+                };
                 ensure!(self.sp >= count, "window callback stack overflow");
-                self.window_callback = Some((previous, self.sp, arguments[1]));
+                self.window_callback = Some(WindowCallback {
+                    previous,
+                    stack_pointer: self.sp,
+                    kind: if close_hook {
+                        WindowCallbackKind::Close
+                    } else {
+                        WindowCallbackKind::Message(arguments[1])
+                    },
+                });
                 self.sp -= count;
                 self.banks.get_mut(&8).unwrap()[self.sp..self.sp + count]
                     .copy_from_slice(&arguments[..count]);
@@ -2693,12 +2736,20 @@ impl BinaryVm {
                 }
                 self.context_flags = 0;
                 rescan = true;
-                // A window procedure's nonzero return consumes the message;
-                // it is not a request to terminate the scenario session.
-                let close = result == 0
-                    && self
-                        .window_callback
-                        .is_some_and(|(_, _, message)| message == 0x10);
+                // 435890: a nonzero 07e4 result consumes the message.
+                // 4362cc: WM_CLOSE then invokes the separate 078a task.
+                // Its zero result cancels default closure; nonzero closes.
+                let close = self.window_callback.as_ref().is_some_and(|callback| {
+                    matches!(callback.kind, WindowCallbackKind::Close) && result != 0
+                });
+                if result == 0
+                    && self.window_callback.as_ref().is_some_and(|callback| {
+                        matches!(callback.kind, WindowCallbackKind::Message(0x10))
+                    })
+                {
+                    self.window_messages
+                        .push_front(QueuedWindowMessage::CloseHook);
+                }
                 if close
                     || (result != 0
                         && self.window_callback.is_none()
@@ -5899,6 +5950,59 @@ mod tests {
         let mut vm = BinaryVm::new("double-click.scn", instruction(0x1a4, &args)).unwrap();
         vm.step().unwrap();
         assert_eq!(vm.banks[&12][0], 500);
+    }
+
+    #[test]
+    fn close_hooks_follow_the_message_hook_and_can_cancel_closure() {
+        for (generic, close, expected, ended) in [
+            (None, Some(1), 2, true),
+            (None, Some(0), 2, false),
+            (Some(0), Some(1), 3, true),
+            (Some(0), Some(0), 3, false),
+            (Some(1), Some(1), 1, false),
+            (Some(0), None, 1, true),
+        ] {
+            let mut code = instruction(0x0258, &[0x84, 0, 0, 0, 0]);
+            let mut entries = Vec::new();
+            for (registration, task, bit, result) in
+                [(0x07e4, 10, 1, generic), (0x078a, 11, 2, close)]
+            {
+                if let Some(result) = result {
+                    let entry = code.len();
+                    code.extend(instruction(
+                        0x0397,
+                        &[immediate(bit), vec![14, 0, 0]].concat(),
+                    ));
+                    code.extend(instruction(0, &immediate(result)));
+                    entries.push((registration, task, entry));
+                }
+            }
+            let mut vm = BinaryVm::new("close.scn", code).unwrap();
+            vm.sp = 900;
+            for (registration, task, entry) in entries {
+                vm.define_task(task, vm.script_base, entry, false);
+                vm.callback_tasks.insert(registration, task);
+            }
+            vm.window_message(0x10, 0, 0);
+            let finished = (0..100).any(|_| {
+                let event = vm.scheduled_step().unwrap();
+                if vm.current_task == 11 {
+                    assert_eq!(vm.sp, CELLS); // 078a receives no message arguments.
+                }
+                if event == Event::SchedulerPoll {
+                    vm.respond(1).unwrap();
+                }
+                event == Event::End
+                    || (vm.window_messages.is_empty() && vm.window_callback.is_none())
+            });
+            assert!(finished);
+            assert_eq!(vm.banks[&14][0], expected);
+            assert_eq!(vm.ended, ended);
+            if !ended {
+                assert_eq!(vm.current_task, 0);
+                assert_eq!(vm.sp, 900);
+            }
+        }
     }
 
     #[test]
