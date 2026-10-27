@@ -1447,8 +1447,24 @@ impl Resources {
         }
         Ok(())
     }
+    fn audio_stream_frequency(&self, handle: u32) -> Result<u32> {
+        // Original 455fd0 calls IDirectSoundBuffer::GetFrequency (vtable +32).
+        if handle == 0 {
+            return Ok(0);
+        }
+        Ok(self
+            .streams
+            .get(&handle)
+            .context("unknown audio stream in frequency query")?
+            .sound
+            .sample_rate)
+    }
+
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        if let PlatformRequest::GetAudioStreamFrequency { handle } = request {
+            return Ok(Some(self.audio_stream_frequency(*handle)?));
+        }
         if let PlatformRequest::ImageFrameExists { id, frame } = request {
             return Ok(Some(u32::from(self.image_frame_exists(*id, *frame)?)));
         }
@@ -1601,6 +1617,29 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn stream_frequency_uses_the_decoded_rate_and_handles_null() {
+        let mut resources = Resources::default();
+        assert_eq!(resources.audio_stream_frequency(0).unwrap(), 0);
+        assert!(resources.audio_stream_frequency(1).is_err());
+        for rate in [22050, 44100, 48000] {
+            resources.streams.insert(
+                1,
+                Arc::new(AudioStream {
+                    sound: Sound {
+                        sample_rate: rate,
+                        channels: 1,
+                        samples: vec![0; 100],
+                    },
+                    loop_start_frame: 0,
+                    first_block_frames: 100,
+                    volume: StreamVolume::default(),
+                }),
+            );
+            assert_eq!(resources.audio_stream_frequency(1).unwrap(), rate);
+        }
+    }
+
     #[test]
     fn draw_list_clip_uses_exclusive_right_bottom_and_preserves_other_pixels() {
         let mut resources = Resources::default();
