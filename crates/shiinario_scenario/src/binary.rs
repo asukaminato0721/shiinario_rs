@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod native_helper;
 mod text_execution;
-use text_execution::{AsyncText, StagedText, TextCallback};
+use text_execution::{AsyncText, StagedText, TextCallback, TextStringIndex};
 
 /// The original engine stores the full operand and treats every nonzero value as
 /// swapped. Input bits 0, 1 and 2 represent the first three physical mouse buttons.
@@ -738,6 +738,7 @@ pub struct BinaryVm {
     text_callback_result: u32,
     // The inline ~ control and opcode 0069 share one value across text contexts.
     text_marker: u32,
+    text_strings: std::collections::BTreeMap<TextStringIndex, [u8; 256]>,
     pending_text_style: Option<(crate::text::TextStyle, crate::text::TextClock)>,
 }
 #[derive(Clone)]
@@ -842,6 +843,7 @@ impl BinaryVm {
             text_callback: None,
             text_callback_result: 0,
             text_marker: 0,
+            text_strings: Default::default(),
             pending_text_style: None,
             context_flags: 1,
             message_mode: 0,
