@@ -44,11 +44,19 @@ pub(super) struct AsyncText {
     pub ticking: bool,
     pub immediate: bool,
     pub staged_destination: Option<Destination>,
+    // Resolve the whole string once. A legacy caption can differ from the story.
+    encoding: crate::TextEncoding,
     coroutine: Option<Coroutine<TextYield>>,
     reply: Option<PlatformReply>,
 }
 impl AsyncText {
-    pub fn new(owner: u32, surface: u32, address: u32, location: Location) -> Self {
+    pub fn new(
+        owner: u32,
+        surface: u32,
+        address: u32,
+        location: Location,
+        encoding: crate::TextEncoding,
+    ) -> Self {
         Self {
             owner,
             surface,
@@ -58,6 +66,7 @@ impl AsyncText {
             ticking: false,
             immediate: false,
             staged_destination: None,
+            encoding,
             coroutine: Some(Coroutine::new(run_text)),
             reply: None,
         }
@@ -303,7 +312,8 @@ impl BinaryVm {
             self.async_text.is_none(),
             "text coroutine is already active"
         );
-        self.string_bytes(address)?;
+        let source = self.string_bytes(address)?;
+        let encoding = crate::TextEncoding::detect_with_preference(&source, self.text_encoding);
         self.text_layout.begin(self.text_cursor);
         self.staged_texts.insert(
             self.text_context,
@@ -313,6 +323,7 @@ impl BinaryVm {
                     u32::MAX,
                     address,
                     location,
+                    encoding,
                 )),
                 context: self.text_snapshot(),
                 completed: false,
@@ -565,6 +576,7 @@ impl BinaryVm {
         let text = self.async_text.as_ref().context("missing text context")?;
         let surface = text.surface;
         let offset = text.offset;
+        let encoding = text.encoding;
         let bytes = self.text_bytes()?;
         if bytes.is_empty() {
             return Ok(None);
@@ -581,7 +593,6 @@ impl BinaryVm {
                 bytes[0]
             );
         }
-        let encoding = self.text_encoding;
         let length = encoding.character_length(bytes[start]);
         ensure!(
             start + length <= bytes.len(),
@@ -707,7 +718,13 @@ mod tests {
             let address = 0x2000_0000;
             vm.allocations
                 .insert(address, [source.as_slice(), &[0]].concat());
-            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            vm.async_text = Some(AsyncText::new(
+                0,
+                0,
+                address,
+                vm.location(),
+                vm.text_encoding,
+            ));
             let index = TextStringIndex::try_from(index).unwrap();
             vm.text_strings.insert(index, [0xa5; 256]);
             let cursor = vm.text_cursor;
@@ -735,7 +752,13 @@ mod tests {
             let mut vm = BinaryVm::new("invalid.scn", vec![0; 7]).unwrap();
             let address = 0x2000_0000;
             vm.allocations.insert(address, [source, &[0]].concat());
-            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            vm.async_text = Some(AsyncText::new(
+                0,
+                0,
+                address,
+                vm.location(),
+                vm.text_encoding,
+            ));
             assert!(vm.text_item().is_err());
             assert!(vm.text_strings.is_empty());
             assert_eq!(vm.async_text.as_ref().unwrap().offset, 0);
@@ -747,7 +770,13 @@ mod tests {
         let mut vm = BinaryVm::new("definition.scn", vec![0; 7]).unwrap();
         let address = 0x2000_0000;
         vm.allocations.insert(address, b"++\0".to_vec());
-        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.async_text = Some(AsyncText::new(
+            0,
+            0,
+            address,
+            vm.location(),
+            vm.text_encoding,
+        ));
         vm.text_style.fullwidth_ascii = false;
         assert!(matches!(vm.text_item().unwrap(), TextItem::Glyph));
         let glyph = vm.text_glyph().unwrap().unwrap();
@@ -786,7 +815,13 @@ mod tests {
             let mut vm = BinaryVm::new("marker.scn", vec![0x69, 0, 12, 0, 0]).unwrap();
             let address = 0x2000_0000;
             vm.allocations.insert(address, [source, &[0]].concat());
-            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            vm.async_text = Some(AsyncText::new(
+                0,
+                0,
+                address,
+                vm.location(),
+                vm.text_encoding,
+            ));
             vm.text_marker = initial;
             let cursor = vm.text_cursor;
             let layout = vm.text_layout.clone();
@@ -804,7 +839,13 @@ mod tests {
         let mut vm = BinaryVm::new("marker.scn", vec![0; 7]).unwrap();
         let address = 0x2000_0000;
         vm.allocations.insert(address, b"~{1}\0".to_vec());
-        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.async_text = Some(AsyncText::new(
+            0,
+            0,
+            address,
+            vm.location(),
+            vm.text_encoding,
+        ));
         vm.text_marker = 42;
         assert!(vm.text_item().is_err());
         assert_eq!(vm.text_marker, 42);
@@ -868,7 +909,13 @@ mod tests {
         assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
         let address = 0x2000_0000;
         vm.allocations.insert(address, short.to_vec());
-        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.async_text = Some(AsyncText::new(
+            0,
+            0,
+            address,
+            vm.location(),
+            vm.text_encoding,
+        ));
         for expected in ['換', '檔'] {
             let glyph = vm.text_glyph().unwrap().unwrap();
             assert_eq!(glyph.character, expected);
@@ -879,6 +926,94 @@ mod tests {
         let (japanese, _, _) = encoding_rs::SHIFT_JIS.encode("日本語の文章です。");
         vm.detect_text_encoding(&japanese);
         assert_eq!(vm.text_encoding, crate::TextEncoding::Cp932);
+    }
+
+    #[test]
+    fn mixed_save_captions_keep_the_story_encoding_for_the_next_text() {
+        for opcode in [0x0083u16, 0x0084, 0x00a0] {
+            let mut code = Vec::new();
+            for (codec, caption) in [
+                (encoding_rs::SHIFT_JIS, "「え、いや……」"),
+                (encoding_rs::BIG5, "換檔"),
+            ] {
+                let (bytes, _, bad) = codec.encode(caption);
+                assert!(!bad);
+                code.extend(opcode.to_le_bytes());
+                if opcode != 0x00a0 {
+                    code.extend(immediate(0));
+                }
+                code.push(0x10);
+                code.extend_from_slice(&bytes);
+                code.push(0);
+                if opcode == 0x00a0 {
+                    for _ in 0..=caption.chars().count() {
+                        code.extend(0x00a1u16.to_le_bytes());
+                        code.extend(immediate(0));
+                        code.extend([12, 0, 0]);
+                    }
+                }
+            }
+            code.extend(0u16.to_le_bytes());
+            code.extend(immediate(0));
+            let mut vm = BinaryVm::new("mixed-save.scn", code).unwrap();
+            vm.set_text_encoding(crate::TextEncoding::Big5);
+            let mut glyphs = String::new();
+            let ended = (0..2000).any(|_| match vm.scheduled_step().unwrap() {
+                Event::End => true,
+                Event::SchedulerPoll => {
+                    vm.respond(1).unwrap();
+                    false
+                }
+                Event::Platform {
+                    request: PlatformRequest::DrawGlyph { character, .. },
+                    ..
+                } => {
+                    glyphs.push(character);
+                    vm.respond(1).unwrap();
+                    false
+                }
+                Event::Platform {
+                    request: PlatformRequest::ClockMilliseconds | PlatformRequest::TextInput { .. },
+                    ..
+                } => {
+                    vm.respond(0).unwrap();
+                    false
+                }
+                Event::Platform { request, .. } => panic!("unexpected text request: {request:?}"),
+                _ => false,
+            });
+            assert!(ended, "text opcode {opcode:#06x}");
+            assert_eq!(glyphs, "「え、いや……」換檔");
+            assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
+        }
+    }
+
+    #[test]
+    fn malformed_text_remains_an_error_when_neither_codec_accepts_it() {
+        let bytes = b"\x81\x30";
+        assert!(crate::TextEncoding::detect_unambiguous(bytes).is_none());
+        let mut code = vec![0x84, 0, 4, 0, 0, 0, 0, 0x10];
+        code.extend(bytes);
+        code.push(0);
+        let mut vm = BinaryVm::new("malformed.scn", code).unwrap();
+        vm.set_text_encoding(crate::TextEncoding::Big5);
+        let cursor = vm.text_cursor;
+        let error = (0..50)
+            .find_map(|_| match vm.scheduled_step() {
+                Err(error) => Some(error),
+                Ok(Event::SchedulerPoll) => {
+                    vm.respond(1).unwrap();
+                    None
+                }
+                Ok(Event::Platform { request, .. }) => {
+                    panic!("malformed text issued a platform request: {request:?}")
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(error.to_string().contains("invalid Big5 text character"));
+        assert_eq!(vm.text_cursor, cursor);
+        assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
     }
 
     #[test]
@@ -1004,7 +1139,13 @@ mod tests {
         let mut data = bytes.to_vec();
         data.push(0);
         vm.allocations.insert(address, data);
-        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.async_text = Some(AsyncText::new(
+            0,
+            0,
+            address,
+            vm.location(),
+            vm.text_encoding,
+        ));
         let advance = vm.text_style.full_advance;
         for (index, expected) in "繁體中文".chars().enumerate() {
             let glyph = vm.text_glyph().unwrap().unwrap();
@@ -1094,7 +1235,13 @@ mod tests {
         vm.text_style.fullwidth_ascii = false;
         vm.context_flags |= 8;
         vm.text_layout.begin(vm.text_cursor);
-        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.async_text = Some(AsyncText::new(
+            0,
+            0,
+            address,
+            vm.location(),
+            vm.text_encoding,
+        ));
         vm
     }
 

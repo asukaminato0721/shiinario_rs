@@ -3734,16 +3734,17 @@ impl BinaryVm {
                     self.async_text.is_none(),
                     "shared concurrent text contexts are unresolved"
                 );
-                ensure!(
-                    self.string_bytes(address)?.len() <= 65536,
-                    "text exceeds 64 KiB"
-                );
+                let source = self.string_bytes(address)?;
+                ensure!(source.len() <= 65536, "text exceeds 64 KiB");
+                let encoding =
+                    crate::TextEncoding::detect_with_preference(&source, self.text_encoding);
                 self.text_layout.begin(self.text_cursor);
                 self.async_text = Some(AsyncText::new(
                     self.current_task,
                     surface,
                     address,
                     location.clone(),
+                    encoding,
                 ));
                 self.context_flags |= 8;
                 if self.text_style.skip_mask & 8 != 0 {
@@ -3776,8 +3777,15 @@ impl BinaryVm {
                         "shared concurrent text contexts are unresolved"
                     );
                     self.text_layout.begin(self.text_cursor);
-                    let mut text =
-                        AsyncText::new(self.current_task, surface, address, location.clone());
+                    let encoding =
+                        crate::TextEncoding::detect_with_preference(&controls, self.text_encoding);
+                    let mut text = AsyncText::new(
+                        self.current_task,
+                        surface,
+                        address,
+                        location.clone(),
+                        encoding,
+                    );
                     text.immediate = true;
                     self.async_text = Some(text);
                     self.context_flags |= 8;
