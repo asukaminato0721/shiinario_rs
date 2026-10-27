@@ -504,6 +504,9 @@ pub enum PlatformRequest {
         window: u32,
         title: String,
     },
+    DestroyMenu {
+        menu: u32,
+    },
 }
 
 const CELLS: usize = 1000;
@@ -4763,6 +4766,14 @@ impl BinaryVm {
                 let title = self.window_title(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::SetWindowTitle { window, title });
             }
+            0x08f2 => {
+                // v2.48 41ffa0 reads one handle, calls DestroyMenu, and
+                // discards the result. It also restores the main window
+                // when the handle identifies the engine's attached menu.
+                request = Some(PlatformRequest::DestroyMenu {
+                    menu: self.read(&mut cursor)?,
+                });
+            }
             _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
         }
         let next_pc = cursor.pc;
@@ -5922,6 +5933,32 @@ mod tests {
             vm.step().unwrap();
             assert_eq!(vm.banks[&12][0], u32::from(mode == 1));
         }
+    }
+
+    #[test]
+    fn destroy_menu_reads_one_handle_and_discards_the_reply() -> Result<()> {
+        for menu in [0, 0x1234_5678] {
+            // RanSem start.SCN:0x1652 uses global bank 14, cell 105.
+            let mut code = instruction(0x08f2, &[14, 105, 0]);
+            code.extend(instruction(0x049d, &immediate(7)));
+            let mut vm = BinaryVm::new("destroy-menu.scn", code)?;
+            vm.banks.get_mut(&14).unwrap()[105] = menu;
+            assert!(matches!(
+                vm.step()?,
+                Event::Platform {
+                    request: PlatformRequest::DestroyMenu { menu: actual }, ..
+                } if actual == menu
+            ));
+            assert_eq!(vm.pc, 5);
+            vm.respond(0)?;
+            assert_eq!(vm.banks[&14][105], menu);
+            vm.step()?;
+            assert_eq!(vm.mouse_mapping().value, 7);
+        }
+        let mut vm = BinaryVm::new("destroy-menu.scn", instruction(0x08f2, &[14, 105]))?;
+        assert!(vm.step().is_err());
+        assert_eq!(vm.pc, 0);
+        Ok(())
     }
 
     #[test]
