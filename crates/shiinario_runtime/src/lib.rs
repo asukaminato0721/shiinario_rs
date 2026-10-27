@@ -246,6 +246,10 @@ impl Host for TracePlatform {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::SetCursorPosition { position } => {
+                self.replay.cursor = *position;
+                Ok(1)
+            }
             PlatformRequest::TextInput { clear } => {
                 Ok(if *clear { 0 } else { self.replay.controls() })
             }
@@ -314,13 +318,30 @@ pub fn open(path: impl AsRef<Path>) -> Result<Project> {
 mod tests {
     use super::*;
     #[test]
+    fn trace_cursor_warp_is_visible_to_the_next_position_query() {
+        let mut host = TracePlatform::default();
+        assert_eq!(
+            host.respond(&PlatformRequest::SetCursorPosition {
+                position: [-12, 160]
+            })
+            .unwrap(),
+            1
+        );
+        host.poll().unwrap();
+        assert_eq!(
+            host.point(&PlatformRequest::CursorPosition).unwrap(),
+            [-12, 160]
+        );
+    }
+
+    #[test]
     fn mouse_button_query_retains_middle_button_and_applies_mapping_once() {
         for buttons in 0..8u8 {
             for mapping in [0u32, 1, u32::MAX] {
                 let mut host = TracePlatform {
                     replay: replay::Replay::new(vec![replay::InputFrame {
                         at_ms: 0,
-                        cursor: [0; 2],
+                        cursor: Some([0; 2]),
                         mouse_buttons: buttons,
                         control_mask: 0,
                         keys: vec![],

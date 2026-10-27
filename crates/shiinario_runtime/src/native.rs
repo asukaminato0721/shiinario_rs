@@ -226,6 +226,19 @@ impl Host for NativeHost {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::SetCursorPosition { position } => {
+                let point = self.transform.to_window_point(*position)?;
+                self.cursor = point;
+                // Keep logical navigation available when the compositor denies
+                // physical pointer warps. The next pointer event replaces it.
+                Ok(u32::from(
+                    self.window
+                        .set_cursor_position(
+                            winit::dpi::PhysicalPosition::new(point[0], point[1]).into(),
+                        )
+                        .is_ok(),
+                ))
+            }
             PlatformRequest::TextInput { clear } => {
                 if *clear {
                     self.text_key = false;

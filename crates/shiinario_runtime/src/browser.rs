@@ -85,6 +85,11 @@ impl Host for BrowserHost {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::SetCursorPosition { position } => {
+                // Browsers cannot move the operating-system pointer.
+                self.cursor = self.transform.to_window_point(*position)?;
+                Ok(1)
+            }
             PlatformRequest::TextInput { clear } => {
                 if *clear {
                     self.text_key = false;
