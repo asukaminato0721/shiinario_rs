@@ -933,7 +933,7 @@ mod tests {
         for opcode in [0x0083u16, 0x0084, 0x00a0] {
             let mut code = Vec::new();
             for (codec, caption) in [
-                (encoding_rs::SHIFT_JIS, "「え、いや……」"),
+                (encoding_rs::SHIFT_JIS, "「え、いや……」_..."),
                 (encoding_rs::BIG5, "換檔"),
             ] {
                 let (bytes, _, bad) = codec.encode(caption);
@@ -955,8 +955,10 @@ mod tests {
             }
             code.extend(0u16.to_le_bytes());
             code.extend(immediate(0));
-            let mut vm = BinaryVm::new("mixed-save.scn", code).unwrap();
+            let mut vm =
+                BinaryVm::with_version("mixed-save.scn", code, EngineVersion::V2_48).unwrap();
             vm.set_text_encoding(crate::TextEncoding::Big5);
+            vm.text_style.fullwidth_ascii = false;
             let mut glyphs = String::new();
             let ended = (0..2000).any(|_| match vm.scheduled_step().unwrap() {
                 Event::End => true,
@@ -983,7 +985,7 @@ mod tests {
                 _ => false,
             });
             assert!(ended, "text opcode {opcode:#06x}");
-            assert_eq!(glyphs, "「え、いや……」換檔");
+            assert_eq!(glyphs, "「え、いや……」..換檔");
             assert_eq!(vm.text_encoding, crate::TextEncoding::Big5);
         }
     }

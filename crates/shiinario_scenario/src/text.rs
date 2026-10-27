@@ -162,6 +162,9 @@ impl TextStyle {
             let command = bytes[at + 1];
             at += 2;
             match command {
+                // v2.48 431ed0 dispatches '.' to the unchanged-state return
+                // at 432a44. Truncated legacy save captions can end in _...
+                b'.' if version == EngineVersion::V2_48 => {}
                 // v2.36's 425fc0 dispatches 'n' to the plain return at 42697b:
                 // only the command byte is consumed. v2.47 uses it to switch
                 // text contexts (432466), which is still unresolved.
@@ -382,6 +385,18 @@ pub(crate) fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn truncated_caption_dot_control_matches_native_consumption() {
+        let style = TextStyle::default();
+        for bytes in [b"_.".as_slice(), b"_...", b"_.A"] {
+            let (result, clock, consumed) = style.prefix(bytes, EngineVersion::V2_48).unwrap();
+            assert_eq!(result, style);
+            assert!(clock.is_none());
+            assert_eq!(consumed, 2);
+        }
+        assert!(style.prefix(b"_.", EngineVersion::V2_47).is_err());
+    }
+
     #[test]
     fn source_encoding_detection_preserves_cp932_and_accepts_valid_big5() {
         let (big5, _, bad) = encoding_rs::BIG5.encode("善意的虛偽，勝於引起爭端的事實。");
