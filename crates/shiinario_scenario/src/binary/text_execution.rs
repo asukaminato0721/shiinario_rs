@@ -7,6 +7,22 @@ use std::{cell::RefCell, rc::Rc};
 type VmOperation = Box<dyn FnOnce(&mut BinaryVm)>;
 type PlatformReply = Box<dyn FnOnce(&mut BinaryVm, u32) -> Result<()>>;
 
+/// A slot in the native global table of 257 inline strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct TextStringIndex(u16);
+
+impl TryFrom<u32> for TextStringIndex {
+    type Error = anyhow::Error;
+
+    fn try_from(value: u32) -> Result<Self> {
+        ensure!(
+            value <= 256,
+            "inline text string index {value} out of bounds"
+        );
+        Ok(Self(value as u16))
+    }
+}
+
 enum TextYield {
     WithVm(VmOperation),
     Platform {
@@ -476,11 +492,31 @@ impl BinaryVm {
 
     /// Precondition: this task owns an active text coroutine.
     /// Postcondition: a valid control updates its state and consumes only its bytes.
-    /// An invalid control leaves the marker, cursor, and text offset unchanged.
+    /// An invalid control leaves the control state, cursor, and text offset unchanged.
     fn text_item(&mut self) -> Result<TextItem> {
         let bytes = self.text_bytes()?;
         if bytes.is_empty() {
             return Ok(TextItem::End);
+        }
+        if bytes.starts_with(b"+") && !bytes.starts_with(b"++") {
+            // v2.48 4336e6: define +index followed by up to 254 raw bytes.
+            // A slash ends the definition. Reaching the cap leaves the next
+            // source byte for the text parser, even when that byte is a slash.
+            let mut consumed = 1;
+            let index =
+                TextStringIndex::try_from(crate::text::parse_number(&bytes, &mut consumed, true)?)?;
+            let source = &bytes[consumed..];
+            let length = source
+                .iter()
+                .take(254)
+                .position(|&byte| byte == b'/')
+                .unwrap_or(source.len().min(254));
+            let terminated = length < 254 && source.get(length) == Some(&b'/');
+            let slot = self.text_strings.entry(index).or_insert([0; 256]);
+            slot[..length].copy_from_slice(&source[..length]);
+            slot[length] = 0;
+            self.async_text.as_mut().unwrap().offset += consumed + length + usize::from(terminated);
+            return Ok(TextItem::Control { clock: false });
         }
         if bytes.starts_with(b"~") && !bytes.starts_with(b"~~") {
             // v2.48 4337ac: an omitted number is zero. An immediate + or -
@@ -642,6 +678,98 @@ impl BinaryVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inline_string_definitions_match_native_boundaries_and_preserve_padding() {
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        let cases = [
+            (b"+7hello/after".to_vec(), 7, b"hello".to_vec(), 8),
+            (b"+E4508".to_vec(), 0, b"E4508".to_vec(), 6),
+            (b"+256upper/".to_vec(), 256, b"upper".to_vec(), 10),
+            (b"+x100Z/".to_vec(), 256, b"Z".to_vec(), 7),
+            (b"+0/".to_vec(), 0, vec![], 3),
+            (b"+".to_vec(), 0, vec![], 1),
+            (
+                [b"+0".as_slice(), &[b'a'; 254], b"/Z"].concat(),
+                0,
+                vec![b'a'; 254],
+                256,
+            ),
+            (
+                [b"+1".as_slice(), &[b'a'; 255], b"/"].concat(),
+                1,
+                vec![b'a'; 254],
+                256,
+            ),
+        ];
+        for (source, index, expected, consumed) in cases {
+            let mut vm = BinaryVm::new("definition.scn", vec![0; 7]).unwrap();
+            let address = 0x2000_0000;
+            vm.allocations
+                .insert(address, [source.as_slice(), &[0]].concat());
+            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            let index = TextStringIndex::try_from(index).unwrap();
+            vm.text_strings.insert(index, [0xa5; 256]);
+            let cursor = vm.text_cursor;
+            assert!(matches!(
+                vm.text_item().unwrap(),
+                TextItem::Control { clock: false }
+            ));
+            assert_eq!(vm.async_text.as_ref().unwrap().offset, consumed);
+            assert_eq!(vm.text_cursor, cursor);
+            let slot = vm.text_strings[&index];
+            assert_eq!(&slot[..expected.len()], expected);
+            assert_eq!(slot[expected.len()], 0);
+            assert!(slot[expected.len() + 1..].iter().all(|&byte| byte == 0xa5));
+            digest.update((consumed as u32).to_le_bytes());
+            digest.update(slot);
+            vm.select_text_context(1);
+            assert_eq!(vm.text_strings[&index], slot);
+        }
+        // Original 4336e6 and 431d60 executed for all eight cases.
+        assert_eq!(
+            format!("{:x}", digest.finalize()),
+            "903d19c2ce20075b455338e11a529a5e67eb13bf38c600d32487e920547e2ffe"
+        );
+        for source in [b"+257bad/".as_slice(), b"+-1bad/", b"+{1}bad/"] {
+            let mut vm = BinaryVm::new("invalid.scn", vec![0; 7]).unwrap();
+            let address = 0x2000_0000;
+            vm.allocations.insert(address, [source, &[0]].concat());
+            vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+            assert!(vm.text_item().is_err());
+            assert!(vm.text_strings.is_empty());
+            assert_eq!(vm.async_text.as_ref().unwrap().offset, 0);
+        }
+    }
+
+    #[test]
+    fn escaped_plus_is_a_glyph_and_unescaped_plus_defines_the_following_bytes() {
+        let mut vm = BinaryVm::new("definition.scn", vec![0; 7]).unwrap();
+        let address = 0x2000_0000;
+        vm.allocations.insert(address, b"++\0".to_vec());
+        vm.async_text = Some(AsyncText::new(0, 0, address, vm.location()));
+        vm.text_style.fullwidth_ascii = false;
+        assert!(matches!(vm.text_item().unwrap(), TextItem::Glyph));
+        let glyph = vm.text_glyph().unwrap().unwrap();
+        assert_eq!(glyph.character, '+');
+        assert_eq!(glyph.offset, 2);
+        assert!(vm.text_strings.is_empty());
+
+        // The localized HANAOTO source uses an omitted index before E4508.
+        let (source, _, bad) = encoding_rs::BIG5.encode("+E4508，很不好意思啊。");
+        assert!(!bad);
+        vm.allocations
+            .insert(address, [source.as_ref(), &[0]].concat());
+        assert!(matches!(
+            vm.text_item().unwrap(),
+            TextItem::Control { clock: false }
+        ));
+        assert_eq!(vm.async_text.as_ref().unwrap().offset, source.len());
+        let slot = &vm.text_strings[&TextStringIndex::try_from(0).unwrap()];
+        assert_eq!(&slot[..source.len() - 1], &source[1..]);
+        assert!(matches!(vm.text_item().unwrap(), TextItem::End));
+    }
+
     #[test]
     fn inline_markers_match_native_numbers_and_remain_available_to_opcode_0069() {
         // v2.48 4337ac and 431d60. Offsets include the leading tilde.
