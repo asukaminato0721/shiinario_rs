@@ -33,6 +33,15 @@ struct Fade {
     stop: bool,
 }
 impl Voice {
+    fn total_frames(&self) -> Option<u64> {
+        let count = self.stream.sound.samples.len() as u64 / u64::from(self.stream.sound.channels);
+        if !self.looping {
+            return Some(count);
+        }
+        let range = self.stream.loop_range?;
+        (range.repeats != 0)
+            .then(|| count + u64::from(range.repeats - 1) * (range.end - range.start))
+    }
     /// Advance on the output clock, independently of SCN scheduling. Returns
     /// true when the fade has stopped this voice.
     fn advance_fade(&mut self, frames: u64, rate: u32) -> bool {
@@ -68,7 +77,25 @@ impl Voice {
         if count == 0 {
             return None;
         }
-        let index = if frame < count as u64 {
+        let index = if self.looping
+            && let Some(range) = self.stream.loop_range
+        {
+            let cycle = range.end - range.start;
+            if let Some(total) = self.total_frames()
+                && frame >= total
+            {
+                return None;
+            }
+            if frame < range.end {
+                frame as usize
+            } else if range.repeats != 0
+                && frame >= range.end + u64::from(range.repeats - 1) * cycle
+            {
+                (frame - u64::from(range.repeats - 1) * cycle) as usize
+            } else {
+                (range.start + (frame - range.end) % cycle) as usize
+            }
+        } else if frame < count as u64 {
             frame as usize
         } else if self.looping {
             // Original 454790 leaves the decoded-byte counter at EOF. After
@@ -167,14 +194,12 @@ impl Mixer {
             if voice.frame_at(voice.frame).is_none() {
                 return false;
             }
-            let frames = if voice.looping {
-                frames
-            } else {
-                let count =
-                    voice.stream.sound.samples.len() / usize::from(voice.stream.sound.channels);
-                let remaining = ((count as u64 - voice.frame) * 48000 - voice.fraction)
+            let frames = if let Some(count) = voice.total_frames() {
+                let remaining = ((count - voice.frame) * 48000 - voice.fraction)
                     .div_ceil(u64::from(voice.stream.sound.sample_rate));
                 frames.min(remaining)
+            } else {
+                frames
             };
             if voice.advance_fade(frames, 48000) {
                 return false;
@@ -232,6 +257,12 @@ impl Mixer {
             stream.loop_start_frame == 0 && stream.first_block_frames <= frames,
             "unresolved stream loop range"
         );
+        if let Some(range) = stream.loop_range {
+            ensure!(
+                range.start < range.end && range.end <= frames as u64,
+                "invalid audio loop frame range"
+            );
+        }
         ensure!(
             frames == 0 || stream.first_block_frames > 0,
             "missing stream block size"
@@ -480,6 +511,49 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
 mod tests {
     use super::*;
     use crate::resources::{Resources, Sound};
+    #[test]
+    fn configured_loops_repeat_the_range_and_finite_loops_keep_the_final_tail() {
+        use crate::resources::AudioLoopRange;
+        for (repeats, expected) in [
+            (0, vec![0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 2, 3, 4, 5, 2, 3]),
+            (1, vec![0, 1, 2, 3, 4, 5, 6, 7]),
+            (2, vec![0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7]),
+            (3, vec![0, 1, 2, 3, 4, 5, 2, 3, 4, 5, 2, 3, 4, 5, 6, 7]),
+        ] {
+            let stream = Arc::new(AudioStream {
+                sound: Sound {
+                    sample_rate: 1000,
+                    channels: 1,
+                    samples: (0..8).map(|i| i * 1024).collect(),
+                },
+                loop_start_frame: 0,
+                first_block_frames: 1,
+                loop_range: Some(AudioLoopRange {
+                    start: 2,
+                    end: 6,
+                    repeats,
+                }),
+                volume: StreamVolume::default(),
+            });
+            let mut mixer = Mixer::default();
+            mixer.play(1, stream.clone(), 2).unwrap();
+            let mut output = vec![0.0; 16];
+            mixer.render(&mut output, 1000, 1).unwrap();
+            let mut expected_pcm: Vec<_> = expected.iter().map(|&i| i as f32 / 32.0).collect();
+            expected_pcm.resize(16, 0.0);
+            assert_eq!(output, expected_pcm);
+            mixer.play(1, stream.clone(), 2).unwrap();
+            mixer.advance_ms(if repeats == 0 {
+                10000
+            } else {
+                expected.len() as u32
+            });
+            assert_eq!(mixer.is_playing(1), repeats == 0);
+            mixer.play(1, stream, 0).unwrap();
+            mixer.advance_ms(8);
+            assert!(!mixer.is_playing(1));
+        }
+    }
     fn synthetic() -> Arc<AudioStream> {
         let ogg = include_bytes!("../../shiinario_assets/tests/fixtures/sine.ogg");
         let mut data = b"OGV\0".to_vec();
@@ -604,6 +678,7 @@ mod tests {
             },
             loop_start_frame: 0,
             first_block_frames: 1,
+            loop_range: None,
             volume: StreamVolume::default(),
         });
         mixer.play(23, stream, 0).unwrap(); // same numeric handle uses separate channel
@@ -725,6 +800,7 @@ mod tests {
             },
             loop_start_frame: 0,
             first_block_frames: 1,
+            loop_range: None,
             volume: StreamVolume::default(),
         });
         let mut mixer = Mixer::default();

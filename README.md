@@ -140,6 +140,10 @@ waiting. Input timestamps use elapsed u64 milliseconds and continue across the
 engine's u32 clock wrap. `--summary --tail-events 2000` keeps recent events for
 diagnosing a stalled replay.
 
+Configured audio loops use decoded PCM frame boundaries. Native decoder block
+effects at configured loop endpoints do not have sample-by-sample verification.
+Changing a loop during active playback reports an error.
+
 Extraction writes only to the explicitly provided output path. Reading, inspecting,
 verifying, and tracing do not write to the installation. Keep extracted assets and
 research artifacts outside this repository. No alternative save format is created.

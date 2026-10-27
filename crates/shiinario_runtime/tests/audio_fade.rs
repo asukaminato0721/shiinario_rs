@@ -14,6 +14,7 @@ fn stream(percent: u32) -> Arc<AudioStream> {
         },
         loop_start_frame: 0,
         first_block_frames: 16,
+        loop_range: None,
         volume: StreamVolume::default(),
     });
     stream.volume.set_percent(percent).unwrap();

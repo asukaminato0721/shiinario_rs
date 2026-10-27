@@ -40,7 +40,15 @@ pub struct AudioStream {
     pub loop_start_frame: u64,
     /// First ov_read block after seeking to zero (at most 4096 PCM bytes).
     pub first_block_frames: usize,
+    pub loop_range: Option<AudioLoopRange>,
     pub volume: StreamVolume,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioLoopRange {
+    pub start: u64,
+    pub end: u64,
+    /// Zero repeats indefinitely. One plays the source once.
+    pub repeats: u32,
 }
 /// Shared with the audio callback so volume changes preserve playback position.
 pub struct StreamVolume {
@@ -648,6 +656,7 @@ impl Resources {
                 },
                 loop_start_frame: 0,
                 first_block_frames: first_block_samples / usize::from(info.channels),
+                loop_range: None,
                 volume: StreamVolume::default(),
             }),
         );
@@ -1471,8 +1480,59 @@ impl Resources {
         Ok((frames as u64 * 1000 / u64::from(sound.sample_rate)) as u32)
     }
 
+    fn set_audio_stream_loop(
+        &mut self,
+        handle: u32,
+        start_ms: u32,
+        end_ms: u32,
+        repeats: u32,
+    ) -> Result<()> {
+        let stream = self
+            .streams
+            .get_mut(&handle)
+            .context("unknown audio stream in loop setup")?;
+        let stream =
+            Arc::get_mut(stream).context("changing an active stream loop is unresolved")?;
+        let count = stream.sound.samples.len() as u64 / u64::from(stream.sound.channels);
+        let mut range = stream.loop_range.unwrap_or(AudioLoopRange {
+            start: stream.loop_start_frame,
+            end: count,
+            repeats: 0,
+        });
+        if start_ms != u32::MAX {
+            range.start = u64::from(start_ms) * u64::from(stream.sound.sample_rate) / 1000;
+        }
+        if end_ms != u32::MAX {
+            let duration = count * 1000 / u64::from(stream.sound.sample_rate);
+            range.end = if u64::from(end_ms) >= duration {
+                count
+            } else {
+                u64::from(end_ms) * u64::from(stream.sound.sample_rate) / 1000
+            };
+        }
+        if repeats != u32::MAX {
+            range.repeats = repeats;
+        }
+        ensure!(
+            range.start < range.end && range.end <= count,
+            "invalid audio loop range"
+        );
+        stream.loop_range = Some(range);
+        Ok(())
+    }
+
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        if let PlatformRequest::SetAudioStreamLoop {
+            handle,
+            start_ms,
+            end_ms,
+            repeats,
+        } = request
+        {
+            self.set_audio_stream_loop(*handle, *start_ms, *end_ms, *repeats)?;
+            return Ok(Some(1));
+        }
         if let PlatformRequest::GetAudioStreamFrequency { handle } = request {
             return Ok(Some(self.audio_stream_frequency(*handle)?));
         }
@@ -1632,6 +1692,56 @@ impl Resources {
 mod tests {
     use super::*;
     #[test]
+    fn loop_setup_converts_time_preserves_sentinels_and_rejects_invalid_updates() {
+        let mut resources = Resources::default();
+        resources.streams.insert(
+            1,
+            Arc::new(AudioStream {
+                sound: Sound {
+                    sample_rate: 44100,
+                    channels: 2,
+                    samples: vec![0; 88246],
+                },
+                loop_start_frame: 0,
+                first_block_frames: 1024,
+                loop_range: None,
+                volume: StreamVolume::default(),
+            }),
+        );
+        resources
+            .set_audio_stream_loop(1, 100, 1000, u32::MAX)
+            .unwrap();
+        let range = AudioLoopRange {
+            start: 4410,
+            end: 44123,
+            repeats: 0,
+        };
+        assert_eq!(resources.streams[&1].loop_range, Some(range));
+        resources
+            .set_audio_stream_loop(1, u32::MAX, u32::MAX, 3)
+            .unwrap();
+        let range = AudioLoopRange {
+            repeats: 3,
+            ..range
+        };
+        assert_eq!(resources.streams[&1].loop_range, Some(range));
+        assert!(
+            resources
+                .set_audio_stream_loop(1, 1001, u32::MAX, 0)
+                .is_err()
+        );
+        assert_eq!(resources.streams[&1].loop_range, Some(range));
+        let playing = resources.streams[&1].clone();
+        assert!(
+            resources
+                .set_audio_stream_loop(1, 200, u32::MAX, 0)
+                .is_err()
+        );
+        assert_eq!(playing.loop_range, Some(range));
+        assert!(resources.set_audio_stream_loop(0, 0, 1, 0).is_err());
+    }
+
+    #[test]
     fn stream_frequency_uses_the_decoded_rate_and_handles_null() {
         let mut resources = Resources::default();
         assert_eq!(resources.audio_stream_frequency(0).unwrap(), 0);
@@ -1647,6 +1757,7 @@ mod tests {
                     },
                     loop_start_frame: 0,
                     first_block_frames: 100,
+                    loop_range: None,
                     volume: StreamVolume::default(),
                 }),
             );
@@ -1670,6 +1781,7 @@ mod tests {
                         },
                         loop_start_frame: 0,
                         first_block_frames: frames,
+                        loop_range: None,
                         volume: StreamVolume::default(),
                     }),
                 );
