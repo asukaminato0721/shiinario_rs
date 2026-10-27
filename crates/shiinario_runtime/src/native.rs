@@ -341,6 +341,8 @@ impl Host for NativeHost {
                 Ok(old)
             }
             PlatformRequest::FindWindow { .. } => Ok(0),
+            // No menu exists for the null handle. DestroyMenu returns FALSE.
+            PlatformRequest::DestroyMenu { menu: 0 } => Ok(0),
             // The verified startup has an empty INI search prefix; the original
             // command returns its operand default even when RANDL.ini exists.
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),

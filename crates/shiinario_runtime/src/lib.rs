@@ -339,6 +339,8 @@ impl Host for TracePlatform {
                 Ok(old)
             }
             PlatformRequest::FindWindow { .. } => Ok(0),
+            // No menu exists for the null handle. DestroyMenu returns FALSE.
+            PlatformRequest::DestroyMenu { menu: 0 } => Ok(0),
             PlatformRequest::SetWindowTitle { window: 0, .. } => Ok(1),
             _ => bail!("unsupported simulated platform request: {request:?}"),
         }
