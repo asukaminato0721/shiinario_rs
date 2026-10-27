@@ -265,6 +265,9 @@ pub enum PlatformRequest {
     GetAudioStreamFrequency {
         handle: u32,
     },
+    GetAudioStreamDuration {
+        handle: u32,
+    },
     FadeAudioStream {
         handle: u32,
         interval: u32,
@@ -2756,12 +2759,13 @@ impl BinaryVm {
                 }
                 request = Some(PlatformRequest::FillSurface { id, rect, color });
             }
-            0x06e3 | 0x06e6 | 0x06e8 => {
+            0x06e3 | 0x06e6 | 0x06e8 | 0x06f0 => {
                 let handle = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(match opcode {
                     0x06e6 => PlatformRequest::GetAudioStreamFrequency { handle },
                     0x06e8 => PlatformRequest::GetAudioStreamStatus { handle },
+                    0x06f0 => PlatformRequest::GetAudioStreamDuration { handle },
                     _ => PlatformRequest::GetAudioStreamVolume { handle },
                 });
             }
