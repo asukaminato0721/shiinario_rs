@@ -2342,6 +2342,28 @@ impl BinaryVm {
                         *byte = !*byte;
                     }
                     memory_write = Some((destination, bytes));
+                } else if self
+                    .memory_read(address, native_helper::IMAGE_COPY_CODE_SIZE)
+                    .is_ok_and(|code| native_helper::is_image_copy(&code))
+                {
+                    // HANAOTO start.SCN:0x48c83 reads the current task stack.
+                    let target = self.banks[&8][self.bank_index(8, 0)?];
+                    let source = self.banks[&8][self.bank_index(8, 1)?];
+                    ensure!(
+                        u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
+                            || u64::from(target) + native_helper::IMAGE_COPY_TARGET_SIZE as u64
+                                <= u64::from(source),
+                        "overlapping native image copy buffers are unresolved"
+                    );
+                    let destination =
+                        self.memory_range(target, native_helper::IMAGE_COPY_TARGET_SIZE)?;
+                    let mut bytes =
+                        self.memory_read(target, native_helper::IMAGE_COPY_TARGET_SIZE)?;
+                    native_helper::copy_image_rows(
+                        &self.memory_read(source, native_helper::SOURCE_SIZE)?,
+                        &mut bytes,
+                    )?;
+                    memory_write = Some((destination, bytes));
                 } else {
                     let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
                         .iter()
@@ -4897,6 +4919,78 @@ mod tests {
             12,
             [0, 1],
         )
+    }
+
+    #[test]
+    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
+    fn original_hanaoto_image_copy_checks_code_and_preserves_padding() -> Result<()> {
+        use sha2::{Digest, Sha256};
+        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
+            .context("set SHIINARIO_HANAOTO_START_SCN")?;
+        let original = std::fs::read(path)?;
+        let source: Vec<_> = (0..native_helper::SOURCE_SIZE)
+            .map(|i| (i * 37 + (i / 97) * 13) as u8)
+            .collect();
+        for alignment in 0..4 {
+            // 0: normal, 1: changed code, 2: incomplete code, 3/4: short
+            // source/target, 5: overlapping buffers, 6: exact target extent.
+            for case in 0..7 {
+                let mut code = original[..0x48c83 + native_helper::IMAGE_COPY_CODE_SIZE].to_vec();
+                if case == 1 {
+                    code[0x48c83 + 50] ^= 1;
+                } else if case == 2 {
+                    code.pop();
+                }
+                let mut vm = BinaryVm::new("start.scn", code)?;
+                vm.pc = 0xe1a1;
+                vm.sp = 962;
+                let target_offset = 16 + alignment;
+                let target = if case == 5 {
+                    0x5000_0020
+                } else {
+                    0x6000_0000 + target_offset as u32
+                };
+                vm.banks.get_mut(&8).unwrap()[962..964].copy_from_slice(&[target, 0x5000_0010]);
+                let mut input = vec![0xa5; 16];
+                input.extend_from_slice(&source);
+                if case == 3 {
+                    input.pop();
+                } else {
+                    input.extend_from_slice(&[0xa5; 16]);
+                }
+                let extent = target_offset + native_helper::IMAGE_COPY_TARGET_SIZE;
+                let output_size = match case {
+                    4 => extent - 1,
+                    6 => extent,
+                    _ => extent + 20,
+                };
+                vm.allocations.insert(0x5000_0000, input);
+                vm.allocations.insert(0x6000_0000, vec![0xa5; output_size]);
+                let allocations = vm.allocations.clone();
+                let banks = vm.banks.clone();
+                if (1..=5).contains(&case) {
+                    assert!(vm.step().is_err());
+                    assert_eq!(vm.pc, 0xe1a1);
+                    assert_eq!(vm.allocations, allocations);
+                } else {
+                    vm.step()?;
+                    assert_eq!(vm.pc, 0xe1a8);
+                    let output = &vm.allocations[&0x6000_0000];
+                    assert!(output[..target_offset].iter().all(|&b| b == 0xa5));
+                    assert!(output[extent..].iter().all(|&b| b == 0xa5));
+                    let mut image = output[target_offset..extent].to_vec();
+                    image.extend_from_slice(&[0xa5; 4]);
+                    assert_eq!(
+                        format!("{:x}", Sha256::digest(&image)),
+                        "d6bfb24b587525c1d890152ab8fbe5dce1e62d997b150934a2dc512a96dd86a3"
+                    );
+                    assert_eq!(vm.allocations[&0x5000_0000], allocations[&0x5000_0000]);
+                }
+                assert_eq!(vm.sp, 962);
+                assert_eq!(vm.banks, banks);
+            }
+        }
+        Ok(())
     }
 
     #[test]
