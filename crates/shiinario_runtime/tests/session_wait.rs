@@ -74,6 +74,8 @@ impl Host for TestHost {
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         self.requests += 1;
         match request {
+            PlatformRequest::SetWindowTitle { window: 0, .. } => Ok(1),
+            PlatformRequest::FindWindow { .. } => Ok(0),
             PlatformRequest::ClockMilliseconds => Ok(self.now),
             PlatformRequest::ReadScanKey { scan } => Ok(if self.scan_keys.contains(scan) {
                 0x80
@@ -111,6 +113,73 @@ impl Host for TestHost {
     }
     fn play_stream(&mut self, _: u32, _: Arc<AudioStream>, _: u32) -> Result<()> {
         Ok(())
+    }
+}
+
+#[test]
+fn window_titles_use_story_encoding_before_the_first_story_load() {
+    for (codec, story, title) in [
+        (
+            encoding_rs::BIG5,
+            "善意的虛偽，勝於引起爭端的事實。",
+            "花與乙女的祝福",
+        ),
+        (encoding_rs::SHIFT_JIS, "日本語の文章です。", "日本語の窓"),
+        (encoding_rs::SHIFT_JIS, "ASCII only", "Example Game"),
+    ] {
+        let game = Game::new();
+        let (sample, _, bad) = codec.encode(story);
+        assert!(!bad);
+        // The loose story overrides the synthetic archive's fixture.txt.
+        std::fs::write(game.0.join("fixture.txt"), sample).unwrap();
+        let (encoded_title, _, bad) = codec.encode(title);
+        assert!(!bad);
+        if codec == encoding_rs::BIG5 {
+            // The title alone is valid CP932 as well. A per-title fallback
+            // cannot detect this game's encoding without a story sample.
+            assert!(
+                encoding_rs::SHIFT_JIS
+                    .decode_without_bom_handling_and_without_replacement(&encoded_title)
+                    .is_some()
+            );
+        }
+        let mut code = 0x07a8u16.to_le_bytes().to_vec();
+        code.extend([4, 0, 0, 0, 0, 0x10]);
+        code.extend_from_slice(&encoded_title);
+        code.push(0);
+        code.extend(0x07b2u16.to_le_bytes());
+        code.extend(b"\x10ShiinaRio\0\x10");
+        code.extend_from_slice(&encoded_title);
+        code.extend([0, 12, 0, 0]);
+        code.extend([0, 0, 4, 0, 0, 0, 0]);
+        std::fs::write(game.0.join("wait.scn"), code).unwrap();
+        let project = Project::open(&game.0).unwrap();
+        let mut session = Session::new(&project, "wait.scn").unwrap();
+        let mut host = TestHost::default();
+        let mut titles = Vec::new();
+        let ended = (0..100).any(|_| {
+            !session
+                .step(&project, &mut host, |event| {
+                    if let Event::Platform { request, .. } = event {
+                        match request {
+                            PlatformRequest::SetWindowTitle { title, .. }
+                            | PlatformRequest::FindWindow { title, .. } => {
+                                titles.push(title.clone())
+                            }
+                            PlatformRequest::LoadAsset { .. }
+                            | PlatformRequest::BeginAssetLoad { .. }
+                            | PlatformRequest::ReadAssetInto { .. } => {
+                                panic!("title must precede story loading")
+                            }
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                })
+                .unwrap()
+        });
+        assert!(ended);
+        assert_eq!(titles, [title, title]);
     }
 }
 
