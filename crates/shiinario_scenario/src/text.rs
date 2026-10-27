@@ -332,7 +332,7 @@ fn number(bytes: &[u8], at: &mut usize) -> Result<u32> {
     parse_number(bytes, at, false)
 }
 
-fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) -> Result<u32> {
+pub(crate) fn parse_number(bytes: &[u8], at: &mut usize, allow_omitted: bool) -> Result<u32> {
     while bytes.get(*at) == Some(&b' ') {
         *at += 1;
     }
