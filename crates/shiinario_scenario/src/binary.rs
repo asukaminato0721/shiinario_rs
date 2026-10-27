@@ -662,6 +662,7 @@ pub struct BinaryVm {
     allocations: std::collections::BTreeMap<u32, Vec<u8>>,
     shared_regions: std::collections::BTreeMap<u32, SharedMemory>,
     surface_regions: std::collections::BTreeMap<u32, u32>,
+    image_regions: std::collections::BTreeMap<u32, (u32, SharedMemory)>,
     next_shared: u32,
     // Entry points are separate from the task's resumable program counter.
     task_entries: std::collections::BTreeMap<u32, (u32, usize)>,
@@ -771,6 +772,7 @@ impl BinaryVm {
             allocations: Default::default(),
             shared_regions: Default::default(),
             surface_regions: Default::default(),
+            image_regions: Default::default(),
             next_shared: 0x9000_0000,
             task_entries: Default::default(),
             current_task: 0,
@@ -1235,6 +1237,43 @@ impl BinaryVm {
         if let Some(destination) = destination {
             self.write(destination, value)?;
         }
+        match &event {
+            Event::Platform {
+                request: PlatformRequest::BindImageMemory { id, address },
+                ..
+            } => {
+                // A successful runtime bind shares the heap region first.
+                self.image_regions.remove(id);
+                if let Some(memory) = self.shared_regions.get(address) {
+                    self.image_regions.insert(*id, (*address, memory.clone()));
+                }
+            }
+            Event::Platform {
+                request: PlatformRequest::ReleaseImage { id },
+                ..
+            } => {
+                // Native 425b1a frees the slot's bound pointer, including
+                // externally loaded buffers bound through 04b2.
+                if let Some((address, memory)) = self.image_regions.remove(id)
+                    && self
+                        .shared_regions
+                        .get(&address)
+                        .is_some_and(|mapped| mapped.same_region(&memory))
+                {
+                    self.shared_regions.remove(&address);
+                }
+            }
+            Event::Platform {
+                request:
+                    PlatformRequest::LoadImage { id, .. } | PlatformRequest::CreateImage { id, .. },
+                ..
+            } => {
+                // Replacing an external binding does not free its caller-owned
+                // buffer (405b30/425b60 test the native ownership flag).
+                self.image_regions.remove(id);
+            }
+            _ => {}
+        }
         if let Event::Platform {
             request:
                 PlatformRequest::CreateSurface { id, .. } | PlatformRequest::ReleaseSurface { id },
@@ -1399,7 +1438,7 @@ impl BinaryVm {
                     .map(|(&base, memory)| (base, memory.len())),
             )
             .collect();
-        for (base, length) in regions {
+        for (&base, &length) in &regions {
             if address.checked_add(needed).is_some_and(|end| end <= base) {
                 break;
             }
@@ -1411,7 +1450,9 @@ impl BinaryVm {
             address
                 .checked_add(needed)
                 .is_some_and(|end| end < 0x3000_0000),
-            "VM allocation address space exhausted"
+            "VM allocation address space exhausted: requested={size}, live_regions={}, live_bytes={}",
+            regions.len(),
+            regions.values().sum::<usize>()
         );
         Ok(address)
     }
@@ -4558,6 +4599,59 @@ pub fn boot_binary(name: &str, data: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn releasing_a_bound_image_unmaps_heap_memory_and_preserves_reused_addresses() {
+        let address = 0x2000_0000;
+        let mut code = Vec::new();
+        for id in [5, 6] {
+            code.extend(instruction(
+                0x04b2,
+                &[immediate(id), immediate(address)].concat(),
+            ));
+        }
+        for id in [5, 6] {
+            code.extend(instruction(0x04b1, &immediate(id)));
+        }
+        let mut vm = BinaryVm::new("image-memory.scn", code).unwrap();
+        vm.allocations.insert(address, vec![42; 64]);
+        let old = vm.share_allocation(address).unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                vm.step().unwrap(),
+                Event::Platform {
+                    request: PlatformRequest::BindImageMemory { .. },
+                    ..
+                }
+            ));
+            vm.respond(1).unwrap();
+        }
+        assert!(vm.allocation_address(64).unwrap() > address);
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ReleaseImage { id: 5 },
+                ..
+            }
+        ));
+        vm.respond(1).unwrap();
+        assert!(vm.memory_read(address, 1).is_err());
+        assert_eq!(vm.allocation_address(64).unwrap(), address);
+        assert_eq!(old.read(0, 1).unwrap(), [42]);
+        vm.allocations.insert(address, vec![99; 64]);
+        let replacement = vm.share_allocation(address).unwrap();
+        assert!(matches!(
+            vm.step().unwrap(),
+            Event::Platform {
+                request: PlatformRequest::ReleaseImage { id: 6 },
+                ..
+            }
+        ));
+        vm.respond(1).unwrap();
+        assert_eq!(vm.memory_read(address, 1).unwrap(), [99]);
+        assert!(vm.shared_regions[&address].same_region(&replacement));
+        assert!(vm.image_regions.is_empty());
+    }
+
     #[test]
     fn cursor_warp_reads_signed_coordinates_without_destination_operands() {
         let mut code = instruction(
