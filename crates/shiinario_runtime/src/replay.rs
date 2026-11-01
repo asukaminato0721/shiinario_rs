@@ -1,5 +1,5 @@
 //! Deterministic input snapshots for long, headless gameplay runs.
-use crate::input::{AsyncKeys, ControlState};
+use crate::input::{AsyncKeys, ControlState, JoystickState};
 use anyhow::{Result, ensure};
 use serde::Deserialize;
 use shiinario_scenario::MouseButtonMapping;
@@ -21,6 +21,9 @@ pub struct InputFrame {
     /// Physical DirectInput scan-code indices, separate from virtual keys.
     #[serde(default)]
     pub scan_keys: Vec<u8>,
+    /// Device-zero WinMM axes (0..65535) and the raw 32-bit button word.
+    #[serde(default)]
+    pub joystick: Option<JoystickState>,
 }
 #[derive(Default)]
 pub(crate) struct Replay {
@@ -29,6 +32,7 @@ pub(crate) struct Replay {
     pub cursor: [i32; 2],
     mouse: u8,
     control_mask: u32,
+    pub joystick: Option<JoystickState>,
     pub keys: AsyncKeys,
     scan_keys: Vec<u8>,
     mapping: MouseButtonMapping,
@@ -62,6 +66,12 @@ impl Replay {
             frames.iter().all(|f| f.mouse_buttons & !7 == 0),
             "replay mouse buttons exceed mask 7"
         );
+        ensure!(
+            frames.iter().all(|frame| frame
+                .joystick
+                .is_none_or(|state| state.x <= 65535 && state.y <= 65535)),
+            "replay joystick axes exceed 65535"
+        );
         Ok(Self {
             frames,
             ..Default::default()
@@ -89,6 +99,7 @@ impl Replay {
             }
             self.mouse = frame.mouse_buttons;
             self.control_mask = frame.control_mask;
+            self.joystick = frame.joystick;
             self.scan_keys.clone_from(&frame.scan_keys);
             let alt = [0x12, 0xa4, 0xa5]
                 .iter()
@@ -113,9 +124,19 @@ impl Replay {
     pub fn controls(&self) -> u32 {
         ControlState {
             mouse_buttons: self.mapping.map_buttons(self.mouse),
+            joystick: self.joystick,
             ..Default::default()
         }
         .mask()
+            | self.control_mask
+    }
+    pub fn merged_controls(&self, joystick_enabled: bool) -> u32 {
+        ControlState {
+            mouse_buttons: self.mapping.map_buttons(self.mouse),
+            joystick: self.joystick,
+            ..Default::default()
+        }
+        .merged_mask(joystick_enabled)
             | self.control_mask
     }
     pub fn mouse_buttons(&self) -> [i32; 2] {
@@ -253,6 +274,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![],
                 scan_keys: vec![29],
+                joystick: None,
             },
             InputFrame {
                 at_ms: 10,
@@ -261,6 +283,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![17],
                 scan_keys: vec![],
+                joystick: None,
             },
         ])
         .unwrap();
@@ -283,6 +306,7 @@ mod tests {
                 control_mask: 256,
                 keys: vec![17],
                 scan_keys: vec![],
+                joystick: None,
             },
             InputFrame {
                 at_ms: 20,
@@ -291,6 +315,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![],
                 scan_keys: vec![],
+                joystick: None,
             },
         ])
         .unwrap();
@@ -319,6 +344,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![],
                 scan_keys: vec![],
+                joystick: None,
             },
             InputFrame {
                 at_ms: u64::from(u32::MAX) + 2,
@@ -327,6 +353,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![],
                 scan_keys: vec![],
+                joystick: None,
             },
         ])
         .unwrap();
@@ -349,6 +376,7 @@ mod tests {
                 control_mask: 0x100,
                 keys: vec![],
                 scan_keys: vec![],
+                joystick: None,
             },
             InputFrame {
                 at_ms: 20,
@@ -357,6 +385,7 @@ mod tests {
                 control_mask: 0,
                 keys: vec![],
                 scan_keys: vec![],
+                joystick: None,
             },
         ])
         .unwrap();

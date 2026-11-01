@@ -7,6 +7,8 @@ mod browser;
 mod buffer_audio;
 mod calendar;
 pub mod executor;
+#[cfg(not(target_arch = "wasm32"))]
+mod gamepad;
 pub mod input;
 mod main_loop;
 pub mod movie;
@@ -116,6 +118,8 @@ pub fn trace_with_options(
             replay: replay::Replay::new(input)?,
             tick_ms,
             enabled: simulate_platform,
+            joystick_enabled: input::InputSettings::from_values(&project.config.values)?
+                .joystick_enabled,
             ..Default::default()
         };
         let mut input_reload = input_reload.map(replay::InputReload::new).transpose()?;
@@ -200,6 +204,7 @@ pub fn trace_with_options(
 struct TracePlatform {
     replay: replay::Replay,
     enabled: bool,
+    joystick_enabled: bool,
     mixer: audio::Mixer,
     class_style: u32,
     clock_ms: u32,
@@ -210,6 +215,7 @@ impl Default for TracePlatform {
         Self {
             replay: Default::default(),
             enabled: true,
+            joystick_enabled: false,
             mixer: audio::Mixer::default(),
             class_style: 0xb,
             clock_ms: 0,
@@ -241,6 +247,7 @@ impl Host for TracePlatform {
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
+            PlatformRequest::ReadJoystick => Ok(input::JoystickState::reply(self.replay.joystick)),
             PlatformRequest::MouseButtons => Ok(self.replay.mouse_buttons()),
             PlatformRequest::CursorPosition => Ok(self.replay.cursor),
             PlatformRequest::MapCursor { point } => {
@@ -280,11 +287,16 @@ impl Host for TracePlatform {
                 self.replay.cursor = *position;
                 Ok(1)
             }
-            PlatformRequest::TextInput { clear } => {
-                Ok(if *clear { 0 } else { self.replay.controls() })
-            }
+            PlatformRequest::TextInput { clear } => Ok(if *clear {
+                0
+            } else {
+                self.replay.merged_controls(self.joystick_enabled)
+            }),
             PlatformRequest::ReadKeyState { key } => Ok(self.replay.keys.query(*key, true)),
             PlatformRequest::ReadControls => Ok(self.replay.controls()),
+            PlatformRequest::ReadMergedControls => {
+                Ok(self.replay.merged_controls(self.joystick_enabled))
+            }
             PlatformRequest::ReadMouseButtons => Ok(self.replay.mouse_button_mask()),
             PlatformRequest::ReadScanKey { scan } => Ok(self.replay.scan_key(*scan)),
             PlatformRequest::GetAudioStreamStatus { handle } => {
@@ -382,6 +394,7 @@ mod tests {
                         control_mask: 0,
                         keys: vec![],
                         scan_keys: vec![],
+                        joystick: None,
                     }])
                     .unwrap(),
                     ..Default::default()

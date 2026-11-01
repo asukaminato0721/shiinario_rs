@@ -56,6 +56,7 @@ impl Host for BrowserHost {
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
+            PlatformRequest::ReadJoystick => Ok([0, 0]),
             PlatformRequest::MouseButtons => {
                 let buttons = self.mapping.map_buttons(self.mouse);
                 Ok([i32::from(buttons & 1 != 0), i32::from(buttons & 2 != 0)])
@@ -96,7 +97,7 @@ impl Host for BrowserHost {
                     return Ok(0);
                 }
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
-                Ok(self.controls.mask() | if self.text_key { 0x10000 } else { 0 })
+                Ok(self.controls.merged_mask(false) | if self.text_key { 0x10000 } else { 0 })
             }
             PlatformRequest::ReadKeyState { key } => {
                 Ok(self.async_keys.query(*key, self.controls.focused))
@@ -104,6 +105,10 @@ impl Host for BrowserHost {
             PlatformRequest::ReadControls => {
                 self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
                 Ok(self.controls.mask())
+            }
+            PlatformRequest::ReadMergedControls => {
+                self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
+                Ok(self.controls.merged_mask(false))
             }
             PlatformRequest::ReadScanKey { scan } => Ok(
                 if self.controls.focused && self.controls.keys.get(*scan as usize) == Some(&true) {

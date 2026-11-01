@@ -1,7 +1,8 @@
 //! Native window, input and audio services for the shared scenario session.
 use crate::{
     audio::AudioOutput,
-    input::{AsyncKeys, ControlState},
+    gamepad::Joystick,
+    input::{AsyncKeys, ControlState, InputSettings, JoystickState},
     presentation::Presentation,
     resources::{AudioStream, Sound},
     session::{Host, Session, SessionState, Wake},
@@ -109,6 +110,8 @@ struct NativeHost {
     window: Arc<dyn Window>,
     started: Instant,
     controls: ControlState,
+    joystick: Joystick,
+    joystick_enabled: bool,
     async_keys: AsyncKeys,
     mouse: u8,
     mapping: MouseButtonMapping,
@@ -123,6 +126,15 @@ struct NativeHost {
     wake_input: bool,
 }
 impl NativeHost {
+    fn merged_controls(&mut self) -> u32 {
+        self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
+        self.controls.joystick = if self.controls.focused && self.joystick_enabled {
+            self.joystick.query()
+        } else {
+            None
+        };
+        self.controls.merged_mask(self.joystick_enabled)
+    }
     fn key(&mut self, virtual_key: usize, pressed: bool) {
         self.async_keys.set(virtual_key, pressed);
     }
@@ -178,6 +190,7 @@ impl Host for NativeHost {
     }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]> {
         match request {
+            PlatformRequest::ReadJoystick => Ok(JoystickState::reply(self.joystick.query())),
             PlatformRequest::MouseButtons => {
                 let buttons = self.mapping.map_buttons(self.mouse);
                 Ok([i32::from(buttons & 1 != 0), i32::from(buttons & 2 != 0)])
@@ -244,16 +257,17 @@ impl Host for NativeHost {
                     self.text_key = false;
                     return Ok(0);
                 }
-                self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
-                Ok(self.controls.mask() | if self.text_key { 0x10000 } else { 0 })
+                Ok(self.merged_controls() | if self.text_key { 0x10000 } else { 0 })
             }
             PlatformRequest::ReadKeyState { key } => {
                 Ok(self.async_keys.query(*key, self.controls.focused))
             }
             PlatformRequest::ReadControls => {
-                self.controls.mouse_buttons = self.mapping.map_buttons(self.mouse);
-                Ok(self.controls.mask())
+                let merged = self.merged_controls();
+                // Native 03e9 queries again outside the focus/configuration gate.
+                Ok(merged | self.joystick.query().map_or(0, JoystickState::mask))
             }
+            PlatformRequest::ReadMergedControls => Ok(self.merged_controls()),
             PlatformRequest::ReadScanKey { scan } => Ok(
                 if self.controls.focused && self.controls.keys.get(*scan as usize) == Some(&true) {
                     0x80
@@ -393,6 +407,9 @@ impl App<'_> {
                 focused: window.has_focus(),
                 ..Default::default()
             },
+            joystick: Joystick::new(),
+            joystick_enabled: InputSettings::from_values(&self.project.config.values)?
+                .joystick_enabled,
             window,
             started: Instant::now(),
             async_keys: AsyncKeys::default(),

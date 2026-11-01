@@ -15,6 +15,25 @@ cargo b -r
 
 Copy `target/release/shiinario_engine` into the game directory and run it.
 
+Desktop joystick input follows the original engine's device-zero queries.
+Windows uses `joyGetPosEx`. Linux and macOS convert raw device axes to the WinMM
+range and retain native button order. The ordinary control mask uses X/Y and
+buttons 1 and 2. It uses the original asymmetric axis thresholds.
+
+`Joypad` enables joystick input in text and repeated-control queries. `Joystick`
+is an alias and overrides `Joypad` when both keys exist. These queries require
+foreground focus. Commands `0x03e9` and `0x03fc` also read the joystick when this
+setting is zero or the window lacks focus. Command `0x03fc` returns direction
+bits and the complete raw button word separately. No joystick input generates
+keyboard or mouse messages. The game script determines which menus support it.
+The reference game's title and NMS scripts discard direction bits. Setting
+`Joypad=1` does not enable direction navigation in these menus.
+
+`KeyRepeatDelay` and `KeyRepeatSpeed` retain their original defaults of 300 ms
+and 50 ms. See [original input research](docs/GAMEPAD_RESEARCH.md) for query
+addresses and mappings. Device input is not yet available in the browser,
+Android or FreeBSD players.
+
 Branch pushes build Linux, macOS and Windows binaries for x86_64 and ARM64,
 plus FreeBSD x86_64. The GitHub Actions workflow uploads archives containing
 `shiinario_engine` and `shiinario_tool` and refreshes the rolling `pre-release`
@@ -35,7 +54,8 @@ for supported patterns and limitations.
 
 Development
 
-On Linux, CPAL requires ALSA development headers and pkg-config:
+On Linux, CPAL requires ALSA development headers and pkg-config. Joystick input
+uses `/dev/input/js0` through the kernel joydev interface:
 
 ```sh
 cargo build --workspace --release --locked
@@ -129,6 +149,10 @@ logical `cursor: [x, y]`, `mouse_buttons` (left/right/middle bits), `keys` (Wind
 virtual-key numbers), and `control_mask` (`256` holds the engine's skip control).
 `scan_keys` supplies physical DirectInput scan-code indices for opcode `03ec`.
 It is separate from virtual keys. For example, left Ctrl has scan code `29`.
+Optional `joystick: {"x": 32768, "y": 0, "buttons": 1}` supplies device-zero
+axes in the range 0..65535 and a raw 32-bit button word. Omit `joystick` or set
+it to `null` to simulate an unavailable device. Joystick replay does not create
+keyboard or mouse messages.
 Omit `cursor` in keyboard frames to preserve script pointer movements.
 Opcode `0457` moves the engine cursor. Native windows also request a physical
 pointer warp. The engine retains its logical position when the platform denies
