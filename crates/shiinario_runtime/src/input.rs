@@ -1,6 +1,57 @@
 //! Control masks recovered from the original v2.47 input functions.
 //! Device acquisition and event timing belong to the platform host.
 
+use anyhow::{Context, Result};
+use std::collections::BTreeMap;
+
+#[derive(Clone, Copy)]
+pub(crate) struct InputSettings {
+    pub joystick_enabled: bool,
+    repeat_delay: u32,
+    repeat_speed: u32,
+}
+impl Default for InputSettings {
+    fn default() -> Self {
+        Self {
+            joystick_enabled: false,
+            repeat_delay: 300,
+            repeat_speed: 50,
+        }
+    }
+}
+impl InputSettings {
+    pub fn from_values(values: &BTreeMap<String, String>) -> Result<Self> {
+        fn read(values: &BTreeMap<String, String>, key: &str, default: u32) -> Result<u32> {
+            let value = values
+                .get(key)
+                .map(|value| {
+                    value
+                        .parse::<i32>()
+                        .with_context(|| format!("invalid {key} configuration"))
+                })
+                .transpose()?;
+            Ok(value
+                .filter(|value| *value != -1)
+                .map_or(default, |value| value as u32))
+        }
+        let defaults = Self::default();
+        // Native 4085f2 reads Joypad before its Joystick alias. -1 means no change.
+        let joypad = read(values, "joypad", 0)?;
+        Ok(Self {
+            joystick_enabled: read(values, "joystick", joypad)? != 0,
+            repeat_delay: read(values, "keyrepeatdelay", defaults.repeat_delay)?,
+            repeat_speed: read(values, "keyrepeatspeed", defaults.repeat_speed)?,
+        })
+    }
+
+    pub fn repeat(self) -> ControlRepeat {
+        ControlRepeat {
+            settings: self,
+            ..Default::default()
+        }
+    }
+}
+
 /// Opcode 03e8 sign-extends GetAsyncKeyState's SHORT, then applies the
 /// engine's activation flag. The query itself still occurs when inactive.
 pub fn key_state_reply(raw: i16, active: bool) -> u32 {
@@ -25,6 +76,7 @@ pub(crate) struct ControlRepeat {
     phase: u8,
     epoch: u32,
     delay: u32,
+    settings: InputSettings,
 }
 impl ControlRepeat {
     pub fn query(&mut self, mask: u32, now: u32) -> u32 {
@@ -36,13 +88,13 @@ impl ControlRepeat {
         let previous = std::mem::replace(&mut self.mask, mask);
         if previous & mask != mask || self.phase == 0 {
             self.epoch = now;
-            self.delay = 300;
+            self.delay = self.settings.repeat_delay;
             self.phase = 2;
             return mask;
         }
         if self.phase == 1 {
             self.epoch = now;
-            self.delay = 50;
+            self.delay = self.settings.repeat_speed;
             self.phase = 2;
             return mask;
         }
@@ -90,14 +142,15 @@ impl AsyncKeys {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JoystickState {
     pub x: u32,
     pub y: u32,
     pub buttons: u32,
 }
 impl JoystickState {
-    pub fn mask(self) -> u32 {
+    pub fn directions(self) -> u32 {
         let mut mask = 0;
         if self.x < 0x2000 {
             mask |= 4;
@@ -111,6 +164,10 @@ impl JoystickState {
         if self.y > 0xdfff {
             mask |= 2;
         }
+        mask
+    }
+    pub fn mask(self) -> u32 {
+        let mut mask = self.directions();
         if self.buttons & 1 != 0 {
             mask |= 0x20;
         }
@@ -118,6 +175,13 @@ impl JoystickState {
             mask |= 0x10;
         }
         mask
+    }
+
+    /// Preserve all 32 raw button bits in the second script destination.
+    pub fn reply(state: Option<Self>) -> [i32; 2] {
+        state.map_or([0, 0], |state| {
+            [state.directions() as i32, state.buttons as i32]
+        })
     }
 }
 
@@ -140,8 +204,27 @@ impl Default for ControlState {
     }
 }
 impl ControlState {
+    /// Native 03e9 includes a joystick query outside the focus/configuration gate.
     pub fn mask(&self) -> u32 {
-        let mut mask = self.joystick.map_or(0, JoystickState::mask);
+        self.keyboard_mouse_mask() | self.joystick.map_or(0, JoystickState::mask)
+    }
+
+    /// Native 414490: text and repeated controls require foreground focus.
+    pub fn merged_mask(&self, joystick_enabled: bool) -> u32 {
+        if self.focused {
+            self.keyboard_mouse_mask()
+                | if joystick_enabled {
+                    self.joystick.map_or(0, JoystickState::mask)
+                } else {
+                    0
+                }
+        } else {
+            0
+        }
+    }
+
+    fn keyboard_mouse_mask(&self) -> u32 {
+        let mut mask = 0;
         if !self.focused {
             return mask;
         }
@@ -183,6 +266,99 @@ impl ControlState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joystick_thresholds_and_raw_buttons_match_native_queries() {
+        for (x, y, expected) in [
+            (0x1fff, 0x8000, 4),
+            (0x2000, 0x8000, 0),
+            (0xdfff, 0x8000, 0),
+            (0xe000, 0x8000, 8),
+            (0x8000, 0x3fff, 1),
+            (0x8000, 0x4000, 0),
+            (0x8000, 0xdfff, 0),
+            (0x8000, 0xe000, 2),
+        ] {
+            let state = JoystickState {
+                x,
+                y,
+                buttons: 0x8000_0003,
+            };
+            assert_eq!(state.mask(), expected | 0x30);
+            assert_eq!(
+                JoystickState::reply(Some(state)),
+                [expected as i32, 0x8000_0003u32 as i32]
+            );
+        }
+        assert_eq!(JoystickState::reply(None), [0, 0]);
+    }
+
+    #[test]
+    fn direct_joystick_queries_bypass_the_merged_focus_and_configuration_gates() {
+        let mut controls = ControlState {
+            joystick: Some(JoystickState {
+                x: 0,
+                y: 0,
+                buttons: 3,
+            }),
+            mouse_buttons: 4,
+            ..Default::default()
+        };
+        controls.keys[0x1d] = true;
+        for focused in [false, true] {
+            controls.focused = focused;
+            assert_eq!(controls.mask(), if focused { 0x935 } else { 0x35 });
+            for enabled in [false, true] {
+                let expected = if focused {
+                    0x900 | if enabled { 0x35 } else { 0 }
+                } else {
+                    0
+                };
+                assert_eq!(controls.merged_mask(enabled), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn joystick_alias_and_repeat_settings_preserve_native_override_order() {
+        let values = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        for (pairs, expected) in [
+            (vec![], false),
+            (vec![("joypad", "1")], true),
+            (vec![("joypad", "1"), ("joystick", "0")], false),
+            (vec![("joypad", "0"), ("joystick", "1")], true),
+            (vec![("joypad", "1"), ("joystick", "-1")], true),
+        ] {
+            assert_eq!(
+                InputSettings::from_values(&values(&pairs))
+                    .unwrap()
+                    .joystick_enabled,
+                expected
+            );
+        }
+        let settings = InputSettings::from_values(&values(&[
+            ("keyrepeatdelay", "5"),
+            ("keyrepeatspeed", "2"),
+        ]))
+        .unwrap();
+        let mut repeat = settings.repeat();
+        for (now, expected) in [
+            (0, 0x20),
+            (4, 0),
+            (5, 0),
+            (5, 0x20),
+            (6, 0),
+            (7, 0),
+            (7, 0x20),
+        ] {
+            assert_eq!(repeat.query(0x20, now), expected);
+        }
+    }
+
     #[test]
     fn control_repeat_waits_rearms_and_resets_across_clock_wrap() {
         for epoch in [0u32, u32::MAX - 100] {

@@ -119,6 +119,60 @@ impl Host for TestHost {
 }
 
 #[test]
+fn joystick_script_queries_preserve_configuration_bypass_and_raw_buttons() {
+    use std::io::Write;
+    for (settings, merged) in [
+        ("", 0),
+        ("Joypad=1\r\n", 0x35),
+        ("Joypad=1\r\nJoystick=0\r\n", 0),
+        ("Joypad=0\r\nJoystick=1\r\n", 0x35),
+    ] {
+        let game = Game::new();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(game.0.join("GAME.INI"))
+            .unwrap()
+            .write_all(settings.as_bytes())
+            .unwrap();
+        let mut code = Vec::new();
+        for opcode in [0x03e9u16, 0x03ea] {
+            code.extend(opcode.to_le_bytes());
+            code.extend([12, 0, 0]);
+            code.extend([0x9d, 4, 12, 0, 0]);
+        }
+        code.extend([0xfc, 3, 12, 0, 0, 12, 1, 0]);
+        code.extend([0x9d, 4, 12, 0, 0, 0x9d, 4, 12, 1, 0]);
+        code.extend([0, 0, 4, 1, 0, 0, 0]);
+        std::fs::write(game.0.join("wait.scn"), code).unwrap();
+        let project = Project::open(&game.0).unwrap();
+        let input = serde_json::from_value(serde_json::json!([
+            { "at_ms": 0, "joystick": { "x": 0, "y": 0, "buttons": 0x8000_0003u32 } }
+        ]))
+        .unwrap();
+        let mut replies = Vec::new();
+        shiinario_runtime::trace_with_options(
+            &project,
+            "wait.scn",
+            1000,
+            shiinario_runtime::TraceOptions {
+                simulate_platform: true,
+                tick_ms: 1,
+                input,
+                ..Default::default()
+            },
+            |event| {
+                if let Event::MouseButtonMapping { value, .. } = event {
+                    replies.push(*value);
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(replies, [0x35, merged, 5, 0x8000_0003], "{settings}");
+    }
+}
+
+#[test]
 fn window_close_runs_the_save_callback_before_ending_the_session() {
     let game = Game::new();
     // Define the inactive close task, disable flag encoding, and set a clear bit.

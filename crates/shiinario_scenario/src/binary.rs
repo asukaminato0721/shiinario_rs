@@ -193,7 +193,11 @@ pub enum PlatformRequest {
         key: u32,
     },
     ReadControls,
+    /// Focused keyboard/mouse controls plus the configured joystick input.
+    ReadMergedControls,
     ReadRepeatedControls,
+    /// Device-zero direction bits and the complete raw button word.
+    ReadJoystick,
     ReadMouseButtons,
     ReadScanKey {
         scan: u32,
@@ -2736,6 +2740,13 @@ impl BinaryVm {
                 } else {
                     PlatformRequest::ReadControls
                 });
+            }
+            0x03fc => {
+                point_destinations = Some([
+                    self.destination(&mut cursor)?,
+                    self.destination(&mut cursor)?,
+                ]);
+                request = Some(PlatformRequest::ReadJoystick);
             }
             0x07e5 => self.background_mode = 1,
             0x07e6 => self.background_mode = 0,
@@ -6057,6 +6068,33 @@ mod tests {
                 assert_eq!(vm.current_task, 0);
                 assert_eq!(vm.sp, 900);
             }
+        }
+    }
+
+    #[test]
+    fn joystick_query_retains_two_destinations_and_all_button_bits() {
+        for reply in [[0, 0], [5, 0x8000_0003u32 as i32]] {
+            let mut code = instruction(0x03fc, &[12, 0, 0, 14, 2, 0]);
+            let next = code.len();
+            code.extend(instruction(0x049d, &[14, 2, 0]));
+            let mut vm =
+                BinaryVm::with_version("joystick.scn", code, EngineVersion::V2_49).unwrap();
+            let event = vm.step().unwrap();
+            assert!(matches!(
+                &event,
+                Event::Platform {
+                    request: PlatformRequest::ReadJoystick,
+                    ..
+                }
+            ));
+            assert_eq!(vm.step().unwrap(), event);
+            vm.respond_point(reply).unwrap();
+            assert_eq!(vm.location().offset, next);
+            assert_eq!(vm.banks[&12][0], reply[0] as u32);
+            assert_eq!(vm.banks[&14][2], reply[1] as u32);
+            assert!(
+                matches!(vm.step().unwrap(), Event::MouseButtonMapping { value, .. } if value == reply[1] as u32)
+            );
         }
     }
 

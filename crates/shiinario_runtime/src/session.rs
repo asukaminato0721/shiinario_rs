@@ -55,6 +55,7 @@ pub struct Session {
     window_timers: std::collections::BTreeMap<u32, (u32, u32)>,
     control_repeat: crate::input::ControlRepeat,
     scan_repeats: std::collections::BTreeMap<u32, crate::input::ControlRepeat>,
+    input_settings: crate::input::InputSettings,
 }
 
 /// Precondition: `project` contains the resolved game archives.
@@ -81,6 +82,7 @@ fn initial_text_encoding(project: &Project) -> shiinario_scenario::TextEncoding 
 
 impl Session {
     pub fn new(project: &Project, name: &str) -> Result<Self> {
+        let input_settings = crate::input::InputSettings::from_values(&project.config.values)?;
         let mut vm = BinaryVm::with_version(name, project.read(name)?, project.config.version)?;
         // Titles can precede the first story load.
         vm.set_text_encoding(initial_text_encoding(project));
@@ -104,8 +106,9 @@ impl Session {
             state: SessionState::Runnable,
             main_loop: Some(MainLoop::new()),
             window_timers: Default::default(),
-            control_repeat: Default::default(),
+            control_repeat: input_settings.repeat(),
             scan_repeats: Default::default(),
+            input_settings,
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -325,6 +328,7 @@ impl Session {
                 PlatformRequest::CursorPosition
                     | PlatformRequest::MapCursor { .. }
                     | PlatformRequest::MouseButtons
+                    | PlatformRequest::ReadJoystick
             ) {
                 let point = host.point(&request)?;
                 vm.respond_point(point)?;
@@ -386,7 +390,7 @@ impl Session {
                 return Ok(true);
             }
             if matches!(&request, PlatformRequest::ReadRepeatedControls) {
-                let mask = host.respond(&PlatformRequest::ReadControls)?;
+                let mask = host.respond(&PlatformRequest::ReadMergedControls)?;
                 let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
                 let value = self.control_repeat.query(mask, now);
                 vm.respond(value)?;
@@ -399,7 +403,11 @@ impl Session {
             if let PlatformRequest::ReadRepeatedScanKey { scan } = &request {
                 let mask = host.respond(&PlatformRequest::ReadScanKey { scan: *scan })?;
                 let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
-                let value = self.scan_repeats.entry(*scan).or_default().query(mask, now);
+                let value = self
+                    .scan_repeats
+                    .entry(*scan)
+                    .or_insert_with(|| self.input_settings.repeat())
+                    .query(mask, now);
                 vm.respond(value)?;
                 emit(&Event::PlatformReply {
                     value,
