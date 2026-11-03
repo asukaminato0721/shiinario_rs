@@ -15,6 +15,17 @@ cargo b -r
 
 Copy `target/release/shiinario_engine` into the game directory and run it.
 
+Windows uses DirectX 12 (DX12) by default. Set `WGPU_BACKEND` before startup to
+select another backend. For OpenGL, run these commands in PowerShell:
+
+```powershell
+$env:WGPU_BACKEND = "gl"
+.\shiinario_engine.exe
+```
+
+The Windows build includes OpenGL support. The display driver must provide
+OpenGL 3.3 or later. A virtual machine or remote session may lack this support.
+
 Desktop joystick input follows the original engine's device-zero queries.
 Windows uses `joyGetPosEx`. Linux and macOS convert raw device axes to the WinMM
 range and retain native button order. The ordinary control mask uses X/Y and

@@ -19,6 +19,9 @@ impl Presentation {
     pub async fn new(window: Arc<dyn Window>, logical: [u32; 2]) -> Result<Self> {
         let size = window.surface_size();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            #[cfg(target_os = "windows")]
+            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::DX12),
+            #[cfg(not(target_os = "windows"))]
             backends: wgpu::util::backend_bits_from_env().unwrap_or_default(),
             ..Default::default()
         });
