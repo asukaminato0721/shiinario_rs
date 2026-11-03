@@ -27,10 +27,14 @@ The Windows build includes OpenGL support. The display driver must provide
 OpenGL 3.3 or later. A virtual machine or remote session may lack this support.
 
 Windows reads installed system and user fonts directly. It matches the script's
-font family and weight, including Japanese family names and TTC faces. If the
-family is missing, it tries Japanese fonts such as MS Gothic, Yu Gothic, Meiryo,
-and Noto Sans JP. Install one of these fonts if none is available. Windows does
-not require Fontconfig. Linux font lookup requires `fc-match` and a Japanese font.
+font family and weight, including localized family names and TTC faces.
+Requests for MingLiU and other Traditional Chinese families prefer Traditional
+Chinese replacements, such as Microsoft JhengHei and Noto CJK TC.
+If the selected font lacks a character, Windows searches other installed fonts
+for that character. The renderer caches these fonts and retains the primary
+font for characters it supports. Install a font with the required characters
+if no installed font contains them. Windows does not require Fontconfig.
+Linux font lookup requires `fc-match` and a Japanese font.
 
 Desktop joystick input follows the original engine's device-zero queries.
 Windows uses `joyGetPosEx`. Linux and macOS convert raw device axes to the WinMM

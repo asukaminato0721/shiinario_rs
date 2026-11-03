@@ -1,11 +1,18 @@
 //! Native outline rasterization with platform-specific font lookup.
 //! Script advances remain independent of font metrics. Font pixels can differ
 //! between platforms.
-use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
-use anyhow::{Context, Result, ensure};
+#[cfg(not(target_os = "windows"))]
+use ab_glyph::FontVec;
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+#[cfg(not(target_os = "windows"))]
+use anyhow::Context;
+use anyhow::{Result, ensure};
 use shiinario_scenario::{SharedMemory, TextStyle};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+#[cfg(any(target_os = "windows", test))]
+mod windows_fonts;
 
 pub(crate) struct Canvas<'a> {
     pub pixels: &'a SharedMemory,
@@ -22,6 +29,28 @@ struct Face {
     name: Vec<u8>,
     weight: u32,
     font: FontArc,
+    fallbacks: Vec<FontArc>,
+}
+impl Face {
+    fn font_for(
+        &mut self,
+        character: char,
+        load: impl FnOnce(&[u8], u32, char) -> Result<FontArc>,
+    ) -> Result<FontArc> {
+        if let Some(font) = std::iter::once(&self.font)
+            .chain(&self.fallbacks)
+            .find(|font| font.glyph_id(character).0 != 0)
+        {
+            return Ok(font.clone());
+        }
+        let font = load(&self.name, self.weight, character)?;
+        ensure!(
+            font.glyph_id(character).0 != 0,
+            "fallback font has no glyph for {character:?}"
+        );
+        self.fallbacks.push(font.clone());
+        Ok(font)
+    }
 }
 #[derive(Default)]
 pub(crate) struct TextRenderer {
@@ -48,6 +77,7 @@ impl TextRenderer {
                 name: style.font_face.clone(),
                 weight: style.font_weight,
                 font,
+                fallbacks: Vec::new(),
             });
             self.masks.clear();
             self.cached = 0;
@@ -56,9 +86,12 @@ impl TextRenderer {
         if let Some(mask) = self.masks.get(&key) {
             return Ok(mask.clone());
         }
-        let font = &self.face.as_ref().unwrap().font;
+        let font = self
+            .face
+            .as_mut()
+            .unwrap()
+            .font_for(character, load_fallback_font)?;
         let id = font.glyph_id(character);
-        ensure!(id.0 != 0, "selected font has no glyph for {character:?}");
         let scale = PxScale::from(style.font_height as f32);
         let glyph = id.with_scale_and_position(scale, point(0.0, font.as_scaled(scale).ascent()));
         let mask = if let Some(outline) = font.outline_glyph(glyph) {
@@ -302,64 +335,21 @@ fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
 
 #[cfg(target_os = "windows")]
 fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
-    use fontdb::{Database, Family, Query, Weight};
-    use std::sync::OnceLock;
+    windows_fonts::load(windows_fonts::installed(), name, font_weight, None)
+}
 
-    // Scan system and per-user font directories once. Fontdb retains the face
-    // index for TTC files and the localized family names used by CP932 scripts.
-    static FONTS: OnceLock<Database> = OnceLock::new();
-    let fonts = FONTS.get_or_init(|| {
-        let mut fonts = Database::new();
-        fonts.load_system_fonts();
-        fonts
-    });
-    let weight = Weight(
-        font_weight
-            .try_into()
-            .context("font weight exceeds 65535")?,
-    );
-    let families = [
-        name,
-        "MS Gothic",
-        "Yu Gothic",
-        "Meiryo",
-        "Yu Gothic UI",
-        "MS Mincho",
-        "Yu Mincho",
-        "Noto Sans CJK JP",
-        "Noto Sans JP",
-        "Source Han Sans JP",
-    ];
-    let id = families
-        .iter()
-        .find_map(|name| {
-            // Windows family names are case-insensitive. Fontdb queries use
-            // exact names, so obtain the stored spelling before the query.
-            let family = fonts
-                .faces()
-                .flat_map(|face| &face.families)
-                .find(|(family, _)| family.eq_ignore_ascii_case(name))?;
-            fonts.query(&Query {
-                families: &[Family::Name(&family.0)],
-                weight,
-                ..Default::default()
-            })
-        })
-        .context("No Japanese font found. Install MS Gothic, Meiryo, or Noto Sans JP.")?;
-    let font = fonts
-        .with_face_data(id, |bytes, index| -> Result<FontArc> {
-            ensure!(bytes.len() <= 32 * 1024 * 1024, "font exceeds 32 MiB");
-            Ok(FontVec::try_from_vec_and_index(bytes.to_vec(), index)
-                .context("invalid Windows font face")?
-                .into())
-        })
-        .context("cannot read the selected Windows font")??;
-    let face = fonts.face(id).context("selected Windows font is missing")?;
-    eprintln!(
-        "Text font: {name:?} -> {} (face {})",
-        face.post_script_name, face.index
-    );
-    Ok(font)
+fn load_fallback_font(name: &[u8], weight: u32, character: char) -> Result<FontArc> {
+    #[cfg(target_os = "windows")]
+    {
+        let (name, _, bad) = encoding_rs::SHIFT_JIS.decode(name);
+        ensure!(!bad, "invalid CP932 font name");
+        windows_fonts::load(windows_fonts::installed(), &name, weight, Some(character))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (name, weight);
+        anyhow::bail!("selected font has no glyph for {character:?}")
+    }
 }
 
 #[cfg(target_os = "android")]

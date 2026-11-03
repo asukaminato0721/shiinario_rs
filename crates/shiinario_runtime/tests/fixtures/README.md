@@ -19,6 +19,13 @@ thread shutdown, and DirectSound calls are stubbed. Executable SHA-256 hashes
 and entry addresses are recorded in the fixture. No game media is included.
 The Rust tests compare both simulated time and 44.1/48 kHz mixer output clocks.
 
+`font-fallback.ttc` is a synthetic TrueType collection with three faces.
+Each glyph contains one triangle. The face named `MS Gothic` covers `A` and `あ`.
+Two faces named `Microsoft JhengHei` cover `A`, `說`, and U+20000.
+Their weights are 400 and 700. Their advance widths are 500 and 700 font units.
+These test names reproduce family selection. The collection contains no data
+from the Microsoft fonts. Tests require no installed fonts.
+
 Eight v2.49 cases additionally cover targets above 100, the full 31-bit target
 range, signed 32-bit arithmetic wraparound, descending overshoot, and equal
 targets. The original worker's volume-table call is stubbed for these cases;
