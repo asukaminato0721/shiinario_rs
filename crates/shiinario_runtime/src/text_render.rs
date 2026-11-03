@@ -1,6 +1,6 @@
-//! Native outline rasterization. Fontconfig selects an installed Japanese font;
-//! script advances remain independent of font metrics. Windows font pixels are
-//! not assumed identical to the selected Linux fallback.
+//! Native outline rasterization with platform-specific font lookup.
+//! Script advances remain independent of font metrics. Font pixels can differ
+//! between platforms.
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use anyhow::{Context, Result, ensure};
 use shiinario_scenario::{SharedMemory, TextStyle};
@@ -272,7 +272,7 @@ fn draw_mask(
     Ok(damage)
 }
 
-#[cfg(not(any(target_arch = "wasm32", target_os = "android")))]
+#[cfg(not(any(target_arch = "wasm32", target_os = "android", target_os = "windows")))]
 fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
     let weight = if font_weight >= 600 { 200 } else { 80 };
     let pattern = format!("{name}:lang=ja:weight={weight}");
@@ -297,6 +297,68 @@ fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
         .context("invalid font face")?
         .into();
     eprintln!("Text font: {name:?} -> {path} (face {index})");
+    Ok(font)
+}
+
+#[cfg(target_os = "windows")]
+fn load_font(name: &str, font_weight: u32) -> Result<FontArc> {
+    use fontdb::{Database, Family, Query, Weight};
+    use std::sync::OnceLock;
+
+    // Scan system and per-user font directories once. Fontdb retains the face
+    // index for TTC files and the localized family names used by CP932 scripts.
+    static FONTS: OnceLock<Database> = OnceLock::new();
+    let fonts = FONTS.get_or_init(|| {
+        let mut fonts = Database::new();
+        fonts.load_system_fonts();
+        fonts
+    });
+    let weight = Weight(
+        font_weight
+            .try_into()
+            .context("font weight exceeds 65535")?,
+    );
+    let families = [
+        name,
+        "MS Gothic",
+        "Yu Gothic",
+        "Meiryo",
+        "Yu Gothic UI",
+        "MS Mincho",
+        "Yu Mincho",
+        "Noto Sans CJK JP",
+        "Noto Sans JP",
+        "Source Han Sans JP",
+    ];
+    let id = families
+        .iter()
+        .find_map(|name| {
+            // Windows family names are case-insensitive. Fontdb queries use
+            // exact names, so obtain the stored spelling before the query.
+            let family = fonts
+                .faces()
+                .flat_map(|face| &face.families)
+                .find(|(family, _)| family.eq_ignore_ascii_case(name))?;
+            fonts.query(&Query {
+                families: &[Family::Name(&family.0)],
+                weight,
+                ..Default::default()
+            })
+        })
+        .context("No Japanese font found. Install MS Gothic, Meiryo, or Noto Sans JP.")?;
+    let font = fonts
+        .with_face_data(id, |bytes, index| -> Result<FontArc> {
+            ensure!(bytes.len() <= 32 * 1024 * 1024, "font exceeds 32 MiB");
+            Ok(FontVec::try_from_vec_and_index(bytes.to_vec(), index)
+                .context("invalid Windows font face")?
+                .into())
+        })
+        .context("cannot read the selected Windows font")??;
+    let face = fonts.face(id).context("selected Windows font is missing")?;
+    eprintln!(
+        "Text font: {name:?} -> {} (face {})",
+        face.post_script_name, face.index
+    );
     Ok(font)
 }
 

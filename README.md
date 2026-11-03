@@ -26,6 +26,12 @@ $env:WGPU_BACKEND = "gl"
 The Windows build includes OpenGL support. The display driver must provide
 OpenGL 3.3 or later. A virtual machine or remote session may lack this support.
 
+Windows reads installed system and user fonts directly. It matches the script's
+font family and weight, including Japanese family names and TTC faces. If the
+family is missing, it tries Japanese fonts such as MS Gothic, Yu Gothic, Meiryo,
+and Noto Sans JP. Install one of these fonts if none is available. Windows does
+not require Fontconfig. Linux font lookup requires `fc-match` and a Japanese font.
+
 Desktop joystick input follows the original engine's device-zero queries.
 Windows uses `joyGetPosEx`. Linux and macOS convert raw device axes to the WinMM
 range and retain native button order. The ordinary control mask uses X/Y and
