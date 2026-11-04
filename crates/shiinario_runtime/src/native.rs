@@ -219,6 +219,12 @@ impl Host for NativeHost {
         }
         Ok(())
     }
+    fn pause_stream(&mut self, handle: u32, paused: bool) -> Result<()> {
+        self.audio
+            .as_ref()
+            .context("audio has not been initialized")?
+            .pause(handle, paused)
+    }
     fn stop_stream(&mut self, handle: u32) -> Result<()> {
         self.audio
             .as_ref()
@@ -239,6 +245,9 @@ impl Host for NativeHost {
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
         match request {
+            PlatformRequest::MessageBox { text, title, flags } => {
+                crate::dialog::show(text, title, *flags)
+            }
             PlatformRequest::SetCursorPosition { position } => {
                 let point = self.transform.to_window_point(*position)?;
                 self.cursor = point;

@@ -3,11 +3,13 @@ const canvas = $('screen');
 const context = canvas.getContext('2d', { alpha: false });
 let worker, audio, audioStart, audioNext, clockTimer, closing = false;
 let audioSequence = 0;
+let messageDialog;
 const sources = new Set();
 const status = message => { $('status').textContent = message; };
 function post(data) { worker?.postMessage(data); }
 function clearAudio() { for (const source of sources) { source.stop(); source.disconnect(); } sources.clear(); }
 async function cleanup(message) {
+  messageDialog?.remove(); messageDialog = null;
   clearInterval(clockTimer);
   clearAudio();
   worker?.terminate(); worker = null;
@@ -35,6 +37,32 @@ $('start').onclick = async () => {
         case 'ready': status('Running. Saves are stored locally in this browser.'); $('stop').disabled = false; canvas.focus(); break;
         case 'frame': context.putImageData(new ImageData(new Uint8ClampedArray(data.frame), 800, 600), 0, 0); break;
         case 'title': document.title = data.title || 'Shiina Rio'; break;
+        case 'message-box': {
+          const owner = worker;
+          const dialog = document.createElement('dialog');
+          messageDialog = dialog;
+          const title = document.createElement('h2'); title.textContent = data.title;
+          const text = document.createElement('p'); text.textContent = data.text; text.style.whiteSpace = 'pre-wrap';
+          dialog.append(title, text);
+          const choices = (data.flags & 15) === 4 ? [[6, 'Yes'], [7, 'No']] :
+            (data.flags & 15) === 1 ? [[1, 'OK'], [2, 'Cancel']] : [[1, 'OK']];
+          const reply = value => {
+            dialog.close(); dialog.remove(); messageDialog = null;
+            if (owner === worker) post({ type: 'message-box-reply', value });
+            canvas.focus();
+          };
+          for (const [index, [value, label]] of choices.entries()) {
+            const button = document.createElement('button'); button.textContent = label;
+            button.autofocus = index === ((data.flags >> 8) & 3);
+            button.onclick = () => reply(value); dialog.append(button);
+          }
+          dialog.oncancel = event => {
+            event.preventDefault();
+            if ((data.flags & 15) !== 4) reply(choices.at(-1)[0]);
+          };
+          document.body.append(dialog); dialog.showModal();
+          break;
+        }
         case 'fullscreen': status('Use the Fullscreen button to change browser display mode.'); break;
         case 'audio': {
           if (document.hidden || data.sequence < audioSequence) break;

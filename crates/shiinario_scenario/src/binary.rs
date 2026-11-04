@@ -2,7 +2,9 @@
 use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
+mod compat;
 mod native_helper;
+pub mod scan;
 mod text_execution;
 use text_execution::{AsyncText, StagedText, TextCallback, TextStringIndex};
 
@@ -57,6 +59,43 @@ pub struct SurfaceCopy {
     pub destination: SurfacePoint,
     pub source: SurfacePoint,
     pub size: [i32; 2],
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ImageCopy {
+    pub destination: ImagePoint,
+    pub source: ImagePoint,
+    pub size: [i32; 2],
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceArithmetic {
+    pub copy: SurfaceCopy,
+    pub amount: u32,
+    pub subtract: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceWave {
+    pub copy: SurfaceCopy,
+    pub phase: u32,
+    pub step: u32,
+    pub amplitude: i32,
+    pub vertical: bool,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SurfaceRipple {
+    pub destination: u32,
+    pub source: u32,
+    pub phase: i32,
+    pub frequency: i32,
+    pub amplitude: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub enum GdiCommand {
+    CreateSolidBrush { color: u32 },
+    CreatePen { style: u32, width: i32, color: u32 },
+    SelectObject { dc: u32, object: u32 },
+    DeleteObject { object: u32 },
+    Ellipse { dc: u32, rect: [i32; 4] },
 }
 
 /// 0574 uses IEEE-754 f32 bit patterns for angle (degrees) and x/y scales.
@@ -129,6 +168,11 @@ pub enum MovieCommand {
         play: bool,
     },
     Stop,
+    Close,
+    DrawToSurface {
+        surface: u32,
+        position: [i32; 2],
+    },
     Pause,
     Play,
     Status,
@@ -160,6 +204,10 @@ pub enum PlatformRequest {
         lparam: u32,
     },
     Movie {
+        id: u32,
+        command: MovieCommand,
+    },
+    DirectMovie {
         id: u32,
         command: MovieCommand,
     },
@@ -242,6 +290,24 @@ pub enum PlatformRequest {
         rect: [i32; 4],
     },
     UpdateWindow,
+    ValidateRect {
+        rect: [i32; 4],
+    },
+    MessageBox {
+        text: String,
+        title: String,
+        flags: u32,
+    },
+    EnumerateFonts {
+        charset: u32,
+    },
+    WaitControl {
+        mask: u32,
+    },
+    DrawingContext {
+        surface: u32,
+    },
+    Gdi(GdiCommand),
     BlendSurfaces(SurfaceBlend),
     BlendImages(ImageBlend),
     /// Copy working pixels without requesting a window paint (e.g. 0500).
@@ -264,6 +330,15 @@ pub enum PlatformRequest {
         source: [u32; 2],
     },
     CaptureSurface(SurfaceCapture),
+    CopyImage(ImageCopy),
+    ArithmeticSurface(SurfaceArithmetic),
+    WaveSurface(SurfaceWave),
+    RippleSurface(SurfaceRipple),
+    PresentSurface {
+        source: u32,
+        level: u32,
+        update: bool,
+    },
     MaskTransition(MaskTransition),
     SurfacePixels {
         id: u32,
@@ -309,6 +384,10 @@ pub enum PlatformRequest {
     },
     StopAudioStream {
         handle: u32,
+    },
+    PauseAudioStream {
+        handle: u32,
+        paused: bool,
     },
     ReleaseAudioStream {
         handle: u32,
@@ -434,6 +513,10 @@ pub enum PlatformRequest {
         height: u32,
         bytes_per_pixel: u32,
         frames: u32,
+    },
+    CreateImageFromSurface {
+        id: u32,
+        surface: u32,
     },
     FillImage {
         id: u32,
@@ -701,6 +784,7 @@ pub struct BinaryVm {
     draw_lists: std::collections::BTreeMap<u32, (u32, usize, usize)>,
     draw_list_id: u32,
     last_frame_blend: Option<u32>,
+    frame_blend_level: u32,
     file_read_marker: u32,
     file_write_marker: u32,
     input_latches: [u32; 2],
@@ -736,6 +820,7 @@ pub struct BinaryVm {
     ini_path: String,
     pending_bytes: Option<u32>,
     asset_load_address: u32,
+    font_allocation: Option<u32>,
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
     pending_sizes: Option<[Destination; 2]>,
@@ -785,6 +870,33 @@ impl Default for TextContext {
         }
     }
 }
+// Each executable opcode must declare its static operand layout.
+// Both the scanner and the VM use these patterns.
+macro_rules! binary_dispatch {
+    (
+        fn execute(&mut $vm:ident) -> $result:ty { $($prepare:tt)* }
+        match $opcode:ident {
+            $($pattern:pat => $layout:expr => $handler:expr,)*
+        }
+        then { $($finish:tt)* }
+    ) => {
+        fn instruction_layout($opcode: u16) -> Option<scan::Layout> {
+            match $opcode {
+                $($pattern => Some($layout),)*
+                _ => None,
+            }
+        }
+        fn execute(&mut $vm) -> $result {
+            $($prepare)*
+            match $opcode {
+                $($pattern => $handler,)*
+                _ => bail!("unsupported binary SCN opcode 0x{:04x}", $opcode),
+            }
+            $($finish)*
+        }
+    };
+}
+
 impl BinaryVm {
     pub fn new(name: impl Into<String>, data: Vec<u8>) -> Result<Self> {
         Self::with_version(name, data, EngineVersion::V2_47)
@@ -816,6 +928,7 @@ impl BinaryVm {
             draw_lists: Default::default(),
             draw_list_id: 0,
             last_frame_blend: None,
+            frame_blend_level: 255,
             file_read_marker: 0,
             file_write_marker: 0,
             input_latches: [0; 2],
@@ -848,6 +961,7 @@ impl BinaryVm {
             ini_path: String::new(),
             pending_bytes: None,
             asset_load_address: 0,
+            font_allocation: None,
             pending_bounds: None,
             pending_point: None,
             pending_sizes: None,
@@ -1233,6 +1347,12 @@ impl BinaryVm {
             "platform request requires a byte-string reply"
         );
         if let Some((Event::Platform { location, request }, _)) = &self.pending {
+            if matches!(request, PlatformRequest::WaitControl { .. }) {
+                ensure!(value <= 1, "control wait requires a Boolean reply");
+                if value == 0 {
+                    return Ok(());
+                }
+            }
             if matches!(request, PlatformRequest::WaitTaskTimer { .. }) {
                 ensure!(value <= 1, "timer wait requires a Boolean reply");
                 if value == 0 {
@@ -1264,6 +1384,7 @@ impl BinaryVm {
                     | PlatformRequest::LoadImage { .. }
                     | PlatformRequest::BindImageMemory { .. }
                     | PlatformRequest::CreateImage { .. }
+                    | PlatformRequest::CreateImageFromSurface { .. }
                     | PlatformRequest::FillImage { .. }
                     | PlatformRequest::LoadSound { .. }
                     | PlatformRequest::LoadSoundMemory { .. }
@@ -1384,7 +1505,9 @@ impl BinaryVm {
             }
             Event::Platform {
                 request:
-                    PlatformRequest::LoadImage { id, .. } | PlatformRequest::CreateImage { id, .. },
+                    PlatformRequest::LoadImage { id, .. }
+                    | PlatformRequest::CreateImage { id, .. }
+                    | PlatformRequest::CreateImageFromSurface { id, .. },
                 ..
             } => {
                 // Replacing an external binding does not free its caller-owned
@@ -2389,6 +2512,7 @@ impl BinaryVm {
             }
         }
     }
+    binary_dispatch! {
     fn execute(&mut self) -> Result<Event> {
         let location = self.location();
         let mut cursor = Cursor {
@@ -2411,6 +2535,7 @@ impl BinaryVm {
         let mut draw_item = None;
         let mut new_text_context = None;
         let mut staged_text_address = None;
+        let mut callback_advance = None;
         let mut staged_text_step = None;
         let mut file_destinations = None;
         let mut timer_reply = None;
@@ -2423,8 +2548,9 @@ impl BinaryVm {
             location: location.clone(),
             opcode,
         };
+    }
         match opcode {
-            0x01a4 => {
+            0x01a4 => scan::Layout::Dll => {
                 // v2.36: 416580 calls 416490 with convention/module/symbol,
                 // a FF-terminated argument list, then reads the result target.
                 let convention = self.read(&mut cursor)?;
@@ -2444,6 +2570,17 @@ impl BinaryVm {
                 {
                     // Portable host default, in milliseconds.
                     writes.push((destination, 500));
+                } else if convention == 1 && module.eq_ignore_ascii_case("gdi32.dll") {
+                    let command = match (symbol.as_str(), arguments.as_slice()) {
+                        ("CreateSolidBrush", &[color]) => GdiCommand::CreateSolidBrush { color },
+                        ("CreatePen", &[style, width, color]) => GdiCommand::CreatePen { style, width: width as i32, color },
+                        ("SelectObject", &[dc, object]) => GdiCommand::SelectObject { dc, object },
+                        ("DeleteObject", &[object]) => GdiCommand::DeleteObject { object },
+                        ("Ellipse", &[dc, left, top, right, bottom]) => GdiCommand::Ellipse { dc, rect: [left as i32, top as i32, right as i32, bottom as i32] },
+                        _ => bail!("unsupported GDI call {symbol} with {} arguments", arguments.len()),
+                    };
+                    response_destination = Some(destination);
+                    request = Some(PlatformRequest::Gdi(command));
                 } else {
                     ensure!(
                         convention == 1
@@ -2457,10 +2594,12 @@ impl BinaryVm {
                     response_destination = Some(destination);
                     request = Some(PlatformRequest::CreateDirectory { path });
                 }
-            }
-            0x0276 => {
+            },
+            0x0276 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
-                if self
+                if let Some((range, bytes)) = self.effect_native_helper(address)? {
+                    memory_write = Some((range, bytes));
+                } else if self
                     .memory_read(address, native_helper::SAVE_XOR_CODE_SIZE)
                     .is_ok_and(|code| native_helper::is_save_xor(&code))
                 {
@@ -2581,8 +2720,8 @@ impl BinaryVm {
                     )?;
                     memory_write = Some((destination, bytes));
                 }
-            }
-            0x05b4..=0x05c3 => {
+            },
+            0x05b4..=0x05c3 => scan::Layout::Movie => {
                 if opcode == 0x05be {
                     let mut ids = Vec::new();
                     loop {
@@ -2653,19 +2792,49 @@ impl BinaryVm {
                     };
                     request = Some(PlatformRequest::Movie { id, command });
                 }
-            }
-            0x073f => {
+            },
+            0x05c9..=0x05cd | 0x05d3 | 0x05d4 | 0x05d6 => scan::Layout::Operands(match opcode { 0x05c9 | 0x05d3 => 3, 0x05d4 => 4, 0x05ca..=0x05cc => 1, _ => 2 }) => {
+                let id = self.read(&mut cursor)?;
+                ensure!(id < 16, "DirectShow movie slot out of bounds");
+                let command = match opcode {
+                    0x05c9 => MovieCommand::Open {
+                        name: self.window_title(self.read(&mut cursor)?)?,
+                        flags: self.read(&mut cursor)?, surface: 0, play: true,
+                    },
+                    0x05ca => MovieCommand::Close,
+                    0x05cb => MovieCommand::Pause,
+                    0x05cc => MovieCommand::Play,
+                    0x05cd => {
+                        response_destination = Some(self.destination(&mut cursor)?);
+                        MovieCommand::Status
+                    },
+                    0x05d3 => {
+                        point_destinations = Some([self.destination(&mut cursor)?, self.destination(&mut cursor)?]);
+                        MovieCommand::Dimensions
+                    },
+                    0x05d4 => {
+                        let surface = self.read(&mut cursor)?;
+                        ensure!(surface < 256, "movie destination surface out of bounds");
+                        MovieCommand::DrawToSurface { surface, position: [
+                            self.read(&mut cursor)? as i32, self.read(&mut cursor)? as i32,
+                        ] }
+                    },
+                    _ => MovieCommand::SetVolume { percent: self.read(&mut cursor)? },
+                };
+                request = Some(PlatformRequest::DirectMovie { id, command });
+            },
+            0x073f => scan::Layout::Operands(1) => {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::DirectShowAvailable);
-            }
+            },
             // v2.48 002a (42459a) calls Sleep(milliseconds). The portable
             // host uses the same elapsed-time wait while servicing events.
             // 07bf uses MsgWaitForMultipleObjects in v2.36 (4183d0).
-            0x0028 | 0x002a | 0x07bf => {
+            0x0028 | 0x002a | 0x07bf => scan::Layout::Operands(1) => {
                 delay = Some(self.read(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
-            }
-            0x06a7..=0x06ab | 0x06af | 0x06b0 => {
+            },
+            0x06a7..=0x06ab | 0x06af | 0x06b0 => scan::Layout::Sound => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "unsupported sound slot/handle {id:#x}");
                 let command = match opcode {
@@ -2689,32 +2858,70 @@ impl BinaryVm {
                     }
                 };
                 request = Some(PlatformRequest::Sound { id, command });
-            }
-            0x03e8 => {
+            },
+            0x03e8 => scan::Layout::Operands(2) => {
                 let key = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadKeyState { key });
-            }
-            0x03ec => {
+            },
+            0x03eb => scan::Layout::Operands(1) => {
+                request = Some(PlatformRequest::WaitControl { mask: self.read(&mut cursor)? });
+            },
+            0x0066 => scan::Layout::Operands(1) => {
+                let destination = self.destination(&mut cursor)?;
+                let (value, next) = self.next_callback_character()?;
+                callback_advance = Some(next);
+                writes.push((destination, value));
+            },
+            0x006f => scan::Layout::Operands(2) => {
+                let charset = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::EnumerateFonts { charset });
+            },
+            0x0780 => scan::Layout::Operands(4) => {
+                let text = self.window_title(self.read(&mut cursor)?)?;
+                let title = self.window_title(self.read(&mut cursor)?)?;
+                let flags = self.read(&mut cursor)?;
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::MessageBox { text, title, flags });
+            },
+            0x07d2 => scan::Layout::Operands(4) => {
+                request = Some(PlatformRequest::ValidateRect { rect: [
+                    self.read(&mut cursor)? as i32, self.read(&mut cursor)? as i32,
+                    self.read(&mut cursor)? as i32, self.read(&mut cursor)? as i32,
+                ] });
+            },
+            0x0529 => scan::Layout::Operands(2) => {
+                let surface = self.read(&mut cursor)?;
+                ensure!(surface < 256 || surface == u32::MAX, "drawing context surface out of bounds");
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::DrawingContext { surface });
+            },
+            0x06db | 0x06dc => scan::Layout::Operands(1) => {
+                request = Some(PlatformRequest::PauseAudioStream {
+                    handle: self.read(&mut cursor)?, paused: opcode == 0x06db,
+                });
+            },
+            0x03ec => scan::Layout::Operands(2) => {
                 let scan = self.read(&mut cursor)?;
                 ensure!(scan < 256, "keyboard scan code out of bounds");
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadRepeatedScanKey { scan });
-            }
-            0x0459 => {
+            },
+            0x0459 => scan::Layout::Operands(1) => {
                 // v2.48 41db20 -> 40d590 returns the three mapped button bits.
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadMouseButtons);
-            }
-            0x0457 => {
+            },
+            0x0457 => scan::Layout::Operands(2) => {
                 request = Some(PlatformRequest::SetCursorPosition {
                     position: [
                         self.read(&mut cursor)? as i32,
                         self.read(&mut cursor)? as i32,
                     ],
                 });
-            }
-            0x0456 | 0x0458 | 0x0492 => {
+            },
+            0x0456 | 0x0458 | 0x0492 => scan::Layout::Operands(2) => {
                 let begin = cursor.pc;
                 request = Some(if opcode == 0x0492 {
                     let point = [
@@ -2732,26 +2939,26 @@ impl BinaryVm {
                     self.destination(&mut cursor)?,
                     self.destination(&mut cursor)?,
                 ]);
-            }
-            0x03e9 | 0x03ea => {
+            },
+            0x03e9 | 0x03ea => scan::Layout::Operands(1) => {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(if opcode == 0x03ea {
                     PlatformRequest::ReadRepeatedControls
                 } else {
                     PlatformRequest::ReadControls
                 });
-            }
-            0x03fc => {
+            },
+            0x03fc => scan::Layout::Operands(2) => {
                 point_destinations = Some([
                     self.destination(&mut cursor)?,
                     self.destination(&mut cursor)?,
                 ]);
                 request = Some(PlatformRequest::ReadJoystick);
-            }
-            0x07e5 => self.background_mode = 1,
-            0x07e6 => self.background_mode = 0,
-            0x07e8 => writes.push((self.destination(&mut cursor)?, self.background_mode)),
-            0x0000 => {
+            },
+            0x07e5 => scan::Layout::Operands(0) => self.background_mode = 1,
+            0x07e6 => scan::Layout::Operands(0) => self.background_mode = 0,
+            0x07e8 => scan::Layout::Operands(1) => writes.push((self.destination(&mut cursor)?, self.background_mode)),
+            0x0000 => scan::Layout::Operands(1) => {
                 let result = self.read(&mut cursor)?;
                 if self.text_callback.is_some() {
                     self.text_callback_result = result;
@@ -2779,8 +2986,8 @@ impl BinaryVm {
                 {
                     self.ended = true;
                 }
-            }
-            0x0001 | 0x0002 => {
+            },
+            0x0001 | 0x0002 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < CELLS as u32, "unsupported scenario task slot {id}");
                 let name = self.string(self.read(&mut cursor)?)?;
@@ -2789,8 +2996,8 @@ impl BinaryVm {
                     name,
                     activate: opcode == 1,
                 });
-            }
-            0x07d0 => {
+            },
+            0x07d0 => scan::Layout::Operands(4) => {
                 let rect = [
                     self.read(&mut cursor)? as i32,
                     self.read(&mut cursor)? as i32,
@@ -2798,12 +3005,12 @@ impl BinaryVm {
                     self.read(&mut cursor)? as i32,
                 ];
                 request = Some(PlatformRequest::InvalidateRect { rect });
-            }
-            0x07d1 => {
+            },
+            0x07d1 => scan::Layout::Operands(0) => {
                 // v2.48 4205e0 calls UpdateWindow without operands.
                 request = Some(PlatformRequest::UpdateWindow);
-            }
-            0x0568 => {
+            },
+            0x0568 => scan::Layout::Operands(5) => {
                 let destination = self.read(&mut cursor)?;
                 let first = self.read(&mut cursor)?;
                 let second = self.read(&mut cursor)?;
@@ -2823,8 +3030,8 @@ impl BinaryVm {
                     mask,
                     flags,
                 }));
-            }
-            0x0574 => {
+            },
+            0x0574 => scan::Layout::Operands(19) => {
                 let mut arguments = [0u32; 19];
                 for value in &mut arguments {
                     *value = self.read(&mut cursor)?;
@@ -2839,8 +3046,8 @@ impl BinaryVm {
                     flags: arguments[17],
                     background: arguments[18],
                 }));
-            }
-            0x0563 => {
+            },
+            0x0563 => scan::Layout::Operands(16) => {
                 // v2.48 41fa10 reads three image/frame/position groups,
                 // width/height, then two independent 8-bit fixed-point weights.
                 let mut point = || -> Result<ImagePoint> {
@@ -2864,8 +3071,8 @@ impl BinaryVm {
                     ],
                     weights: [self.read(&mut cursor)?, self.read(&mut cursor)?],
                 }));
-            }
-            0x0562 => {
+            },
+            0x0562 => scan::Layout::Operands(6) => {
                 let destination = [self.read(&mut cursor)?, self.read(&mut cursor)?];
                 let position = [
                     self.read(&mut cursor)? as i32,
@@ -2877,8 +3084,8 @@ impl BinaryVm {
                     position,
                     source,
                 });
-            }
-            0x0560 | 0x0561 => {
+            },
+            0x0560 | 0x0561 => scan::Layout::Operands(4) => {
                 let id = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot out of bounds");
@@ -2899,8 +3106,8 @@ impl BinaryVm {
                     ]);
                     PlatformRequest::ImageOrigin { id, frame }
                 });
-            }
-            0x055e => {
+            },
+            0x055e => scan::Layout::Operands(9) => {
                 let image = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
                 let destination = [
@@ -2923,8 +3130,49 @@ impl BinaryVm {
                     size,
                     source,
                 }));
-            }
-            0x0514 => {
+            },
+            0x055f => scan::Layout::Operands(10) => {
+                let destination = ImagePoint { id: self.read(&mut cursor)?, frame: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32, y: self.read(&mut cursor)? as i32 };
+                let size = [self.read(&mut cursor)? as i32, self.read(&mut cursor)? as i32];
+                let source = ImagePoint { id: self.read(&mut cursor)?, frame: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32, y: self.read(&mut cursor)? as i32 };
+                ensure!(destination.id < 256 && source.id < 256, "image copy slot out of bounds");
+                request = Some(PlatformRequest::CopyImage(ImageCopy { destination, source, size }));
+            },
+            0x04fb | 0x04fc | 0x0566 => scan::Layout::Operands(if opcode == 0x0566 { 12 } else { 9 }) => {
+                let destination = SurfacePoint { id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32, y: self.read(&mut cursor)? as i32 };
+                let size = [self.read(&mut cursor)? as i32, self.read(&mut cursor)? as i32];
+                let source = SurfacePoint { id: self.read(&mut cursor)?,
+                    x: self.read(&mut cursor)? as i32, y: self.read(&mut cursor)? as i32 };
+                ensure!(destination.id < 256 && source.id < 256, "surface effect slot out of bounds");
+                let copy = SurfaceCopy { destination, source, size };
+                request = Some(if opcode == 0x0566 {
+                    PlatformRequest::WaveSurface(SurfaceWave { copy,
+                        phase: self.read(&mut cursor)?, step: self.read(&mut cursor)?,
+                        amplitude: self.read(&mut cursor)? as i32, vertical: self.read(&mut cursor)? & 1 != 0 })
+                } else { PlatformRequest::ArithmeticSurface(SurfaceArithmetic { copy,
+                    amount: self.read(&mut cursor)?, subtract: opcode == 0x04fc }) });
+            },
+            0x056c => scan::Layout::Operands(5) => {
+                let destination = self.read(&mut cursor)?;
+                let source = self.read(&mut cursor)?;
+                ensure!(destination < 256 && source < 256, "ripple surface slot out of bounds");
+                request = Some(PlatformRequest::RippleSurface(SurfaceRipple { destination, source,
+                    phase: self.read(&mut cursor)? as i32, frequency: self.read(&mut cursor)? as i32,
+                    amplitude: self.read(&mut cursor)? as i32 }));
+            },
+            0x04c6 => scan::Layout::Operands(2) => {
+                let source = self.read(&mut cursor)?;
+                ensure!(source < 256, "presentation surface slot out of bounds");
+                let update = self.read(&mut cursor)? != 0;
+                request = Some(PlatformRequest::PresentSurface { source, level: self.frame_blend_level, update });
+                if source != 0 {
+                    self.last_frame_blend = (self.frame_blend_level != 256).then_some(self.frame_blend_level);
+                }
+            },
+            0x0514 => scan::Layout::Operands(9) => {
                 // v2.48 41e340 -> 41e230 maps surface slots to GDI DCs.
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
@@ -2949,8 +3197,8 @@ impl BinaryVm {
                     },
                     raster_operation,
                 });
-            }
-            0x051e => {
+            },
+            0x051e => scan::Layout::Operands(11) => {
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
                     x: self.read(&mut cursor)? as i32,
@@ -2977,23 +3225,23 @@ impl BinaryVm {
                     source_size,
                     mode,
                 }));
-            }
-            0x04e7 => {
+            },
+            0x04e7 => scan::Layout::Operands(4) => {
                 // Report the portable software renderer (original mode 1).
                 // This mode has no hardware texture filtering options.
                 for value in [1, 0, 0, 0] {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
-            }
-            0x04e8 => {
+            },
+            0x04e8 => scan::Layout::Operands(5) => {
                 let mode = self.read(&mut cursor)?;
                 let _min_filter = self.read(&mut cursor)?;
                 let _mag_filter = self.read(&mut cursor)?;
                 let _options = self.read(&mut cursor)?;
                 let destination = self.destination(&mut cursor)?;
                 writes.push((destination, u32::from(mode == 1)));
-            }
-            0x04e2 | 0x0564 => {
+            },
+            0x04e2 | 0x0564 => scan::Layout::SurfaceCopy => {
                 let destination = SurfacePoint {
                     id: self.read(&mut cursor)?,
                     x: self.read(&mut cursor)? as i32,
@@ -3029,8 +3277,8 @@ impl BinaryVm {
                     // when the destination is the screen surface.
                     PlatformRequest::CopySurfaceAndInvalidate(copy)
                 });
-            }
-            0x04f6 => {
+            },
+            0x04f6 => scan::Layout::Operands(13) => {
                 let mut point = || -> Result<SurfacePoint> {
                     let id = self.read(&mut cursor)?;
                     ensure!(id < 256, "unsupported blend surface index/flags {id:#x}");
@@ -3053,14 +3301,14 @@ impl BinaryVm {
                     size,
                     weights,
                 }));
-            }
-            0x0528 => {
+            },
+            0x0528 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "drawing surface slot out of bounds: {id}");
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::SurfacePixels { id });
-            }
-            0x04d8 => {
+            },
+            0x04d8 => scan::Layout::Operands(8) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "drawing surface slot out of bounds: {id}");
                 let mut rect = [0; 4];
@@ -3072,8 +3320,8 @@ impl BinaryVm {
                     *value = self.read(&mut cursor)? as u8;
                 }
                 request = Some(PlatformRequest::FillSurface { id, rect, color });
-            }
-            0x06e3 | 0x06e6 | 0x06e8 | 0x06f0 => {
+            },
+            0x06e3 | 0x06e6 | 0x06e8 | 0x06f0 => scan::Layout::Operands(2) => {
                 let handle = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(match opcode {
@@ -3082,8 +3330,8 @@ impl BinaryVm {
                     0x06f0 => PlatformRequest::GetAudioStreamDuration { handle },
                     _ => PlatformRequest::GetAudioStreamVolume { handle },
                 });
-            }
-            0x06ec => {
+            },
+            0x06ec => scan::Layout::Operands(4) => {
                 let handle = self.read(&mut cursor)?;
                 let interval = self.read(&mut cursor)?;
                 let step = self.read(&mut cursor)? as i32;
@@ -3094,8 +3342,8 @@ impl BinaryVm {
                     step,
                     target,
                 });
-            }
-            0x06ef => {
+            },
+            0x06ef => scan::Layout::Operands(4) => {
                 let handle = self.read(&mut cursor)?;
                 let start_ms = self.read(&mut cursor)?;
                 let end_ms = self.read(&mut cursor)?;
@@ -3106,27 +3354,27 @@ impl BinaryVm {
                     end_ms,
                     repeats,
                 });
-            }
-            0x06df => {
+            },
+            0x06df => scan::Layout::Operands(2) => {
                 let handle = self.read(&mut cursor)?;
                 let percent = self.read(&mut cursor)?;
                 request = Some(PlatformRequest::SetAudioStreamVolume { handle, percent });
-            }
-            0x06d8 | 0x06da => {
+            },
+            0x06d8 | 0x06da => scan::Layout::Operands(1) => {
                 let handle = self.read(&mut cursor)?;
                 request = Some(if opcode == 0x06d8 {
                     PlatformRequest::ReleaseAudioStream { handle }
                 } else {
                     PlatformRequest::StopAudioStream { handle }
                 });
-            }
-            0x06d9 => {
+            },
+            0x06d9 => scan::Layout::Operands(2) => {
                 let handle = self.read(&mut cursor)?;
                 let flags =
                     self.read(&mut cursor)? | if self.media_flags & 8 != 0 { 0x10 } else { 0 };
                 request = Some(PlatformRequest::PlayAudioStream { handle, flags });
-            }
-            0x06d6 => {
+            },
+            0x06d6 => scan::Layout::Operands(3) => {
                 let address = self.read(&mut cursor)?;
                 let flags =
                     self.read(&mut cursor)? | 0x20 | if self.background_mode != 0 { 8 } else { 0 };
@@ -3141,8 +3389,8 @@ impl BinaryVm {
                 );
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::CreateAudioStream { address, flags });
-            }
-            0x06a6 => {
+            },
+            0x06a6 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "sound slot {id} out of bounds");
                 let name = self.string(self.read(&mut cursor)?)?;
@@ -3151,8 +3399,8 @@ impl BinaryVm {
                     name,
                     flags: self.media_flags | if self.background_mode != 0 { 0x8000 } else { 0 },
                 });
-            }
-            0x06b1 => {
+            },
+            0x06b1 => scan::Layout::Operands(2) => {
                 // v2.48 422830 decodes a memory buffer before creating sound.
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "sound slot {id} out of bounds");
@@ -3162,8 +3410,8 @@ impl BinaryVm {
                     address,
                     flags: self.media_flags | if self.background_mode != 0 { 0x8000 } else { 0 },
                 });
-            }
-            0x055a => {
+            },
+            0x055a => scan::Layout::Operands(5) => {
                 request = Some(PlatformRequest::CreateImage {
                     id: self.read(&mut cursor)?,
                     width: self.read(&mut cursor)?,
@@ -3171,8 +3419,8 @@ impl BinaryVm {
                     bytes_per_pixel: self.read(&mut cursor)?,
                     frames: self.read(&mut cursor)?,
                 });
-            }
-            0x055b => {
+            },
+            0x055b => scan::Layout::Operands(7) => {
                 request = Some(PlatformRequest::FillImage {
                     id: self.read(&mut cursor)?,
                     frame: self.read(&mut cursor)?,
@@ -3182,8 +3430,19 @@ impl BinaryVm {
                     height: self.read(&mut cursor)?,
                     color: self.read(&mut cursor)?,
                 });
-            }
-            0x04c7 => {
+            },
+            0x055c => scan::Layout::Operands(2) => {
+                // v2.48 41f640 -> 4113d0 copies the complete DIB into one frame.
+                let id = self.read(&mut cursor)?;
+                let surface = self.read(&mut cursor)?;
+                ensure!(id < 256, "image slot {id} out of bounds");
+                ensure!(
+                    surface < 256,
+                    "drawing surface slot {surface} out of bounds"
+                );
+                request = Some(PlatformRequest::CreateImageFromSurface { id, surface });
+            },
+            0x04c7 => scan::Layout::Operands(3) => {
                 let x = self.read(&mut cursor)? as i32;
                 let y = self.read(&mut cursor)? as i32;
                 response_destination = Some(self.destination(&mut cursor)?);
@@ -3192,8 +3451,8 @@ impl BinaryVm {
                     y,
                     items: self.draw_list()?,
                 });
-            }
-            0x04c8 => {
+            },
+            0x04c8 => scan::Layout::Operands(6) => {
                 let id = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot {id} out of bounds");
@@ -3204,34 +3463,34 @@ impl BinaryVm {
                     self.destination(&mut cursor)?,
                 ]);
                 request = Some(PlatformRequest::ImageBounds { id, frame });
-            }
-            0x04c9 => {
+            },
+            0x04c9 => scan::Layout::Operands(3) => {
                 // v2.48 426117 tests both frame count and the frame pointer.
                 let id = self.read(&mut cursor)?;
                 let frame = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot {id} out of bounds");
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ImageFrameExists { id, frame });
-            }
-            0x04b5 => {
+            },
+            0x04b5 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 let capacity = self.read(&mut cursor)? as usize;
                 new_draw_list = Some((id, capacity));
-            }
-            0x04b6 => {
+            },
+            0x04b6 => scan::Layout::Operands(1) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "draw list slot out of bounds");
                 if let Some((address, _, _)) = self.draw_lists.insert(id, (0, 0, 0)) {
                     self.allocations.remove(&address);
                 }
-            }
-            0x04b7 => writes.push((self.destination(&mut cursor)?, self.draw_list_id)),
-            0x04b8 => {
+            },
+            0x04b7 => scan::Layout::Operands(1) => writes.push((self.destination(&mut cursor)?, self.draw_list_id)),
+            0x04b8 => scan::Layout::Operands(1) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "draw list slot out of bounds");
                 self.draw_list_id = id;
-            }
-            0x04b9 => {
+            },
+            0x04b9 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "draw list slot out of bounds");
                 let address = self
@@ -3239,13 +3498,13 @@ impl BinaryVm {
                     .get(&id)
                     .map_or(0, |&(address, _, _)| address);
                 writes.push((self.destination(&mut cursor)?, address));
-            }
-            0x04ba => {
+            },
+            0x04ba => scan::Layout::Operands(0) => {
                 if let Some((_, count, _)) = self.draw_lists.get_mut(&self.draw_list_id) {
                     *count = 0;
                 }
-            }
-            0x04bb => {
+            },
+            0x04bb => scan::Layout::Operands(1) => {
                 let count = self.read(&mut cursor)? as usize;
                 let list = self
                     .draw_lists
@@ -3253,15 +3512,15 @@ impl BinaryVm {
                     .context("draw list is not allocated")?;
                 ensure!(count <= list.2, "draw list count exceeds capacity");
                 list.1 = count;
-            }
-            0x04bc => {
+            },
+            0x04bc => scan::Layout::Operands(1) => {
                 let count = self
                     .draw_lists
                     .get(&self.draw_list_id)
                     .map_or(0, |list| list.1);
                 writes.push((self.destination(&mut cursor)?, count as u32));
-            }
-            0x04bd => {
+            },
+            0x04bd => scan::Layout::DrawItem => {
                 let (_, count, capacity) = self
                     .draw_lists
                     .get(&self.draw_list_id)
@@ -3298,8 +3557,8 @@ impl BinaryVm {
                     | EngineVersion::Unverified(_) => item.extra[1] = self.read(&mut cursor)?,
                 }
                 draw_item = Some(item);
-            }
-            0x04c4 | 0x04c5 => {
+            },
+            0x04c4 | 0x04c5 => scan::Layout::DrawImages => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "draw surface index out of bounds");
                 let clip = if opcode == 0x04c5 {
@@ -3317,18 +3576,19 @@ impl BinaryVm {
                     items: self.draw_list()?,
                     clip,
                 });
-            }
-            0x04ce => {
+            },
+            0x04ce => scan::Layout::Operands(1) => {
                 // v2.48 426154 clears the surface and invalidates window zero.
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "clear surface slot out of bounds");
                 request = Some(PlatformRequest::ClearSurface { id });
-            }
-            0x0500 => {
+            },
+            0x0500 => scan::Layout::Operands(1) => {
                 // v2.48 4261ba -> 412770 updates surface zero from surface one.
                 // 256 preserves the current pixels. Repeated levels do no work.
                 let level = self.read(&mut cursor)?;
                 ensure!(level <= 256, "frame blend level exceeds 256");
+                self.frame_blend_level = level;
                 if level != 256 && self.last_frame_blend != Some(level) {
                     let point = |id| SurfacePoint { id, x: 0, y: 0 };
                     let size = self.viewport.map(|n| n as i32);
@@ -3352,26 +3612,26 @@ impl BinaryVm {
                     });
                     self.last_frame_blend = Some(level);
                 }
-            }
-            0x04b1 => {
+            },
+            0x04b1 => scan::Layout::Operands(1) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id <= 256, "image release slot {id} out of bounds");
                 request = Some(PlatformRequest::ReleaseImage { id });
-            }
-            0x04b0 => {
+            },
+            0x04b0 => scan::Layout::Operands(2) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot {id} out of bounds");
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::LoadImage { id, name });
-            }
-            0x04b2 => {
+            },
+            0x04b2 => scan::Layout::Operands(2) => {
                 // v2.48 425b60 binds and relocates the supplied S25 allocation.
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "image slot {id} out of bounds");
                 let address = self.read(&mut cursor)?;
                 request = Some(PlatformRequest::BindImageMemory { id, address });
-            }
-            0x0154 => {
+            },
+            0x0154 => scan::Layout::Operands(6) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 let access = self.read(&mut cursor)?;
                 file_destinations = Some([
@@ -3381,13 +3641,13 @@ impl BinaryVm {
                     self.destination(&mut cursor)?,
                 ]);
                 request = Some(PlatformRequest::OpenFile { name, access });
-            }
-            0x0155 => {
+            },
+            0x0155 => scan::Layout::Operands(1) => {
                 request = Some(PlatformRequest::CloseFile {
                     handle: self.read(&mut cursor)?,
                 })
-            }
-            0x0156 | 0x0157 => {
+            },
+            0x0156 | 0x0157 => scan::Layout::Operands(4) => {
                 let handle = self.read(&mut cursor)?;
                 let address = self.read(&mut cursor)?;
                 let length = self.read(&mut cursor)?;
@@ -3406,8 +3666,8 @@ impl BinaryVm {
                         length,
                     }
                 });
-            }
-            0x0159 => {
+            },
+            0x0159 => scan::Layout::Operands(4) => {
                 let handle = self.read(&mut cursor)?;
                 let distance = self.read(&mut cursor)? as i32;
                 let origin = self.read(&mut cursor)?;
@@ -3417,41 +3677,41 @@ impl BinaryVm {
                     distance,
                     origin,
                 });
-            }
-            0x0158 => {
+            },
+            0x0158 => scan::Layout::Operands(3) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 size_destinations = Some([
                     self.destination(&mut cursor)?,
                     self.destination(&mut cursor)?,
                 ]);
                 request = Some(PlatformRequest::AssetSizes { name });
-            }
-            0x00c8 => {
+            },
+            0x00c8 => scan::Layout::Operands(2) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 let address = self.read(&mut cursor)?;
                 self.memory_range(address, 0)?;
                 request = Some(PlatformRequest::ReadAssetInto { name, address });
-            }
-            0x00c9 => {
+            },
+            0x00c9 => scan::Layout::Operands(2) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::LoadAsset { name });
-            }
-            0x00ce => {
+            },
+            0x00ce => scan::Layout::Operands(1) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::BeginAssetLoad { name });
-            }
-            0x00cf => {
+            },
+            0x00cf => scan::Layout::Operands(1) => {
                 // The portable host completes the read before replying to CE.
                 writes.push((self.destination(&mut cursor)?, 0));
-            }
-            0x00d0 => {
+            },
+            0x00d0 => scan::Layout::Operands(1) => {
                 writes.push((self.destination(&mut cursor)?, self.asset_load_address));
-            }
-            0x00d1 => {
+            },
+            0x00d1 => scan::Layout::Operands(0) => {
                 // Join the completed job. Its result remains script-owned.
-            }
-            0x00d2 => {
+            },
+            0x00d2 => scan::Layout::Operands(3) => {
                 // 424793 -> 405ba0 writes these bytes verbatim. The scenario
                 // owns the slot format; 0136 does not transform raw file writes.
                 let address = self.read(&mut cursor)?;
@@ -3464,8 +3724,8 @@ impl BinaryVm {
                     address,
                     length,
                 });
-            }
-            0x00dd | 0x00df => {
+            },
+            0x00dd | 0x00df => scan::Layout::Operands(1) => {
                 ensure!(
                     opcode == 0x00df || self.archive_paths.len() < 256,
                     "archive search list exceeds 256 entries"
@@ -3500,22 +3760,22 @@ impl BinaryVm {
                         name,
                     };
                 }
-            }
-            0x0032 => self.message_mode = 0,
-            0x0a5c => {
+            },
+            0x0032 => scan::Layout::Operands(0) => self.message_mode = 0,
+            0x0a5c => scan::Layout::Operands(1) => {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::CpuFeatures);
-            }
-            0x0033 => self.message_mode = 1,
-            0x001e => self.context_flags |= 4,
-            0x001f => self.context_flags &= !4,
-            0x02e4 => {
+            },
+            0x0033 => scan::Layout::Operands(0) => self.message_mode = 1,
+            0x001e => scan::Layout::Operands(0) => self.context_flags |= 4,
+            0x001f => scan::Layout::Operands(0) => self.context_flags &= !4,
+            0x02e4 => scan::Layout::Operands(1) => {
                 // v2.48 4269df stores a separate cursor for each task.
                 let address = self.read(&mut cursor)?;
                 self.memory_range(address, 0)?;
                 self.read_cursor = address;
-            }
-            0x02e5..=0x02e7 => {
+            },
+            0x02e5..=0x02e7 => scan::Layout::Operands(1) => {
                 let width = match opcode {
                     0x02e5 => 4,
                     0x02e6 => 1,
@@ -3531,16 +3791,16 @@ impl BinaryVm {
                     .context("read cursor overflow")?;
                 writes.push((destination, u32::from_le_bytes(value)));
                 self.read_cursor = next;
-            }
-            0x02e8 | 0x02e9 => {
+            },
+            0x02e8 | 0x02e9 => scan::Layout::Operands(1) => {
                 let address = if opcode == 0x02e8 {
                     self.read_cursor.wrapping_sub(self.script_base)
                 } else {
                     self.read_cursor
                 };
                 writes.push((self.destination(&mut cursor)?, address));
-            }
-            0x02ee => {
+            },
+            0x02ee => scan::Layout::Operands(1) => {
                 let selector = self.read(&mut cursor)?;
                 ensure!(self.sp > 0, "stack overflow saving execution mode");
                 let value = match selector {
@@ -3550,8 +3810,8 @@ impl BinaryVm {
                 };
                 self.sp -= 1;
                 writes.push((Destination::Bank(8, self.sp), value));
-            }
-            0x02ef => {
+            },
+            0x02ef => scan::Layout::Operands(1) => {
                 let selector = self.read(&mut cursor)?;
                 ensure!(self.sp < CELLS, "stack underflow restoring execution mode");
                 let value = self.banks[&8][self.sp];
@@ -3561,17 +3821,17 @@ impl BinaryVm {
                     1 => self.message_mode = value,
                     _ => {}
                 }
-            }
+            },
             // v2.49 also exposes desktop-sized borderless fullscreen (0778).
             // Both modes use the portable host's borderless fullscreen request.
-            0x0776 | 0x0778 => {
+            0x0776 | 0x0778 => scan::Layout::Operands(1) => {
                 request = Some(PlatformRequest::SetFullscreen {
                     enabled: self.read(&mut cursor)? != 0,
                 })
-            }
-            0x06a5 => request = Some(PlatformRequest::ReleaseAudio),
-            0x06c3 => request = Some(PlatformRequest::ReleaseGraphics),
-            0x0546 => {
+            },
+            0x06a5 => scan::Layout::Operands(0) => request = Some(PlatformRequest::ReleaseAudio),
+            0x06c3 => scan::Layout::Operands(0) => request = Some(PlatformRequest::ReleaseGraphics),
+            0x0546 => scan::Layout::Operands(1) => {
                 let operand = self.read(&mut cursor)?;
                 let (id, flags) = if operand & 0x8000_0000 != 0 {
                     (operand & 0x3fff_ffff, operand & 0xc000_0000)
@@ -3585,8 +3845,8 @@ impl BinaryVm {
                     height: self.viewport[1],
                     flags,
                 });
-            }
-            0x06a4 | 0x06c2 => {
+            },
+            0x06a4 | 0x06c2 => scan::Layout::Operands(1) => {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(if opcode == 0x06a4 {
                     PlatformRequest::InitializeAudio {
@@ -3595,8 +3855,8 @@ impl BinaryVm {
                 } else {
                     PlatformRequest::InitializeGraphics
                 });
-            }
-            0x02db => {
+            },
+            0x02db => scan::Layout::VarArgs => {
                 let mut arguments = Vec::new();
                 while cursor.data.get(cursor.pc) != Some(&0xff) {
                     ensure!(arguments.len() < 256, "format exceeds 256 operands");
@@ -3613,8 +3873,8 @@ impl BinaryVm {
                 })?;
                 bytes.push(0);
                 memory_write = Some((self.memory_range(arguments[0], bytes.len())?, bytes));
-            }
-            0x02da => {
+            },
+            0x02da => scan::Layout::Operands(3) => {
                 let destination = self.read(&mut cursor)?;
                 let format_address = self.read(&mut cursor)?;
                 let format = self.string_bytes(format_address)?;
@@ -3646,16 +3906,16 @@ impl BinaryVm {
                     );
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
-            }
-            0x0104 => {
+            },
+            0x0104 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
                 ensure!(
                     self.string_bytes(address)?.len() < 260,
                     "INI path exceeds engine buffer"
                 );
                 self.ini_path = self.string(address)?;
-            }
-            0x0107 => {
+            },
+            0x0107 => scan::Layout::Operands(3) => {
                 let section = self.string(self.read(&mut cursor)?)?;
                 let key = self.string(self.read(&mut cursor)?)?;
                 let start = cursor.pc;
@@ -3668,13 +3928,13 @@ impl BinaryVm {
                     key,
                     default,
                 });
-            }
-            0x03b6 => {
+            },
+            0x03b6 => scan::Layout::Operands(1) => {
                 // v2.48 41d310: timeGetTime, then write one destination.
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ClockMilliseconds);
-            }
-            0x03b7 | 0x03b8 => {
+            },
+            0x03b7 | 0x03b8 => scan::Layout::Operands(4) => {
                 calendar_destinations = Some([
                     self.destination(&mut cursor)?,
                     self.destination(&mut cursor)?,
@@ -3684,8 +3944,8 @@ impl BinaryVm {
                 request = Some(PlatformRequest::LocalCalendar {
                     time: opcode == 0x03b8,
                 });
-            }
-            0x03bb..=0x03bd => {
+            },
+            0x03bb..=0x03bd => scan::Layout::Timer => {
                 if opcode != 0x03bb {
                     response_destination = Some(self.destination(&mut cursor)?);
                 }
@@ -3695,13 +3955,13 @@ impl BinaryVm {
                     _ => None,
                 };
                 request = Some(PlatformRequest::ClockMilliseconds);
-            }
-            0x03be => {
+            },
+            0x03be => scan::Layout::Operands(1) => {
                 let duration = self.read(&mut cursor)?;
                 let epoch = *self.task_timers.get(&self.current_task).unwrap_or(&0);
                 request = Some(PlatformRequest::WaitTaskTimer { epoch, duration });
-            }
-            0x00b4 | 0x00b6 => {
+            },
+            0x00b4 | 0x00b6 => scan::Layout::Operands(2) => {
                 let values = [self.read(&mut cursor)?, self.read(&mut cursor)?];
                 if opcode == 0x00b4 {
                     ensure!(
@@ -3712,8 +3972,8 @@ impl BinaryVm {
                 } else {
                     self.text_image_offset = values;
                 }
-            }
-            0x00b5 | 0x00b7 => {
+            },
+            0x00b5 | 0x00b7 => scan::Layout::Operands(2) => {
                 let values = if opcode == 0x00b5 {
                     self.text_style.image
                 } else {
@@ -3722,15 +3982,15 @@ impl BinaryVm {
                 for value in values {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
-            }
-            0x0096 => {
+            },
+            0x0096 => scan::Layout::Operands(1) => {
                 // v2.48 424d6a selects the task's text context without
                 // resetting its font, cursor, or image bindings.
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "text context slot out of bounds");
                 new_text_context = Some(id);
-            }
-            0x0078 | 0x007a => {
+            },
+            0x0078 | 0x007a => scan::Layout::TextPosition => {
                 let x = self.read(&mut cursor)?;
                 let y = self.read(&mut cursor)?;
                 let start_x = if opcode == 0x007a {
@@ -3739,14 +3999,14 @@ impl BinaryVm {
                     x
                 };
                 self.text_cursor = [start_x, x, y];
-            }
-            0x0079 => {
+            },
+            0x0079 => scan::Layout::Operands(2) => {
                 let x = self.destination(&mut cursor)?;
                 let y = self.destination(&mut cursor)?;
                 writes.push((x, self.text_cursor[1]));
                 writes.push((y, self.text_cursor[2]));
-            }
-            0x0083 => {
+            },
+            0x0083 => scan::Layout::Operands(2) => {
                 let surface = self.read(&mut cursor)?;
                 let address = self.read(&mut cursor)?;
                 self.text_surface = surface;
@@ -3774,8 +4034,8 @@ impl BinaryVm {
                 if self.text_style.skip_mask & 8 != 0 {
                     request = Some(PlatformRequest::TextInput { clear: true });
                 }
-            }
-            0x0084 => {
+            },
+            0x0084 => scan::Layout::Operands(2) => {
                 let surface = self.read(&mut cursor)?;
                 ensure!(
                     surface < 256 || surface == u32::MAX,
@@ -3824,22 +4084,22 @@ impl BinaryVm {
                         self.text_style = style;
                     }
                 }
-            }
-            0x00a0 => {
+            },
+            0x00a0 => scan::Layout::Operands(1) => {
                 staged_text_address = Some(self.read(&mut cursor)?);
-            }
-            0x00a1 => {
+            },
+            0x00a1 => scan::Layout::Operands(2) => {
                 let task = self.read(&mut cursor)?;
                 ensure!(task < CELLS as u32, "text task slot out of bounds");
                 let destination = self.destination(&mut cursor)?;
                 staged_text_step = Some((task, destination));
-            }
-            0x0547 => {
+            },
+            0x0547 => scan::Layout::Operands(1) => {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "surface release slot out of bounds");
                 request = Some(PlatformRequest::ReleaseSurface { id });
-            }
-            0x0123 => {
+            },
+            0x0123 => scan::Layout::Operands(2) => {
                 // v2.48 420f40 joins directory and filename (414310), then
                 // calls DeleteFileA. The script receives no result operand.
                 let mut path = self.string(self.read(&mut cursor)?)?;
@@ -3853,13 +4113,13 @@ impl BinaryVm {
                     "file deletion path exceeds engine buffer"
                 );
                 request = Some(PlatformRequest::DeleteFile { path });
-            }
-            0x010e => {
+            },
+            0x010e => scan::Layout::Operands(2) => {
                 let path = self.string(self.read(&mut cursor)?)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::FileExists { path });
-            }
-            0x00fd => {
+            },
+            0x00fd => scan::Layout::Operands(2) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::ReadRegistryValue {
@@ -3867,15 +4127,15 @@ impl BinaryVm {
                     path: self.registry_path.clone(),
                     name,
                 });
-            }
-            0x02c6 => {
+            },
+            0x02c6 => scan::Layout::Operands(3) => {
                 let destination = self.read(&mut cursor)?;
                 let source = self.read(&mut cursor)?;
                 let length = self.read(&mut cursor)? as usize;
                 let range = self.memory_range(destination, length)?;
                 memory_write = Some((range, self.memory_read(source, length)?));
-            }
-            0x00fe => {
+            },
+            0x00fe => scan::Layout::Operands(2) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 let address = self.read(&mut cursor)?;
                 self.memory_range(address, 256)?;
@@ -3885,14 +4145,14 @@ impl BinaryVm {
                     path: self.registry_path.clone(),
                     name,
                 });
-            }
-            0x0a28 => {
+            },
+            0x0a28 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
                 self.memory_range(address, 256)?;
                 byte_destination = Some(address);
                 request = Some(PlatformRequest::ProjectDirectory);
-            }
-            0x0a30 => {
+            },
+            0x0a30 => scan::Layout::Operands(2) => {
                 // v2.36 418d60 searches CD drives for a named file and writes
                 // a root string, or an empty string when no disc contains it.
                 let name = self.string(self.read(&mut cursor)?)?;
@@ -3900,16 +4160,16 @@ impl BinaryVm {
                 self.memory_range(address, 4)?;
                 byte_destination = Some(address);
                 request = Some(PlatformRequest::FindMedia { name });
-            }
-            0x0a31 => {
+            },
+            0x0a31 => scan::Layout::Operands(1) => {
                 // The portable host uses the supplied game directory as media.
                 let root = self.string(self.read(&mut cursor)?)?;
                 ensure!(
                     matches!(root.as_str(), ".\\" | "./" | ""),
                     "unsupported media root {root:?}"
                 );
-            }
-            0x0303 | 0x0309 => {
+            },
+            0x0303 | 0x0309 => scan::Layout::Operands(if opcode < 0x0308 { 2 } else { 3 }) => {
                 let base = self.read(&mut cursor)?;
                 let offset = if opcode == 0x0309 {
                     self.read(&mut cursor)?
@@ -3921,8 +4181,8 @@ impl BinaryVm {
                     self.memory_range(base.wrapping_add(offset), 4)?,
                     value.to_le_bytes().to_vec(),
                 ));
-            }
-            0x0302 | 0x0308 => {
+            },
+            0x0302 | 0x0308 => scan::Layout::Operands(if opcode < 0x0308 { 2 } else { 3 }) => {
                 let base = self.read(&mut cursor)?;
                 let offset = if opcode == 0x0308 {
                     self.read(&mut cursor)?
@@ -3935,8 +4195,8 @@ impl BinaryVm {
                         .try_into()?,
                 );
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x0304 | 0x0306 | 0x030a | 0x030c => {
+            },
+            0x0304 | 0x0306 | 0x030a | 0x030c => scan::Layout::Operands(if opcode < 0x0308 { 2 } else { 3 }) => {
                 let address = self.read(&mut cursor)?;
                 let offset = if matches!(opcode, 0x0304 | 0x0306) {
                     0
@@ -3955,8 +4215,8 @@ impl BinaryVm {
                     u32::from(u16::from_le_bytes(bytes.try_into().unwrap()))
                 };
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x0305 | 0x0307 | 0x030b | 0x030d => {
+            },
+            0x0305 | 0x0307 | 0x030b | 0x030d => scan::Layout::Operands(if opcode < 0x0308 { 2 } else { 3 }) => {
                 let address = self.read(&mut cursor)?;
                 let offset = if matches!(opcode, 0x0305 | 0x0307) {
                     0
@@ -3973,8 +4233,8 @@ impl BinaryVm {
                     self.memory_range(address.wrapping_add(offset), width)?,
                     value.to_le_bytes()[..width].to_vec(),
                 ));
-            }
-            0x03de => {
+            },
+            0x03de => scan::Layout::RealExpression => {
                 let expression = self.string_bytes(self.read(&mut cursor)?)?;
                 let value = crate::expression::evaluate_real(&expression, |variable| {
                     self.expression_variable(variable)
@@ -3986,12 +4246,12 @@ impl BinaryVm {
                     (value as f32).to_bits()
                 };
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x02d0 => {
+            },
+            0x02d0 => scan::Layout::Operands(2) => {
                 let length = self.string_bytes(self.read(&mut cursor)?)?.len() as u32;
                 writes.push((self.destination(&mut cursor)?, length));
-            }
-            0x02d1 | 0x02d3 => {
+            },
+            0x02d1 | 0x02d3 => scan::Layout::Operands(2) => {
                 let mut destination = self.read(&mut cursor)?;
                 let source = self.read(&mut cursor)?;
                 let mut bytes = self.string_bytes(source)?;
@@ -4002,12 +4262,12 @@ impl BinaryVm {
                         .context("string destination overflow")?;
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
-            }
-            0x0208 => {
+            },
+            0x0208 => scan::Layout::Operands(1) => {
                 // The marker evaluates its operand but does not retain it.
                 self.read(&mut cursor)?;
-            }
-            0x0209 => {
+            },
+            0x0209 => scan::Layout::Case => {
                 let source = cursor.dword()? as usize;
                 let mut selector = Cursor {
                     data: cursor.data,
@@ -4029,8 +4289,8 @@ impl BinaryVm {
                 };
                 ensure!(target < self.data.len(), "case target outside scenario");
                 cursor.pc = target;
-            }
-            0x0259 => {
+            },
+            0x0259 => scan::Layout::JumpTable => {
                 let table_end = cursor.dword()? as usize;
                 let selector = self.read(&mut cursor)?;
                 ensure!(
@@ -4058,8 +4318,8 @@ impl BinaryVm {
                     }
                     index += 1;
                 }
-            }
-            0x0258 => {
+            },
+            0x0258 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
                 let target = address
                     .checked_sub(self.script_base)
@@ -4070,8 +4330,8 @@ impl BinaryVm {
                     "jump target {target:#x} outside scenario"
                 );
                 cursor.pc = target;
-            }
-            0x03d0 => {
+            },
+            0x03d0 => scan::Layout::Operands(2) => {
                 let task = self.read(&mut cursor)?;
                 let count = self.read(&mut cursor)? as i32;
                 ensure!(
@@ -4099,8 +4359,8 @@ impl BinaryVm {
                         released_scopes.push(scope.allocation);
                     }
                 }
-            }
-            0x03ce => {
+            },
+            0x03ce => scan::Layout::Declarations => {
                 // v2.48: 4270fd calls 41d8f0. The shared declaration helper
                 // uses the global table, skips existing names, and stores zero.
                 let count = cursor.word()? as usize;
@@ -4114,8 +4374,8 @@ impl BinaryVm {
                         writes.push((Destination::NewGlobal(key), 0));
                     }
                 }
-            }
-            0x03cf => {
+            },
+            0x03cf => scan::Layout::Declarations => {
                 let count = cursor.word()? as usize;
                 ensure!(count <= 256, "named declaration exceeds 256 variables");
                 if count == 0 {
@@ -4145,8 +4405,8 @@ impl BinaryVm {
                         names,
                     });
                 }
-            }
-            0x00fa => {
+            },
+            0x00fa => scan::Layout::Operands(2) => {
                 let root = self.read(&mut cursor)?;
                 let address = self.read(&mut cursor)?;
                 ensure!(
@@ -4156,16 +4416,16 @@ impl BinaryVm {
                 let path = self.string(address)?;
                 self.registry_root = root;
                 self.registry_path = path;
-            }
-            0x0034 => request = Some(PlatformRequest::PumpMessages),
-            0x0a8d => request = Some(PlatformRequest::DisableIme),
-            0x02f8 => {
+            },
+            0x0034 => scan::Layout::Operands(0) => request = Some(PlatformRequest::PumpMessages),
+            0x0a8d => scan::Layout::Operands(0) => request = Some(PlatformRequest::DisableIme),
+            0x02f8 => scan::Layout::Operands(1) => {
                 let value = self.read(&mut cursor)?;
                 ensure!(self.sp > 0, "stack overflow pushing operand");
                 self.sp -= 1;
                 writes.push((Destination::Bank(8, self.sp), value));
-            }
-            0x02f9 => {
+            },
+            0x02f9 => scan::Layout::Operands(1) => {
                 ensure!(self.sp < CELLS, "stack underflow popping operand");
                 let value = self.banks[&8][self.sp];
                 // Destination operands see the stack after the pop. Restore
@@ -4175,8 +4435,8 @@ impl BinaryVm {
                 self.sp -= 1;
                 writes.push((destination?, value));
                 self.sp += 1;
-            }
-            0x0212 => {
+            },
+            0x0212 => scan::Layout::LoopStart => {
                 let end = cursor.dword()?;
                 let counter = end
                     .checked_sub(8)
@@ -4187,8 +4447,8 @@ impl BinaryVm {
                     .checked_add(counter)
                     .context("loop counter address overflow")?;
                 memory_write = Some((self.memory_range(address, 4)?, value.to_le_bytes().to_vec()));
-            }
-            0x0213 => {
+            },
+            0x0213 => scan::Layout::LoopEnd => {
                 let counter = cursor.pc;
                 let value = cursor.dword()?.wrapping_sub(1);
                 let target = cursor.dword()? as usize;
@@ -4200,8 +4460,8 @@ impl BinaryVm {
                     self.memory_range(self.script_base + counter as u32, 4)?,
                     value.to_le_bytes().to_vec(),
                 ));
-            }
-            0x0280 => {
+            },
+            0x0280 => scan::Layout::Parameters => {
                 let count = cursor.word()? as usize;
                 let argc = *self
                     .parameters
@@ -4213,8 +4473,8 @@ impl BinaryVm {
                     let value = self.parameters[self.parameters.len() - i - 2];
                     writes.push((self.destination(&mut cursor)?, value));
                 }
-            }
-            0x0281 | 0x0283 => {
+            },
+            0x0281 | 0x0283 => scan::Layout::CallArguments => {
                 let tag = cursor.byte()?;
                 let destination = self.operand_address(tag, &mut cursor)?;
                 if destination != 0 {
@@ -4259,8 +4519,8 @@ impl BinaryVm {
                 self.sp -= 2;
                 cursor.pc = target;
                 next_base = base;
-            }
-            0x0285 => {
+            },
+            0x0285 => scan::Layout::Operands(1) => {
                 let count = *self
                     .parameters
                     .last()
@@ -4304,8 +4564,8 @@ impl BinaryVm {
                 self.sp += 2;
                 cursor.pc = target;
                 next_base = base;
-            }
-            0x0262 | 0x0267 => {
+            },
+            0x0262 | 0x0267 => scan::Layout::Operands(1) => {
                 let operand = self.read(&mut cursor)?;
                 let (base, target) = if opcode == 0x0267 {
                     *self
@@ -4334,8 +4594,8 @@ impl BinaryVm {
                 self.sp -= 2;
                 cursor.pc = target;
                 next_base = base;
-            }
-            0x026c | 0x026d => {
+            },
+            0x026c | 0x026d => scan::Layout::Return => {
                 ensure!(self.sp <= CELLS - 2, "return stack underflow");
                 let address = self.banks[&8][self.sp];
                 let base = self.banks[&8][self.sp + 1];
@@ -4362,8 +4622,8 @@ impl BinaryVm {
                 cursor.pc = target;
                 self.sp = next_sp;
                 next_base = base;
-            }
-            0x000f => {
+            },
+            0x000f => scan::Layout::Operands(1) => {
                 let task = self.read(&mut cursor)?;
                 ensure!(task < CELLS as u32, "task release slot out of bounds");
                 if task == self.current_task {
@@ -4376,13 +4636,13 @@ impl BinaryVm {
                 // clears entry/PC/flags, but does not reset stack or local data.
                 // A later definition supplies a new entry and resets the stack.
                 rescan = true;
-            }
-            0x000d => {
+            },
+            0x000d => scan::Layout::Operands(1) => {
                 // v2.48 424197 restores the registered entry, clears the
                 // parameter count, resets SP to 1000 and sets flags to one.
                 task_restart = Some(self.prepare_task_restart(self.read(&mut cursor)?)?);
-            }
-            0x000c => {
+            },
+            0x000c => scan::Layout::Operands(2) => {
                 let task = self.read(&mut cursor)?;
                 ensure!(
                     task != self.current_task && task < CELLS as u32,
@@ -4398,18 +4658,18 @@ impl BinaryVm {
                     "task target {target:#x} outside scenario"
                 );
                 definition = Some((task, self.script_base, target));
-            }
-            0x076c | 0x076d | 0x078a | 0x0794 | 0x07e4 | 0x0af0 => {
+            },
+            0x076c | 0x076d | 0x078a | 0x0794 | 0x07e4 | 0x0af0 => scan::Layout::Operands(1) => {
                 let task = self.read(&mut cursor)?;
                 self.callback_tasks.insert(opcode, task);
-            }
-            0x02c7 => {
+            },
+            0x02c7 => scan::Layout::Operands(3) => {
                 let address = self.read(&mut cursor)?;
                 let size = self.read(&mut cursor)? as usize;
                 let value = self.read(&mut cursor)? as u8;
                 memory_write = Some((self.memory_range(address, size)?, vec![value; size]));
-            }
-            0x02bd => {
+            },
+            0x02bd => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
                 if address != 0 {
                     ensure!(
@@ -4419,8 +4679,8 @@ impl BinaryVm {
                         "free of unknown allocation {address:#x}"
                     );
                 }
-            }
-            0x02bc => {
+            },
+            0x02bc => scan::Layout::Operands(2) => {
                 let size = self.read(&mut cursor)? as usize;
                 ensure!(
                     size > 0 && size <= 16 * 1024 * 1024,
@@ -4430,32 +4690,32 @@ impl BinaryVm {
                 let address = self.allocation_address(size)?;
                 self.allocations.insert(address, vec![0; size]);
                 writes.push((destination, address));
-            }
-            0x09dd => {
+            },
+            0x09dd => scan::Layout::Operands(2) => {
                 // v2.49 425f80: GetSystemMetrics(index), then result destination.
                 let index = self.read(&mut cursor)? as i32;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::SystemMetric { index });
-            }
-            0x09e2 => {
+            },
+            0x09e2 => scan::Layout::Operands(3) => {
                 let device = self.read(&mut cursor)?;
                 let index = self.read(&mut cursor)? as i32;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::DeviceCaps { device, index });
-            }
-            0x049c => {
+            },
+            0x049c => scan::Layout::Operands(1) => {
                 // v2.48 41dd00: return the current mouse-button mapping.
                 writes.push((self.destination(&mut cursor)?, self.mouse_mapping.value));
-            }
-            0x049d => {
+            },
+            0x049d => scan::Layout::Operands(1) => {
                 let value = self.read(&mut cursor)?;
                 self.mouse_mapping.value = value;
                 event = Event::MouseButtonMapping {
                     location: location.clone(),
                     value,
                 };
-            }
-            0x000a => {
+            },
+            0x000a => scan::Layout::Operands(1) => {
                 let value = self.read(&mut cursor)?.min(CELLS as u32);
                 if value != 0 {
                     self.thread_limit = value;
@@ -4463,13 +4723,13 @@ impl BinaryVm {
                     rescan = true;
                 }
                 self.thread_limit_override = value;
-            }
-            0xd382 => self.file_read_marker = 0xd382,
-            0xaa82 => self.file_write_marker = 0xaa82,
-            0x0048 => self.input_latches = [0; 2],
+            },
+            0xd382 => scan::Layout::Operands(0) => self.file_read_marker = 0xd382,
+            0xaa82 => scan::Layout::Operands(0) => self.file_write_marker = 0xaa82,
+            0x0048 => scan::Layout::Operands(0) => self.input_latches = [0; 2],
             // v2.48 4244ee reads the value set by the inline ~ control.
-            0x0069 => writes.push((self.destination(&mut cursor)?, self.text_marker)),
-            0x0316 | 0x0317 => {
+            0x0069 => scan::Layout::Operands(1) => writes.push((self.destination(&mut cursor)?, self.text_marker)),
+            0x0316 | 0x0317 => scan::Layout::Operands(1) => {
                 let count = self.read(&mut cursor)? as usize;
                 let sp = if opcode == 0x0316 {
                     self.sp.checked_sub(count)
@@ -4479,8 +4739,8 @@ impl BinaryVm {
                 self.sp = sp
                     .filter(|&v| v <= CELLS)
                     .context("stack allocation outside 0..1000")?;
-            }
-            0x0138..=0x013b => {
+            },
+            0x0138..=0x013b => scan::Layout::Operands(1) => {
                 let name = self.string(self.read(&mut cursor)?)?;
                 let system = opcode >= 0x013a;
                 request = Some(if opcode & 1 == 0 {
@@ -4488,11 +4748,11 @@ impl BinaryVm {
                 } else {
                     PlatformRequest::WriteFlags { name, system }
                 });
-            }
-            0x0136 => self.save_encoding = self.read(&mut cursor)?,
-            0x06ba => self.media_flags = self.read(&mut cursor)?,
-            0x06bb => writes.push((self.destination(&mut cursor)?, self.media_flags)),
-            0x0bcf => {
+            },
+            0x0136 => scan::Layout::Operands(1) => self.save_encoding = self.read(&mut cursor)?,
+            0x06ba => scan::Layout::Operands(1) => self.media_flags = self.read(&mut cursor)?,
+            0x06bb => scan::Layout::Operands(1) => writes.push((self.destination(&mut cursor)?, self.media_flags)),
+            0x0bcf => scan::Layout::Operands(4) => {
                 let left = self.read(&mut cursor)?;
                 let right = self.read(&mut cursor)?;
                 let count = self.read(&mut cursor)?;
@@ -4518,8 +4778,8 @@ impl BinaryVm {
                     }
                 }
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x0bd0 => {
+            },
+            0x0bd0 => scan::Layout::Operands(3) => {
                 let destination = self.read(&mut cursor)?;
                 let source = self.read(&mut cursor)?;
                 let count = self.read(&mut cursor)? as usize;
@@ -4545,8 +4805,8 @@ impl BinaryVm {
                     );
                     memory_write = Some((range, bytes));
                 }
-            }
-            0x02d4 | 0x02d6 => {
+            },
+            0x02d4 | 0x02d6 => scan::Layout::Operands(3) => {
                 let left = self.string_bytes(self.read(&mut cursor)?)?;
                 let right = self.string_bytes(self.read(&mut cursor)?)?;
                 let comparison = if opcode == 0x02d4 {
@@ -4562,8 +4822,8 @@ impl BinaryVm {
                     std::cmp::Ordering::Greater => 1,
                 };
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x02d5 => {
+            },
+            0x02d5 => scan::Layout::Operands(2) => {
                 let value = self.read(&mut cursor)?;
                 let tag = *cursor
                     .data
@@ -4575,17 +4835,17 @@ impl BinaryVm {
                     value
                 };
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x038e => {
+            },
+            0x038e => scan::Layout::Operands(2) => {
                 let value = self.read(&mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, value));
-            }
-            0x038f => {
+            },
+            0x038f => scan::Layout::Operands(2) => {
                 let tag = cursor.byte()?;
                 let address = self.operand_address(tag, &mut cursor)?;
                 writes.push((self.destination(&mut cursor)?, address));
-            }
-            0x0391 | 0x0392 | 0x0399 | 0x03a2 => {
+            },
+            0x0391 | 0x0392 | 0x0399 | 0x03a2 => scan::Layout::Operands(1) => {
                 let saved = cursor.pc;
                 let value = self.read(&mut cursor)?;
                 cursor.pc = saved;
@@ -4602,8 +4862,8 @@ impl BinaryVm {
                         _ => (value as i32).wrapping_abs() as u32,
                     },
                 ));
-            }
-            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039a..=0x039f => {
+            },
+            0x0393..=0x0394 | 0x0396..=0x0398 | 0x039a..=0x039f => scan::Layout::Operands(2) => {
                 let first = self.read(&mut cursor)?;
                 let saved = cursor.pc;
                 let second = self.read(&mut cursor)?;
@@ -4622,8 +4882,8 @@ impl BinaryVm {
                     _ => second.wrapping_mul(first),
                 };
                 writes.push((destination, value));
-            }
-            0x03ac => {
+            },
+            0x03ac => scan::Layout::Operands(2) => {
                 let bound = self.read(&mut cursor)?;
                 let destination = self.destination(&mut cursor)?;
                 // v2.36 415a20 and v2.47 41cca0 use unsigned rand() % bound.
@@ -4636,16 +4896,16 @@ impl BinaryVm {
                     ((self.random_state >> 16) & 0x7fff) % bound
                 };
                 writes.push((destination, value));
-            }
-            0x03ad => {
+            },
+            0x03ad => scan::Layout::Operands(1) => {
                 writes.push((self.destination(&mut cursor)?, self.random_seed));
-            }
-            0x03ae => {
+            },
+            0x03ae => scan::Layout::Operands(1) => {
                 let seed = self.read(&mut cursor)?;
                 self.random_seed = seed;
                 self.random_state = seed;
-            }
-            0x03a0 => {
+            },
+            0x03a0 => scan::Layout::Operands(3) => {
                 let divisor = self.read(&mut cursor)?;
                 ensure!(divisor != 0, "unsigned division by zero");
                 let saved = cursor.pc;
@@ -4668,8 +4928,8 @@ impl BinaryVm {
                 }
                 writes.push((destinations[0], dividend / divisor));
                 writes.push((destinations[1], dividend % divisor));
-            }
-            0x01f4 | 0x01fe => {
+            },
+            0x01f4 | 0x01fe => scan::Layout::Conditional => {
                 let left = self.read(&mut cursor)?;
                 let comparison = cursor.byte()?;
                 let right = self.read(&mut cursor)?;
@@ -4708,8 +4968,8 @@ impl BinaryVm {
                     );
                     cursor.pc = target;
                 }
-            }
-            0x03c0 | 0x09f6 => {
+            },
+            0x03c0 | 0x09f6 => scan::Layout::Operands(2) => {
                 let values = if opcode == 0x03c0 {
                     self.version.program_info()
                 } else {
@@ -4718,8 +4978,8 @@ impl BinaryVm {
                 for value in values {
                     writes.push((self.destination(&mut cursor)?, value));
                 }
-            }
-            0x07ee | 0x07ef => {
+            },
+            0x07ee | 0x07ef => scan::Layout::Operands(3) => {
                 let window = self.read(&mut cursor)?;
                 let index = self.read(&mut cursor)? as i32;
                 request = Some(if opcode == 0x07ee {
@@ -4733,61 +4993,62 @@ impl BinaryVm {
                         value,
                     }
                 });
-            }
+            },
             // PostMessageA: v2.36 4182b0, v2.47 41fde0. Window zero
             // selects the engine's main window; all four arguments are read.
-            0x07bc => {
+            0x07bc => scan::Layout::Operands(4) => {
                 request = Some(PlatformRequest::PostWindowMessage {
                     window: self.read(&mut cursor)?,
                     message: self.read(&mut cursor)?,
                     wparam: self.read(&mut cursor)?,
                     lparam: self.read(&mut cursor)?,
                 });
-            }
-            0x0afa => {
+            },
+            0x0afa => scan::Layout::Operands(3) => {
                 let id = self.read(&mut cursor)?;
                 let milliseconds = self.read(&mut cursor)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::SetWindowTimer { id, milliseconds });
-            }
-            0x0afb => {
+            },
+            0x0afb => scan::Layout::Operands(1) => {
                 request = Some(PlatformRequest::KillWindowTimer {
                     id: self.read(&mut cursor)?,
                 })
-            }
-            0x079e | 0x079f => {
+            },
+            0x079e | 0x079f => scan::Layout::Operands(0) => {
                 // v2.48 420770/4207f0 set/clear WS_MINIMIZEBOX. No operands.
                 request = Some(PlatformRequest::SetMinimizeButton {
                     enabled: opcode == 0x079e,
                 });
-            }
-            0x07b3 => {
+            },
+            0x07b3 => scan::Layout::Operands(1) => {
                 // v2.48: 4200e0 returns the main window. The portable host
                 // represents this window with token zero.
                 writes.push((self.destination(&mut cursor)?, 0));
-            }
-            0x07b2 => {
+            },
+            0x07b2 => scan::Layout::Operands(3) => {
                 let class = self.string(self.read(&mut cursor)?)?;
                 let title = self.window_title(self.read(&mut cursor)?)?;
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::FindWindow { class, title });
-            }
-            0x07a8 => {
+            },
+            0x07a8 => scan::Layout::Operands(2) => {
                 let window = self.read(&mut cursor)?;
                 let title = self.window_title(self.read(&mut cursor)?)?;
                 request = Some(PlatformRequest::SetWindowTitle { window, title });
-            }
-            0x08f2 => {
+            },
+            0x08f2 => scan::Layout::Operands(1) => {
                 // v2.48 41ffa0 reads one handle, calls DestroyMenu, and
                 // discards the result. It also restores the main window
                 // when the handle identifies the engine's attached menu.
                 request = Some(PlatformRequest::DestroyMenu {
                     menu: self.read(&mut cursor)?,
                 });
-            }
-            _ => bail!("unsupported binary SCN opcode 0x{opcode:04x}"),
+            },
         }
+        then {
         let next_pc = cursor.pc;
+        if let Some(offset) = callback_advance { self.advance_callback_character(offset); }
         if let Some(address) = staged_text_address {
             self.stage_text(address, location.clone())?;
         }
@@ -4859,6 +5120,7 @@ impl BinaryVm {
             self.pending_bytes = byte_destination;
         }
         Ok(event)
+        }
     }
 }
 
@@ -6179,6 +6441,48 @@ mod tests {
         let mut vm = BinaryVm::new("short.scn", code).unwrap();
         assert!(vm.step().is_err());
         assert_eq!(vm.pc, 0);
+    }
+
+    #[test]
+    fn image_from_surface_preserves_operands_replies_and_instruction_boundaries() {
+        let mut operands = immediate(31);
+        operands.extend(immediate(3));
+        let capture = instruction(0x055c, &operands);
+        let mut code = capture.clone();
+        code.extend(instruction(0x049d, &immediate(7)));
+        let mut vm = BinaryVm::new("image-from-surface.scn", code).unwrap();
+        let memory = SharedMemory::zeroed(4).unwrap();
+        vm.shared_regions.insert(0x100000, memory.clone());
+        vm.image_regions.insert(31, (0x100000, memory));
+        let event = vm.step().unwrap();
+        assert!(matches!(
+            &event,
+            Event::Platform {
+                request: PlatformRequest::CreateImageFromSurface { id: 31, surface: 3 },
+                ..
+            }
+        ));
+        assert!(vm.respond(0).is_err());
+        assert_eq!(vm.step().unwrap(), event);
+        assert!(vm.image_regions.contains_key(&31));
+        vm.respond(1).unwrap();
+        assert!(!vm.image_regions.contains_key(&31));
+        assert!(vm.shared_regions.contains_key(&0x100000));
+        vm.step().unwrap();
+        assert_eq!(vm.mouse_mapping.value, 7);
+
+        for end in 2..capture.len() {
+            let mut vm = BinaryVm::new("truncated.scn", capture[..end].to_vec()).unwrap();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+        }
+        for (id, surface) in [(256, 3), (31, 256)] {
+            let mut operands = immediate(id);
+            operands.extend(immediate(surface));
+            let mut vm = BinaryVm::new("invalid.scn", instruction(0x055c, &operands)).unwrap();
+            assert!(vm.step().is_err());
+            assert_eq!(vm.pc, 0);
+        }
     }
 
     #[test]

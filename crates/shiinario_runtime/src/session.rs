@@ -19,6 +19,14 @@ pub trait Host {
     }
     fn poll(&mut self) -> Result<()>;
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32>;
+    fn message_box(&mut self, text: &str, title: &str, flags: u32) -> Result<Option<u32>> {
+        self.respond(&PlatformRequest::MessageBox {
+            text: text.into(),
+            title: title.into(),
+            flags,
+        })
+        .map(Some)
+    }
     fn point(&mut self, request: &PlatformRequest) -> Result<[i32; 2]>;
     fn mouse_mapping(&mut self, _value: u32) {}
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
@@ -26,6 +34,9 @@ pub trait Host {
     }
     fn install_sound(&mut self, id: u32, sound: Arc<Sound>) -> Result<()>;
     fn sound_command(&mut self, id: u32, command: &SoundCommand) -> Result<u32>;
+    fn pause_stream(&mut self, _handle: u32, _paused: bool) -> Result<()> {
+        bail!("host does not support stream pause")
+    }
     fn stop_stream(&mut self, handle: u32) -> Result<()>;
     fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()>;
     fn play_stream(&mut self, handle: u32, stream: Arc<AudioStream>, flags: u32) -> Result<()>;
@@ -54,6 +65,7 @@ pub struct Session {
     main_loop: Option<MainLoop>,
     window_timers: std::collections::BTreeMap<u32, (u32, u32)>,
     control_repeat: crate::input::ControlRepeat,
+    control_wait_released: bool,
     scan_repeats: std::collections::BTreeMap<u32, crate::input::ControlRepeat>,
     input_settings: crate::input::InputSettings,
 }
@@ -107,6 +119,7 @@ impl Session {
             main_loop: Some(MainLoop::new()),
             window_timers: Default::default(),
             control_repeat: input_settings.repeat(),
+            control_wait_released: false,
             scan_repeats: Default::default(),
             input_settings,
         })
@@ -338,9 +351,17 @@ impl Session {
                 })?;
                 return Ok(true);
             }
-            if let PlatformRequest::Movie { id, command } = &request {
+            if let PlatformRequest::Movie { id, command }
+            | PlatformRequest::DirectMovie { id, command } = &request
+            {
+                let id = *id
+                    + if matches!(request, PlatformRequest::DirectMovie { .. }) {
+                        16
+                    } else {
+                        0
+                    };
                 if matches!(command, MovieCommand::Dimensions) {
-                    let point = self.movies.dimensions(*id)?;
+                    let point = self.movies.dimensions(id)?;
                     vm.respond_point(point)?;
                     emit(&Event::PointReply {
                         point,
@@ -349,9 +370,9 @@ impl Session {
                 } else {
                     let value = if let MovieCommand::Open { name, .. } = command {
                         self.movies
-                            .open(*id, command, project.read(name)?, resources, host)
+                            .open(id, command, project.read(name)?, resources, host)
                     } else {
-                        self.movies.command(*id, command, resources, host)
+                        self.movies.command(id, command, resources, host)
                     }
                     .with_context(|| {
                         format!(
@@ -544,6 +565,49 @@ impl Session {
                 vm.respond(value)?;
                 emit(&Event::PlatformReply {
                     value,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::EnumerateFonts { .. } = &request {
+                let value = vm.respond_font_names(&crate::text_render::font_names()?)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::PauseAudioStream { handle, paused } = &request {
+                if *handle != 0 {
+                    resources
+                        .audio_stream(*handle)
+                        .context("unknown audio stream in pause")?;
+                    host.pause_stream(*handle, *paused)?;
+                }
+                vm.respond(1)?;
+                emit(&Event::PlatformReply {
+                    value: 1,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::WaitControl { mask } = &request {
+                host.poll()?;
+                let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                let controls = host.respond(&PlatformRequest::ReadMergedControls)?;
+                let repeated = self.control_repeat.query(controls, now);
+                let ready = self.control_wait_released && repeated & mask != 0;
+                self.control_wait_released =
+                    !ready && (self.control_wait_released || repeated == 0);
+                vm.respond(u32::from(ready))?;
+                if !ready {
+                    self.state = SessionState::Waiting {
+                        epoch: now,
+                        duration: 10,
+                    };
+                }
+                emit(&Event::PlatformReply {
+                    value: u32::from(ready),
                     simulated: host.simulated(),
                 })?;
                 return Ok(true);
@@ -803,6 +867,22 @@ impl Session {
                 })?;
                 return Ok(true);
             }
+            if let PlatformRequest::MessageBox { text, title, flags } = &request {
+                if let Some(value) = host.message_box(text, title, *flags)? {
+                    vm.respond(value)?;
+                    emit(&Event::PlatformReply {
+                        value,
+                        simulated: host.simulated(),
+                    })?;
+                } else {
+                    let epoch = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                    self.state = SessionState::Waiting {
+                        epoch,
+                        duration: 20,
+                    };
+                }
+                return Ok(true);
+            }
             let resource_reply = resources.respond(project, &request).with_context(|| {
                 format!(
                     "{}:{:#x}: resource request {request:?}",
@@ -817,6 +897,35 @@ impl Session {
                     project.config.height as i32,
                 ];
                 resources.invalidate_display(rect);
+            }
+            let effect_damage = match &request {
+                PlatformRequest::ArithmeticSurface(effect) => Some(&effect.copy),
+                PlatformRequest::WaveSurface(effect) => Some(&effect.copy),
+                _ => None,
+            };
+            if let Some(copy) = effect_damage
+                && copy.destination.id == 0
+            {
+                resources.invalidate_display([
+                    copy.destination.x,
+                    copy.destination.y,
+                    copy.destination.x.saturating_add(copy.size[0]),
+                    copy.destination.y.saturating_add(copy.size[1]),
+                ]);
+            }
+            if matches!(
+                &request,
+                PlatformRequest::RippleSurface(shiinario_scenario::SurfaceRipple {
+                    destination: 0,
+                    ..
+                })
+            ) {
+                resources.invalidate_display([
+                    0,
+                    0,
+                    project.config.width as i32,
+                    project.config.height as i32,
+                ]);
             }
             if let PlatformRequest::BitBlt { copy, .. }
             | PlatformRequest::CopySurfaceAndInvalidate(copy) = &request
@@ -867,6 +976,9 @@ impl Session {
                 value
             } else if let PlatformRequest::InvalidateRect { rect } = &request {
                 resources.invalidate_display(*rect);
+                1
+            } else if let PlatformRequest::ValidateRect { rect } = &request {
+                resources.validate_display(*rect);
                 1
             } else if let PlatformRequest::FileExists { path } = &request {
                 u32::from(resources.file_exists(project, path)?)

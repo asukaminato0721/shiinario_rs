@@ -17,6 +17,7 @@ use std::sync::{
 use std::{collections::BTreeMap, sync::Arc};
 
 struct Voice {
+    paused: bool,
     stream: Arc<AudioStream>,
     frame: u64,
     fraction: u64,
@@ -120,6 +121,9 @@ impl Voice {
         Some([left, right])
     }
     fn next(&mut self, rate: u32) -> Option<[f32; 2]> {
+        if self.paused {
+            return Some([0.0; 2]);
+        }
         let a = self.frame_at(self.frame)?;
         let b = self.frame_at(self.frame + 1).unwrap_or(a);
         let fraction = self.fraction as f32 / rate as f32;
@@ -197,6 +201,9 @@ impl Mixer {
             buffer.advance(frames, 48000);
         }
         self.voices.retain(|_, voice| {
+            if voice.paused {
+                return true;
+            }
             if voice.frame_at(voice.frame).is_none() {
                 return false;
             }
@@ -280,6 +287,7 @@ impl Mixer {
         self.voices.insert(
             handle,
             Voice {
+                paused: false,
                 stream,
                 frame: 0,
                 fraction: 0,
@@ -291,24 +299,34 @@ impl Mixer {
         );
         Ok(())
     }
+    pub fn pause(&mut self, handle: u32, paused: bool) {
+        if let Some(voice) = self.voices.get_mut(&handle) {
+            voice.paused = paused;
+        }
+    }
     pub fn stop(&mut self, handle: u32) {
         self.voices.remove(&handle);
     }
     pub fn is_playing(&self, handle: u32) -> bool {
         self.voices
             .get(&handle)
-            .is_some_and(|voice| voice.frame_at(voice.frame).is_some())
+            .is_some_and(|voice| !voice.paused && voice.frame_at(voice.frame).is_some())
     }
     /// Original 456020 returns playback bit 0, fade bit 1 and worker bit 4.
     pub fn stream_status(&self, handle: u32) -> u32 {
         self.voices
             .get(&handle)
             .filter(|voice| voice.frame_at(voice.frame).is_some())
-            .map_or(0, |voice| 0x11 | if voice.fade.is_some() { 2 } else { 0 })
+            .map_or(0, |voice| {
+                0x11 | if voice.fade.is_some() { 2 } else { 0 } | if voice.paused { 4 } else { 0 }
+            })
     }
     fn next_frame(&mut self, rate: u32) -> [f32; 2] {
         let mut sum = [0.0; 2];
         self.voices.retain(|_, voice| {
+            if voice.paused {
+                return true;
+            }
             if let Some(frame) = voice.next(rate) {
                 sum[0] += frame[0];
                 sum[1] += frame[1];
@@ -454,6 +472,14 @@ impl AudioOutput {
         }
         Ok(())
     }
+    pub fn pause(&self, handle: u32, paused: bool) -> Result<()> {
+        self.check()?;
+        self.mixer
+            .lock()
+            .map_err(|_| anyhow::anyhow!("audio mixer lock poisoned"))?
+            .pause(handle, paused);
+        Ok(())
+    }
     pub fn stop(&self, handle: u32) -> Result<()> {
         self.check()?;
         self.mixer
@@ -526,6 +552,30 @@ fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
 mod tests {
     use super::*;
     use crate::resources::{Resources, Sound};
+    #[test]
+    fn pause_keeps_stream_position_and_fade_until_resume() {
+        let stream = synthetic();
+        let mut mixer = Mixer::default();
+        mixer.play(1, stream.clone(), 2).unwrap();
+        mixer.advance_ms(3);
+        mixer.fade(1, 20, -10, 50).unwrap();
+        let position = mixer.voices[&1].frame;
+        let fraction = mixer.voices[&1].fraction;
+        mixer.pause(1, true);
+        assert_eq!(mixer.stream_status(1), 0x17);
+        mixer.advance_ms(1000);
+        let mut output = [1.0; 64];
+        mixer.render(&mut output, 48000, 2).unwrap();
+        assert!(output.iter().all(|v| *v == 0.0));
+        assert_eq!(mixer.voices[&1].frame, position);
+        assert_eq!(mixer.voices[&1].fraction, fraction);
+        assert_eq!(stream.volume.percent(), 100);
+        mixer.pause(1, false);
+        assert_eq!(mixer.stream_status(1), 0x13);
+        mixer.advance_ms(30);
+        assert_ne!(mixer.voices[&1].frame, position);
+        assert!(stream.volume.percent() < 100);
+    }
     #[test]
     fn configured_loops_repeat_the_range_and_finite_loops_keep_the_final_tail() {
         use crate::resources::AudioLoopRange;

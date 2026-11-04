@@ -11,6 +11,35 @@ use shiinario_scenario::{SharedMemory, TextStyle};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+pub(crate) fn font_names() -> Result<Vec<String>> {
+    #[cfg(target_os = "windows")]
+    {
+        Ok(windows_fonts::installed()
+            .faces()
+            .flat_map(|face| face.families.iter().map(|(name, _)| name.clone()))
+            .collect())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(vec!["sans-serif".into()])
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_arch = "wasm32")))]
+    {
+        let output = std::process::Command::new("fc-list")
+            .args(["--format", "%{family[0]}\n"])
+            .output()
+            .context("enumerate installed font families")?;
+        ensure!(
+            output.status.success(),
+            "Fontconfig family enumeration failed"
+        );
+        Ok(String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::to_owned)
+            .collect())
+    }
+}
+
 #[cfg(any(target_os = "windows", test))]
 mod windows_fonts;
 

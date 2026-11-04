@@ -12,6 +12,7 @@ globalThis.shiinarioNow = () => performance.now();
 globalThis.shiinarioWake = wake;
 globalThis.shiinarioTitle = title => postMessage({ type: 'title', title });
 globalThis.shiinarioFullscreen = enabled => postMessage({ type: 'fullscreen', enabled });
+globalThis.shiinarioMessageBox = (text, title, flags) => postMessage({ type: 'message-box', text, title, flags });
 
 function stop(error) {
   if (stopping) return;
@@ -73,6 +74,7 @@ onmessage = async ({ data }) => {
       case 'key': player?.key(data.scan, data.vk, data.pressed, data.text); wake(); break;
       case 'clock': audioClock = data.time; break;
       case 'focus': player?.focus(data.focused); wake(); break;
+      case 'message-box-reply': player?.message_box_reply(data.value); wake(); break;
       case 'visibility':
         if (visible === data.visible) break;
         visible = data.visible;

@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+mod effects;
+mod gdi;
 mod graphics;
+mod trig;
 
 const LIMIT: usize = 256 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +147,7 @@ struct DisplayDamage(Vec<[i32; 4]>);
 
 #[derive(Default)]
 pub struct Resources {
+    gdi: gdi::Gdi,
     text_renderer: crate::text_render::TextRenderer,
     surfaces: BTreeMap<u32, DrawingSurface>,
     display: Option<Surface>,
@@ -538,6 +542,32 @@ impl Resources {
             self.display_damage.0.retain(|old| !contains(&rect, old));
             self.display_damage.0.push(rect);
         }
+    }
+    /// Subtract a validated rectangle from each queued damage rectangle.
+    pub(crate) fn validate_display(&mut self, [left, top, right, bottom]: [i32; 4]) {
+        if left >= right || top >= bottom {
+            return;
+        }
+        self.display_damage.0 = self
+            .display_damage
+            .0
+            .iter()
+            .flat_map(|&[x0, y0, x1, y1]| {
+                let [l, t, r, b] = [left.max(x0), top.max(y0), right.min(x1), bottom.min(y1)];
+                if l >= r || t >= b {
+                    return vec![[x0, y0, x1, y1]];
+                }
+                [
+                    [x0, y0, x1, t],
+                    [x0, b, x1, y1],
+                    [x0, t, l, b],
+                    [r, t, x1, b],
+                ]
+                .into_iter()
+                .filter(|rect| rect[0] < rect[2] && rect[1] < rect[3])
+                .collect()
+            })
+            .collect();
     }
     /// Publish queued regions at a native paint boundary. Keep holes unchanged.
     /// Return their union only for the host's redraw notification.
@@ -1298,6 +1328,7 @@ impl Resources {
         let resident = self.resident - old + size;
         ensure!(resident <= LIMIT, "drawing resources exceed 256 MiB");
         let pixels = SharedMemory::zeroed(size)?;
+        self.gdi.forget_surface(id);
         self.surfaces.insert(
             id,
             DrawingSurface {
@@ -1320,6 +1351,7 @@ impl Resources {
     }
     fn release_surface(&mut self, id: u32) -> Result<()> {
         ensure!(id < 256, "surface release slot out of bounds");
+        self.gdi.forget_surface(id);
         if let Some(surface) = self.surfaces.remove(&id) {
             self.resident -= surface.pixels.len();
         }
@@ -1469,6 +1501,25 @@ impl Resources {
         self.resident = resident;
         Ok(())
     }
+    fn create_image_from_surface(&mut self, id: u32, surface: u32) -> Result<()> {
+        let source = self
+            .surfaces
+            .get(&surface)
+            .context("missing capture source")?;
+        let [width, height] = [source.width, source.height];
+        self.create_image(id, width, height, 3, 1)?;
+        self.capture_surface(&SurfaceCapture {
+            image: id,
+            frame: 0,
+            destination: [0, 0],
+            size: [width as i32, height as i32],
+            source: shiinario_scenario::SurfacePoint {
+                id: surface,
+                x: 0,
+                y: 0,
+            },
+        })
+    }
     fn fill_image(&mut self, id: u32, frame: u32, rect: [u32; 4], color: u32) -> Result<()> {
         let Image::Mutable {
             bytes_per_pixel,
@@ -1576,6 +1627,17 @@ impl Resources {
 
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        if let PlatformRequest::DrawingContext { surface } = request {
+            let surface = if *surface == u32::MAX { 0 } else { *surface };
+            ensure!(
+                self.surfaces.contains_key(&surface),
+                "drawing context surface is not allocated"
+            );
+            return Ok(Some(gdi::drawing_context(surface)?));
+        }
+        if let PlatformRequest::Gdi(command) = request {
+            return self.gdi.respond(command, &self.surfaces).map(Some);
+        }
         if let PlatformRequest::SetAudioStreamLoop {
             handle,
             start_ms,
@@ -1675,6 +1737,25 @@ impl Resources {
             } => self.set_image_origin(*id, *frame, *position)?,
             PlatformRequest::BlendSurfaces(blend) => self.blend_surfaces(blend)?,
             PlatformRequest::BlendImages(blend) => self.blend_images(blend)?,
+            PlatformRequest::CopyImage(copy) => self.copy_image(copy)?,
+            PlatformRequest::ArithmeticSurface(effect) => self.arithmetic_surface(effect)?,
+            PlatformRequest::WaveSurface(effect) => self.wave_surface(effect)?,
+            PlatformRequest::RippleSurface(effect) => self.ripple_surface(effect)?,
+            PlatformRequest::PresentSurface {
+                source,
+                level,
+                update,
+            } => {
+                self.present_surface(*source, *level)?;
+                if *update {
+                    self.invalidate_display([
+                        0,
+                        0,
+                        project.config.width as i32,
+                        project.config.height as i32,
+                    ]);
+                }
+            }
             PlatformRequest::CopySurface(copy)
             | PlatformRequest::CopySurfaceAndInvalidate(copy) => self.copy_surface(copy)?,
             PlatformRequest::BitBlt {
@@ -1716,6 +1797,9 @@ impl Resources {
                 bytes_per_pixel,
                 frames,
             } => self.create_image(*id, *width, *height, *bytes_per_pixel, *frames)?,
+            PlatformRequest::CreateImageFromSurface { id, surface } => {
+                self.create_image_from_surface(*id, *surface)?
+            }
             PlatformRequest::FillImage {
                 id,
                 frame,
@@ -1746,6 +1830,27 @@ impl Resources {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn validated_pixels_stay_unpainted_inside_a_damage_rectangle() {
+        let mut resources = Resources::default();
+        resources.create_surface(0, 4, 4, 0).unwrap();
+        resources.commit_display([0, 0, 4, 4]);
+        resources.fill_surface(0, [0, 0, 4, 4], [7, 8, 9]).unwrap();
+        resources.invalidate_display([0, 0, 4, 4]);
+        resources.validate_display([1, 1, 3, 3]);
+        resources.paint_display().unwrap();
+        let display = resources.display.as_ref().unwrap();
+        for y in 0..4 {
+            for x in 0..4 {
+                let inside = (1..3).contains(&x) && (1..3).contains(&y);
+                let at = (y * 4 + x) * 4;
+                assert_eq!(
+                    &display.rgba[at..at + 3],
+                    if inside { &[0, 0, 0] } else { &[7, 8, 9] }
+                );
+            }
+        }
+    }
     #[test]
     fn loop_setup_converts_time_preserves_sentinels_and_rejects_invalid_updates() {
         let mut resources = Resources::default();
@@ -1968,6 +2073,52 @@ mod tests {
         operation.mode = 0;
         assert!(resources.stretch_surface(&operation).is_err());
         assert_eq!(resources.surfaces[&0].pixels.read(0, 24).unwrap(), expected);
+    }
+    #[test]
+    fn image_from_surface_copies_padded_rows_and_replaces_only_the_image() {
+        let mut resources = Resources::default();
+        resources.create_surface(3, 3, 2, 0).unwrap();
+        let pixels = resources.surface_memory(3).unwrap();
+        pixels
+            .write(
+                0,
+                &[
+                    1, 2, 3, 4, 5, 6, 7, 8, 9, 0xde, 0xad, 0xbe, 10, 11, 12, 13, 14, 15, 16, 17,
+                    18, 0xef, 0xca, 0xfe,
+                ],
+            )
+            .unwrap();
+        resources.create_image(31, 1, 1, 4, 2).unwrap();
+        resources.set_image_origin(31, 0, [17, -9]).unwrap();
+        let previous = resources.frame(31, 0).unwrap().surface;
+        let resident = resources.resident_bytes();
+        assert!(resources.create_image_from_surface(31, 4).is_err());
+        assert!(resources.create_image_from_surface(256, 3).is_err());
+        assert_eq!(resources.frame(31, 0).unwrap().surface, previous);
+        assert_eq!(resources.image_bounds(31, 0).unwrap(), [17, -9, 18, -8]);
+        assert_eq!(resources.resident_bytes(), resident);
+
+        resources.create_image_from_surface(31, 3).unwrap();
+        let frame = resources.frame(31, 0).unwrap();
+        assert_eq!(resources.image_bounds(31, 0).unwrap(), [0, 0, 3, 2]);
+        assert_eq!(frame.methods, [2; 6]);
+        assert_eq!(
+            frame.surface.rgba,
+            [
+                3, 2, 1, 255, 6, 5, 4, 255, 9, 8, 7, 255, 12, 11, 10, 255, 15, 14, 13, 255, 18, 17,
+                16, 255,
+            ]
+        );
+        assert!(resources.frame(31, 1).is_err());
+        assert_eq!(resources.resident_bytes(), 48);
+        pixels.write(0, &[99; 24]).unwrap();
+        assert_eq!(resources.frame(31, 0).unwrap().surface, frame.surface);
+        resources.fill_image(31, 0, [0, 0, 1, 1], 0x112233).unwrap();
+        assert_eq!(
+            &resources.frame(31, 0).unwrap().surface.rgba[..4],
+            &[34, 0, 17, 255]
+        );
+        assert_eq!(pixels.read(0, 24).unwrap(), [99; 24]);
     }
     #[test]
     fn malformed_mutable_image_operations_preserve_existing_pixels_and_budget() {

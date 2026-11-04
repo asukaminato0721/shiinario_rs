@@ -6,6 +6,7 @@ pub mod audio;
 mod browser;
 mod buffer_audio;
 mod calendar;
+mod dialog;
 pub mod executor;
 #[cfg(not(target_arch = "wasm32"))]
 mod gamepad;
@@ -269,6 +270,10 @@ impl Host for TracePlatform {
     fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
         self.mixer.fade(handle, interval, step, target)
     }
+    fn pause_stream(&mut self, handle: u32, paused: bool) -> Result<()> {
+        self.mixer.pause(handle, paused);
+        Ok(())
+    }
     fn stop_stream(&mut self, handle: u32) -> Result<()> {
         self.mixer.stop(handle);
         Ok(())
@@ -313,6 +318,7 @@ impl Host for TracePlatform {
                 Ok(1)
             }
             PlatformRequest::ReadIniInteger { default, .. } => Ok(*default),
+            PlatformRequest::MessageBox { flags, .. } => dialog::default_reply(*flags),
             PlatformRequest::ClockMilliseconds => Ok(self.clock_ms),
             PlatformRequest::WaitTaskTimer { epoch, duration } => {
                 let ready = self.clock_ms.wrapping_sub(*epoch) >= *duration;

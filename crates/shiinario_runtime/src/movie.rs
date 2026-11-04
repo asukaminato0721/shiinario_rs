@@ -103,6 +103,8 @@ impl Video {
 }
 
 struct Movie {
+    explicit: bool,
+    last_frame: Option<Surface>,
     video: Video,
     audio: Option<Sound>,
     audio_delay_ms: u64,
@@ -198,6 +200,8 @@ impl Movie {
         video.end_us = first_time + interval_us;
         video.next = Some((first_time, first));
         Ok(Self {
+            explicit: false,
+            last_frame: None,
             video,
             audio,
             audio_delay_ms: audio_pts.map_or(0, |pts| (pts - origin / 1000).max(0) as u64),
@@ -297,16 +301,16 @@ impl Movie {
         if let Some(frame) = self.video.frame_at(self.position_ms * 1000)? {
             let mut rgba = vec![0; frame.width * frame.height * 4];
             frame_to_rgba_bt601_limited(&frame, &mut rgba);
-            resources.write_movie_frame(
-                self.surface,
-                self.rect,
-                &Surface {
-                    width: frame.width as u32,
-                    height: frame.height as u32,
-                    rgba,
-                },
-            )?;
-            if self.surface == 0 {
+            let frame = Surface {
+                width: frame.width as u32,
+                height: frame.height as u32,
+                rgba,
+            };
+            if !self.explicit {
+                resources.write_movie_frame(self.surface, self.rect, &frame)?;
+            }
+            self.last_frame = Some(frame);
+            if !self.explicit && self.surface == 0 {
                 resources.commit_display([0, 0, i32::MAX, i32::MAX]);
                 invalidate(host)?;
             }
@@ -404,13 +408,14 @@ impl Movies {
         else {
             anyhow::bail!("expected movie open command");
         };
-        ensure!(id < 16, "movie slot out of bounds");
+        ensure!(id < 32, "movie slot out of bounds");
         let surface = if *surface == u32::MAX { 0 } else { *surface };
         ensure!(
             resources.surface_memory(surface).is_some(),
             "missing movie surface {surface}"
         );
-        let movie = Movie::open(bytes, surface, *flags)?;
+        let mut movie = Movie::open(bytes, surface, *flags)?;
+        movie.explicit = id >= 16;
         let resident: usize = self
             .slots
             .iter()
@@ -437,11 +442,38 @@ impl Movies {
         resources: &mut Resources,
         host: &mut impl Host,
     ) -> Result<u32> {
-        ensure!(id < 16, "movie slot out of bounds");
+        ensure!(id < 32, "movie slot out of bounds");
+        if matches!(command, MovieCommand::Close) {
+            if let Some(movie) = self.slots.get_mut(&id) {
+                movie.stop_audio(id, host)?;
+            }
+            self.slots.remove(&id);
+            return Ok(1);
+        }
+        if id >= 16 && !self.slots.contains_key(&id) && matches!(command, MovieCommand::Status) {
+            return Ok(STOPPED);
+        }
         let movie = self.slots.get_mut(&id).context("unknown movie slot")?;
         let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
         movie.update(id, now, resources, host)?;
         match command {
+            MovieCommand::DrawToSurface { surface, position } => {
+                if matches!(movie.state, PLAYING | PAUSED)
+                    && let Some(frame) = &movie.last_frame
+                {
+                    resources.write_movie_frame(
+                        *surface,
+                        [
+                            position[0],
+                            position[1],
+                            frame.width as i32,
+                            frame.height as i32,
+                        ],
+                        frame,
+                    )?;
+                }
+            }
+            MovieCommand::Close => unreachable!(),
             MovieCommand::Stop => {
                 movie.stop_audio(id, host)?;
                 movie.state = STOPPED;

@@ -81,6 +81,97 @@ fn command(m: &mut Movies, r: &mut Resources, h: &mut TestHost, c: Cmd) -> u32 {
 }
 
 #[test]
+fn direct_movie_slots_draw_explicitly_and_preserve_legacy_slots() {
+    let (mut movies, mut resources, mut host) = setup(false);
+    command(&mut movies, &mut resources, &mut host, Cmd::Pause);
+    let legacy = resources.surface(13).unwrap();
+    let untouched = resources.surface(0).unwrap();
+    movies
+        .open(
+            16,
+            &Cmd::Open {
+                name: "fixture.mpg".into(),
+                flags: 0,
+                surface: 0,
+                play: true,
+            },
+            FIXTURE.to_vec(),
+            &mut resources,
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(resources.surface(0).unwrap(), untouched);
+    assert_eq!(movies.dimensions(16).unwrap(), [32, 24]);
+    host.clock += 100;
+    movies.update(&mut host, &mut resources).unwrap();
+    assert_eq!(resources.surface(0).unwrap(), untouched);
+    assert_eq!(
+        movies
+            .command(16, &Cmd::Status, &mut resources, &mut host)
+            .unwrap(),
+        0x20e
+    );
+    movies
+        .command(
+            16,
+            &Cmd::DrawToSurface {
+                surface: 0,
+                position: [3, 4],
+            },
+            &mut resources,
+            &mut host,
+        )
+        .unwrap();
+    assert_ne!(resources.surface(0).unwrap(), untouched);
+    assert_eq!(resources.surface(13).unwrap(), legacy);
+    movies
+        .command(16, &Cmd::Pause, &mut resources, &mut host)
+        .unwrap();
+    host.clock += 1000;
+    movies.update(&mut host, &mut resources).unwrap();
+    assert_eq!(
+        movies
+            .command(16, &Cmd::Status, &mut resources, &mut host)
+            .unwrap(),
+        0x211
+    );
+    movies
+        .command(16, &Cmd::Play, &mut resources, &mut host)
+        .unwrap();
+    assert_eq!(
+        movies
+            .command(16, &Cmd::Status, &mut resources, &mut host)
+            .unwrap(),
+        0x20e
+    );
+    movies
+        .command(
+            16,
+            &Cmd::SetVolume { percent: 25 },
+            &mut resources,
+            &mut host,
+        )
+        .unwrap();
+    assert_eq!(
+        movies
+            .command(16, &Cmd::Volume, &mut resources, &mut host)
+            .unwrap(),
+        25
+    );
+    movies
+        .command(16, &Cmd::Close, &mut resources, &mut host)
+        .unwrap();
+    assert_eq!(
+        movies
+            .command(16, &Cmd::Status, &mut resources, &mut host)
+            .unwrap(),
+        0x20d
+    );
+    assert!(movies.dimensions(16).is_err());
+    assert_eq!(movies.dimensions(0).unwrap(), [32, 24]);
+}
+
+#[test]
 fn movie_deadlines_advance_frames_and_completion_without_millisecond_polling() {
     let (mut movies, mut resources, mut host) = setup(false);
     let first = resources

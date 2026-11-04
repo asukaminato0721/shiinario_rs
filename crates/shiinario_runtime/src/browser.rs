@@ -22,6 +22,8 @@ extern "C" {
     fn browser_now() -> f64;
     #[wasm_bindgen(js_name = shiinarioWake)]
     fn browser_wake();
+    #[wasm_bindgen(js_name = shiinarioMessageBox)]
+    fn browser_message_box(text: &str, title: &str, flags: u32);
 }
 fn js_error(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
@@ -40,8 +42,22 @@ struct BrowserHost {
     text_key: bool,
     window_messages: Vec<[u32; 3]>,
     wake_input: bool,
+    dialog_pending: bool,
+    dialog_reply: Option<u32>,
 }
 impl Host for BrowserHost {
+    fn message_box(&mut self, text: &str, title: &str, flags: u32) -> Result<Option<u32>> {
+        crate::dialog::default_reply(flags)?;
+        if let Some(value) = self.dialog_reply.take() {
+            self.dialog_pending = false;
+            return Ok(Some(value));
+        }
+        if !self.dialog_pending {
+            browser_message_box(text, title, flags);
+            self.dialog_pending = true;
+        }
+        Ok(None)
+    }
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
         std::mem::take(&mut self.window_messages)
     }
@@ -75,6 +91,10 @@ impl Host for BrowserHost {
     }
     fn fade_stream(&mut self, handle: u32, interval: u32, step: i32, target: u32) -> Result<()> {
         self.audio.fade(handle, interval, step, target)
+    }
+    fn pause_stream(&mut self, handle: u32, paused: bool) -> Result<()> {
+        self.audio.pause(handle, paused);
+        Ok(())
     }
     fn stop_stream(&mut self, handle: u32) -> Result<()> {
         self.audio.stop(handle);
@@ -221,6 +241,8 @@ impl BrowserPlayer {
                     audio: Mixer::default(),
                     text_key: false,
                     window_messages: Vec::new(),
+                    dialog_pending: false,
+                    dialog_reply: None,
                     wake_input: false,
                 },
             })
@@ -328,6 +350,14 @@ impl BrowserPlayer {
                 self.host.controls.keys[left] || self.host.controls.keys[right],
             );
         }
+    }
+    pub fn message_box_reply(&mut self, value: u32) -> std::result::Result<(), JsValue> {
+        if !self.host.dialog_pending || !matches!(value, 1 | 2 | 6 | 7) {
+            return Err(JsValue::from_str("invalid message box reply"));
+        }
+        self.host.dialog_reply = Some(value);
+        self.host.wake_input = true;
+        Ok(())
     }
     pub fn focus(&mut self, focused: bool) {
         self.host.wake_input = true;

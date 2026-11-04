@@ -7,9 +7,10 @@ mod memory;
 mod text;
 pub mod text_layout;
 pub use binary::{
-    BinaryVm, ImageAffine, ImageBlend, ImageDraw, ImagePoint, MaskTransition, MouseButtonMapping,
-    MovieCommand, PlatformRequest, SoundCommand, SurfaceBlend, SurfaceCapture, SurfaceCopy,
-    SurfacePoint, SurfaceStretch, boot_binary,
+    BinaryVm, GdiCommand, ImageAffine, ImageBlend, ImageCopy, ImageDraw, ImagePoint,
+    MaskTransition, MouseButtonMapping, MovieCommand, PlatformRequest, SoundCommand,
+    SurfaceArithmetic, SurfaceBlend, SurfaceCapture, SurfaceCopy, SurfacePoint, SurfaceRipple,
+    SurfaceStretch, SurfaceWave, boot_binary, scan,
 };
 pub use memory::SharedMemory;
 pub use text::{TextEncoding, TextStyle};
@@ -84,7 +85,10 @@ impl TextScript {
             } else if let Some(command) = text.strip_prefix('$') {
                 flush(&mut records, &mut paragraph);
                 let mut fields = command.split(',');
-                let command = fields.next().unwrap();
+                let first = fields.next().unwrap();
+                let (command, first_arg) = first
+                    .split_once(char::is_whitespace)
+                    .map_or((first, None), |(name, arg)| (name, Some(arg.trim_start())));
                 ensure!(
                     !command.is_empty()
                         && command.bytes().all(|c| c.is_ascii_uppercase() || c == b'_'),
@@ -94,7 +98,11 @@ impl TextScript {
                 records.push(Record::Command {
                     location,
                     name: command.to_owned(),
-                    args: fields.map(str::to_owned).collect(),
+                    args: first_arg
+                        .into_iter()
+                        .chain(fields)
+                        .map(str::to_owned)
+                        .collect(),
                 });
             } else {
                 match &mut paragraph {
@@ -469,6 +477,18 @@ impl TextVm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn inventory_accepts_both_wait_separators_and_keeps_offsets() {
+        let script = TextScript::parse("H0516_01B.TXT", b"$WAIT 500\r\n$WAIT,500\r\n").unwrap();
+        for record in &script.records {
+            assert!(
+                matches!(record, Record::Command { name, args, .. } if name == "WAIT" && args == &["500"])
+            );
+        }
+        assert_eq!(script.records[1].location().offset, 11);
+        assert_eq!(script.inventory()["WAIT"], 2);
+        assert!(TextScript::parse("invalid", b"$bad 500\n").is_err());
+    }
     #[test]
     fn cp932_offsets_and_paragraphs() {
         let (raw, _, _) =

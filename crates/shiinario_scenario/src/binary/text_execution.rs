@@ -82,6 +82,7 @@ pub(super) struct TextCallback {
     previous: u32,
     stack_pointer: usize,
     text: AsyncText,
+    read_offset: usize,
 }
 
 struct TextCo(Co<TextYield>);
@@ -262,6 +263,10 @@ struct TextGlyph {
 
 impl BinaryVm {
     fn begin_text_callback(&mut self, task: u32) -> Result<Event> {
+        let read_offset = self
+            .text_glyph()?
+            .context("text callback has no glyph")?
+            .offset;
         ensure!(
             self.text_callback.is_none(),
             "recursive text callback is unresolved"
@@ -286,6 +291,7 @@ impl BinaryVm {
             previous,
             stack_pointer: self.sp,
             text,
+            read_offset,
         });
         self.text_callback_result = 0;
         self.switch_scenario(base);
@@ -297,7 +303,35 @@ impl BinaryVm {
         let callback = self.text_callback.take().unwrap();
         self.sp = callback.stack_pointer;
         self.select_task(callback.previous);
-        self.async_text = Some(callback.text);
+        let mut text = callback.text;
+        text.offset = callback.read_offset;
+        self.async_text = Some(text);
+    }
+    pub(super) fn next_callback_character(&self) -> Result<(u32, usize)> {
+        let callback = self
+            .text_callback
+            .as_ref()
+            .context("character read requires an active text callback")?;
+        let address = callback
+            .text
+            .address
+            .checked_add(callback.read_offset as u32)
+            .context("text character address overflow")?;
+        let first = self.memory_read(address, 1)?[0];
+        let length = if first == 0 {
+            0
+        } else if matches!(first, 0x81..=0x9f | 0xe0..=0xfc) {
+            2
+        } else {
+            1
+        };
+        let bytes = self.memory_read(address, length)?;
+        let mut value = [0; 4];
+        value[..length].copy_from_slice(&bytes);
+        Ok((u32::from_le_bytes(value), callback.read_offset + length))
+    }
+    pub(super) fn advance_callback_character(&mut self, offset: usize) {
+        self.text_callback.as_mut().unwrap().read_offset = offset;
     }
     fn text_snapshot(&self) -> TextContext {
         TextContext {
@@ -681,7 +715,7 @@ impl BinaryVm {
         }
         self.text_cursor = layout.cursor;
         self.text_layout = layout;
-        text.offset = offset;
+        text.offset = text.offset.max(offset);
         Ok(())
     }
 }
@@ -1069,6 +1103,49 @@ mod tests {
             assert_eq!(vm.text_cursor[1], 2 * vm.text_style.half_advance);
             assert_eq!(vm.text_surface, 9);
         }
+    }
+
+    #[test]
+    fn callback_reads_consume_following_cp932_characters_without_drawing_them() {
+        let mut code = 0x0083u16.to_le_bytes().to_vec();
+        code.extend(immediate(0));
+        code.extend(b"\x10A\x82\xa0B\0");
+        code.extend(0u16.to_le_bytes());
+        code.extend(immediate(0));
+        let entry = code.len();
+        for index in 0..3 {
+            code.extend(0x0066u16.to_le_bytes());
+            code.extend([14, index, 0]);
+        }
+        code.extend(0u16.to_le_bytes());
+        code.extend(immediate(0));
+        let mut vm = BinaryVm::new("read-characters.scn", code).unwrap();
+        vm.define_task(10, vm.script_base, entry, false);
+        vm.text_style.fullwidth_ascii = false;
+        vm.text_style.glyph_task = 10;
+        let mut glyphs = Vec::new();
+        let mut ended = false;
+        let mut steps = 0;
+        while !ended && steps < 100 {
+            match vm.scheduled_step().unwrap() {
+                Event::Platform {
+                    request: PlatformRequest::DrawGlyph { character, .. },
+                    ..
+                } => {
+                    glyphs.push(character);
+                    vm.respond(1).unwrap();
+                }
+                Event::Platform { .. } | Event::SchedulerPoll => vm.respond(1).unwrap(),
+                Event::End => ended = true,
+                _ => {}
+            }
+            steps += 1;
+        }
+        assert!(ended);
+        assert_eq!(glyphs, ['A']);
+        assert_eq!(&vm.banks[&14][..3], &[0xa082, u32::from(b'B'), 0]);
+        assert_eq!(vm.current_task, 0);
+        assert_eq!(vm.sp, CELLS);
     }
 
     #[test]
