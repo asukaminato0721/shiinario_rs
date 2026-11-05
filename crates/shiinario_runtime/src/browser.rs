@@ -24,11 +24,16 @@ extern "C" {
     fn browser_wake();
     #[wasm_bindgen(js_name = shiinarioMessageBox)]
     fn browser_message_box(text: &str, title: &str, flags: u32);
+    #[wasm_bindgen(js_name = shiinarioEdit)]
+    fn browser_edit(window: u32, text: &str, x: i32, y: i32, width: i32, height: i32);
+    #[wasm_bindgen(js_name = shiinarioDestroyEdit)]
+    fn browser_destroy_edit(window: u32);
 }
 fn js_error(error: anyhow::Error) -> JsValue {
     JsValue::from_str(&format!("{error:#}"))
 }
 struct BrowserHost {
+    edits: crate::edit::Edits,
     elapsed: u32,
     controls: ControlState,
     async_keys: AsyncKeys,
@@ -46,6 +51,9 @@ struct BrowserHost {
     dialog_reply: Option<u32>,
 }
 impl Host for BrowserHost {
+    fn window_text(&mut self, window: u32, capacity: u32) -> Result<Vec<u8>> {
+        self.edits.text(window, capacity)
+    }
     fn message_box(&mut self, text: &str, title: &str, flags: u32) -> Result<Option<u32>> {
         crate::dialog::default_reply(flags)?;
         if let Some(value) = self.dialog_reply.take() {
@@ -105,6 +113,21 @@ impl Host for BrowserHost {
         Ok(())
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
+        if let Some(value) = self.edits.respond(request)? {
+            match request {
+                PlatformRequest::CreateEdit { text, rect } => {
+                    browser_edit(value, text, rect[0], rect[1], rect[2], rect[3])
+                }
+                PlatformRequest::DestroyEdit { window } => browser_destroy_edit(*window),
+                PlatformRequest::SetWindowTitle { window, title } => {
+                    browser_edit(*window, title, 0, 0, 0, 0)
+                }
+                _ => {}
+            }
+            self.dirty = true;
+            return Ok(value);
+        }
+
         match request {
             PlatformRequest::SetCursorPosition { position } => {
                 // Browsers cannot move the operating-system pointer.
@@ -226,6 +249,7 @@ impl BrowserPlayer {
                 session,
                 stopped: false,
                 host: BrowserHost {
+                    edits: Default::default(),
                     elapsed: 0,
                     controls: ControlState {
                         focused: true,
@@ -286,6 +310,9 @@ impl BrowserPlayer {
     /// The worker can sleep until this delay, subject to its audio deadline.
     pub fn next_wake_delay_ms(&self, elapsed_ms: u32) -> u32 {
         self.session.next_wake_delay_ms(elapsed_ms).unwrap_or(0)
+    }
+    pub fn edit_text(&mut self, window: u32, text: String) -> std::result::Result<(), JsValue> {
+        self.host.edits.set_text(window, &text).map_err(js_error)
     }
     pub fn frame(&mut self) -> Vec<u8> {
         if !self.host.dirty {

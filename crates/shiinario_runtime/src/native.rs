@@ -19,12 +19,15 @@ use std::{
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::{ElementState, MouseButton, WindowEvent},
+    event::{ElementState, Ime, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop, run_on_demand::EventLoopExtRunOnDemand},
     icon::RgbaIcon,
     keyboard::{KeyCode, PhysicalKey},
     monitor::Fullscreen,
-    window::{ImeRequest, Window, WindowAttributes, WindowButtons, WindowId},
+    window::{
+        ImeCapabilities, ImeEnableRequest, ImeRequest, ImeRequestData, Window, WindowAttributes,
+        WindowButtons, WindowId,
+    },
 };
 
 #[derive(Default)]
@@ -107,6 +110,7 @@ pub(crate) fn run_with_event_loop(
     Ok(())
 }
 struct NativeHost {
+    edits: crate::edit::Edits,
     window: Arc<dyn Window>,
     started: Instant,
     controls: ControlState,
@@ -173,6 +177,9 @@ impl NativeHost {
     }
 }
 impl Host for NativeHost {
+    fn window_text(&mut self, window: u32, capacity: u32) -> Result<Vec<u8>> {
+        self.edits.text(window, capacity)
+    }
     fn take_window_messages(&mut self) -> Vec<[u32; 3]> {
         std::mem::take(&mut self.window_messages)
     }
@@ -244,6 +251,20 @@ impl Host for NativeHost {
         Ok(())
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
+        if let Some(value) = self.edits.respond(request)? {
+            self.dirty = true;
+            if matches!(request, PlatformRequest::CreateEdit { .. }) {
+                let caps = ImeCapabilities::new();
+                let enable = ImeEnableRequest::new(caps, ImeRequestData::default())
+                    .context("invalid IME capabilities")?;
+                self.window.request_ime_update(ImeRequest::Disable)?;
+                self.window.request_ime_update(ImeRequest::Enable(enable))?;
+            } else if self.edits.is_empty() {
+                self.window.request_ime_update(ImeRequest::Disable)?;
+            }
+            return Ok(value);
+        }
+
         match request {
             PlatformRequest::MessageBox { text, title, flags } => {
                 crate::dialog::show(text, title, *flags)
@@ -412,6 +433,7 @@ impl App<'_> {
         );
         let presentation = pollster::block_on(Presentation::new(window.clone(), logical))?;
         self.host = Some(NativeHost {
+            edits: Default::default(),
             controls: ControlState {
                 focused: window.has_focus(),
                 ..Default::default()
@@ -485,6 +507,7 @@ impl ApplicationHandler for App<'_> {
             WindowEvent::Focused(_)
                 | WindowEvent::PointerMoved { .. }
                 | WindowEvent::KeyboardInput { .. }
+                | WindowEvent::Ime(_)
                 | WindowEvent::PointerButton { .. }
         ) {
             host.wake_input = true;
@@ -523,7 +546,36 @@ impl ApplicationHandler for App<'_> {
                 primary: true,
                 ..
             } => host.cursor = [position.x as i32, position.y as i32],
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                host.edits.insert(&text);
+                host.dirty = true;
+            }
+            WindowEvent::Ime(Ime::Preedit(text, _)) => {
+                host.edits.composition(text);
+                host.dirty = true;
+            }
             WindowEvent::KeyboardInput { event, .. } => {
+                if host.edits.has_focus() {
+                    let pressed = event.state == ElementState::Pressed;
+                    if let PhysicalKey::Code(key) = event.physical_key
+                        && let Some((_, vk)) = keyboard_codes(key)
+                    {
+                        host.key(vk, pressed);
+                    }
+                    let control = host.async_keys.is_down(0xa2) || host.async_keys.is_down(0xa3);
+                    if pressed {
+                        if let PhysicalKey::Code(key) = event.physical_key
+                            && let Some((_, vk)) = keyboard_codes(key)
+                        {
+                            host.edits.key(vk as u32, control);
+                        }
+                        if !control && let Some(text) = &event.text {
+                            host.edits.insert(text);
+                        }
+                    }
+                    host.dirty = true;
+                    return;
+                }
                 if event.state == ElementState::Pressed
                     && event.text.as_ref().is_some_and(|s| !s.is_empty())
                 {
@@ -541,6 +593,22 @@ impl ApplicationHandler for App<'_> {
                 ..
             } => {
                 host.cursor = [position.x as i32, position.y as i32];
+                if state == ElementState::Pressed
+                    && button.clone().mouse_button().unwrap_or(MouseButton::Left)
+                        == MouseButton::Left
+                {
+                    match host.transform.to_logical(host.cursor) {
+                        Ok(point) => host.edits.click(point),
+                        Err(error) => {
+                            self.fail(event_loop, error);
+                            return;
+                        }
+                    }
+                    host.dirty = true;
+                    if host.edits.has_focus() {
+                        return;
+                    }
+                }
                 // Primary touch is a left click on mobile screens.
                 let button = button.mouse_button().unwrap_or(MouseButton::Left);
                 if let Some((bit, vk)) = match button {
@@ -566,7 +634,18 @@ impl ApplicationHandler for App<'_> {
             }
             WindowEvent::RedrawRequested => {
                 if let Some(canvas) = self.session.display() {
-                    match presentation.draw(canvas) {
+                    let overlay = if host.edits.is_empty() {
+                        None
+                    } else {
+                        match host.edits.paint(canvas) {
+                            Ok(canvas) => Some(canvas),
+                            Err(error) => {
+                                self.fail(event_loop, error);
+                                return;
+                            }
+                        }
+                    };
+                    match presentation.draw(overlay.as_ref().unwrap_or(canvas)) {
                         Ok(shown) => {
                             host.dirty = !shown;
                             self.presented += usize::from(shown);

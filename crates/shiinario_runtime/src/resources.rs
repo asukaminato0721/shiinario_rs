@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 mod effects;
 mod gdi;
 mod graphics;
+mod raw_image;
 mod trig;
 
 const LIMIT: usize = 256 * 1024 * 1024;
@@ -154,6 +155,7 @@ pub struct Resources {
     display_damage: DisplayDamage,
     text_damage: Vec<[i32; 4]>,
     images: BTreeMap<u32, Image>,
+    raw_frames: BTreeMap<(u32, u32), raw_image::RawFrame>,
     image_origins: BTreeMap<(u32, u32), [i32; 2]>,
     sounds: BTreeMap<u32, Arc<Sound>>,
     streams: BTreeMap<u32, Arc<AudioStream>>,
@@ -777,6 +779,9 @@ impl Resources {
                     .clone(),
             },
         };
+        if let Some(raw) = self.raw_frames.get(&(id, index as u32)) {
+            frame.surface = raw.surface()?;
+        }
         if let Some(&[x, y]) = self.image_origins.get(&(id, index as u32)) {
             frame.x = x;
             frame.y = y;
@@ -1627,6 +1632,16 @@ impl Resources {
 
     /// A reply here means actual asset I/O or buffer allocation completed.
     pub fn respond(&mut self, project: &Project, request: &PlatformRequest) -> Result<Option<u32>> {
+        self.sync_raw_images()?;
+        let reply = self.respond_inner(project, request)?;
+        self.update_raw_images(request)?;
+        Ok(reply)
+    }
+    fn respond_inner(
+        &mut self,
+        project: &Project,
+        request: &PlatformRequest,
+    ) -> Result<Option<u32>> {
         if let PlatformRequest::DrawingContext { surface } = request {
             let surface = if *surface == u32::MAX { 0 } else { *surface };
             ensure!(

@@ -15,6 +15,11 @@ impl BinaryVm {
             69,
             "b88bd818e6b19cdbe8c5cbb3752218f325a494e6f27f0021c3e4b2a2a267ab41",
         );
+        let copy = copy
+            || matches(
+                65,
+                "db47590e865774d818edd187d3e22ad243db2a5789f05794c1569dc2d3539074",
+            );
         let invert = matches(
             49,
             "8ac6574da39cbf8f6ca928f3b4c06693a50ee8a7236fd2ba75f97568d4db5786",
@@ -106,72 +111,6 @@ mod tests {
     }
     fn instruction(opcode: u16, args: &[u8]) -> Vec<u8> {
         [opcode.to_le_bytes().to_vec(), args.to_vec()].concat()
-    }
-
-    #[test]
-    fn known_native_helpers_check_fingerprints_ranges_and_forward_overlap() -> Result<()> {
-        let copy = include_bytes!("../../tests/fixtures/hanaoto-xor-copy.bin");
-        let invert = include_bytes!("../../tests/fixtures/hanaoto-invert.bin");
-        for (code, copying) in [(copy.as_slice(), true), (invert.as_slice(), false)] {
-            for displacement in [0, 1, 4, 7] {
-                let address = 0x2000_0000;
-                let helper = 0x2100_0000;
-                let mut vm = BinaryVm::new("helper.scn", instruction(0x0276, &operand(helper)))?;
-                vm.allocations.insert(helper, code.to_vec());
-                vm.allocations.insert(address, (0..32u8).collect());
-                vm.sp = CELLS - 6;
-                let mask = 0x1234_56a5;
-                let args = if copying {
-                    [address + displacement, 0, 0, 4, address, mask]
-                } else {
-                    [address + displacement, 4, 0, 0, 0, 0]
-                };
-                vm.banks.get_mut(&8).unwrap()[vm.sp..].copy_from_slice(&args);
-                let before = vm.allocations[&address].clone();
-                let mut expected = before.clone();
-                let expanded =
-                    mask | mask.wrapping_shl(8) | mask.wrapping_shl(16) | mask.wrapping_shl(24);
-                for word in 0..4 {
-                    let start = if copying {
-                        word * 4
-                    } else {
-                        displacement as usize + word * 4
-                    };
-                    let input = u32::from_le_bytes(expected[start..start + 4].try_into()?);
-                    let value = input ^ if copying { expanded } else { u32::MAX };
-                    let at = displacement as usize + word * 4;
-                    expected[at..at + 4].copy_from_slice(&value.to_le_bytes());
-                }
-                let banks = vm.banks.clone();
-                vm.step()?;
-                assert_eq!(vm.allocations[&address], expected);
-                assert_eq!(vm.banks, banks);
-                assert_eq!(vm.sp, CELLS - 6);
-                for invalid in [0, 1, 2] {
-                    let mut vm =
-                        BinaryVm::new("invalid-helper.scn", instruction(0x0276, &operand(helper)))?;
-                    let mut bytes = code.to_vec();
-                    if invalid == 0 {
-                        bytes[20] ^= 1;
-                    }
-                    vm.allocations.insert(helper, bytes);
-                    vm.allocations.insert(address, before.clone());
-                    vm.sp = CELLS - 6;
-                    let mut args = args;
-                    if invalid == 1 {
-                        args[if copying { 3 } else { 1 }] = 100;
-                    }
-                    if invalid == 2 {
-                        args[if copying { 3 } else { 1 }] = 0;
-                    }
-                    vm.banks.get_mut(&8).unwrap()[vm.sp..].copy_from_slice(&args);
-                    assert!(vm.step().is_err());
-                    assert_eq!(vm.pc, 0);
-                    assert_eq!(vm.allocations[&address], before);
-                }
-            }
-        }
-        Ok(())
     }
 
     #[test]

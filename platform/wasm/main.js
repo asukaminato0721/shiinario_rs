@@ -4,11 +4,24 @@ const context = canvas.getContext('2d', { alpha: false });
 let worker, audio, audioStart, audioNext, clockTimer, closing = false;
 let audioSequence = 0;
 let messageDialog;
+const editFields = new Map();
+function placeEditFields() {
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.min(rect.width / 800, rect.height / 600);
+  for (const { input, bounds: [x, y, width, height] } of editFields.values()) {
+    Object.assign(input.style, { left: `${rect.left + (rect.width - 800 * scale) / 2 + x * scale}px`,
+      top: `${rect.top + (rect.height - 600 * scale) / 2 + y * scale}px`, width: `${width * scale}px`, height: `${height * scale}px`, fontSize: `${16 * scale}px` });
+  }
+}
+new ResizeObserver(placeEditFields).observe(canvas);
+window.addEventListener('scroll', placeEditFields, true);
 const sources = new Set();
 const status = message => { $('status').textContent = message; };
 function post(data) { worker?.postMessage(data); }
 function clearAudio() { for (const source of sources) { source.stop(); source.disconnect(); } sources.clear(); }
 async function cleanup(message) {
+  for (const { input } of editFields.values()) input.remove();
+  editFields.clear();
   messageDialog?.remove(); messageDialog = null;
   clearInterval(clockTimer);
   clearAudio();
@@ -36,6 +49,18 @@ $('start').onclick = async () => {
       switch (data.type) {
         case 'ready': status('Running. Saves are stored locally in this browser.'); $('stop').disabled = false; canvas.focus(); break;
         case 'frame': context.putImageData(new ImageData(new Uint8ClampedArray(data.frame), 800, 600), 0, 0); break;
+        case 'edit-create': {
+          const existing = editFields.get(data.window);
+          if (existing) { existing.input.value = data.text; break; }
+          const input = document.createElement('input');
+          input.type = 'text'; input.value = data.text; input.maxLength = 1024;
+          input.autocomplete = 'off'; input.setAttribute('aria-label', 'Character name');
+          Object.assign(input.style, { position: 'fixed', zIndex: 10, boxSizing: 'border-box', margin: 0, padding: '0 2px', border: '1px solid #666', background: 'white', color: 'black' });
+          input.oninput = () => post({ type: 'edit-text', window: data.window, text: input.value });
+          editFields.set(data.window, { input, bounds: [data.x, data.y, data.width, data.height] });
+          document.body.append(input); placeEditFields(); break;
+        }
+        case 'edit-destroy': editFields.get(data.window)?.input.remove(); editFields.delete(data.window); canvas.focus(); break;
         case 'title': document.title = data.title || 'Shiina Rio'; break;
         case 'message-box': {
           const owner = worker;

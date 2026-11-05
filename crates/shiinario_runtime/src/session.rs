@@ -19,6 +19,9 @@ pub trait Host {
     }
     fn poll(&mut self) -> Result<()>;
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32>;
+    fn window_text(&mut self, _window: u32, _capacity: u32) -> Result<Vec<u8>> {
+        bail!("host does not support window text")
+    }
     fn message_box(&mut self, text: &str, title: &str, flags: u32) -> Result<Option<u32>> {
         self.respond(&PlatformRequest::MessageBox {
             text: text.into(),
@@ -68,6 +71,7 @@ pub struct Session {
     control_wait_released: bool,
     scan_repeats: std::collections::BTreeMap<u32, crate::input::ControlRepeat>,
     input_settings: crate::input::InputSettings,
+    frame_fade: Option<(u32, u32)>,
 }
 
 /// Precondition: `project` contains the resolved game archives.
@@ -122,6 +126,7 @@ impl Session {
             control_wait_released: false,
             scan_repeats: Default::default(),
             input_settings,
+            frame_fade: None,
         })
     }
     pub fn surface(&self, id: u32) -> Option<Surface> {
@@ -451,6 +456,69 @@ impl Session {
                 })?;
                 vm.respond_image_bounds(bounds)?;
                 emit(&Event::ImageBoundsReply { bounds })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ImageStride { image, frame } = &request {
+                let value = resources.image_stride(*image, *frame)?;
+                vm.respond(value)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::ImagePixels {
+                image,
+                frame,
+                position,
+            } = &request
+            {
+                let (memory, offset) = resources.image_pixels(*image, *frame, *position)?;
+                let value = vm.respond_image_pixels(memory, offset)?;
+                emit(&Event::PlatformReply {
+                    value,
+                    simulated: false,
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::WindowText { window, capacity } = &request {
+                let bytes = host.window_text(*window, *capacity)?;
+                vm.respond_bytes(&bytes)?;
+                emit(&Event::PlatformReply {
+                    value: bytes.len() as u32,
+                    simulated: host.simulated(),
+                })?;
+                return Ok(true);
+            }
+            if let PlatformRequest::FadeFrame { from, to, duration } = &request {
+                let now = host.respond(&PlatformRequest::ClockMilliseconds)?;
+                let (epoch, _) = *self.frame_fade.get_or_insert((now, *duration));
+                let elapsed = now.wrapping_sub(epoch).min(*duration);
+                let level = if *duration == 0 {
+                    *to
+                } else {
+                    (i64::from(*from)
+                        + (i64::from(*to) - i64::from(*from)) * i64::from(elapsed)
+                            / i64::from(*duration)) as u32
+                };
+                resources.fade_frame(level)?;
+                host.respond(&PlatformRequest::UpdateWindow)?;
+                host.poll()?;
+                self.movies.update(host, resources)?;
+                let completed = elapsed == *duration;
+                vm.respond(u32::from(completed))?;
+                if completed {
+                    self.frame_fade = None;
+                } else {
+                    self.state = SessionState::Waiting {
+                        epoch: now,
+                        duration: (duration - elapsed).min(16),
+                    };
+                }
+                emit(&Event::PlatformReply {
+                    value: u32::from(completed),
+                    simulated: host.simulated(),
+                })?;
                 return Ok(true);
             }
             if let PlatformRequest::SurfacePixels { id } = &request {

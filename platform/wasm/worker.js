@@ -14,6 +14,8 @@ globalThis.shiinarioTitle = title => postMessage({ type: 'title', title });
 globalThis.shiinarioFullscreen = enabled => postMessage({ type: 'fullscreen', enabled });
 globalThis.shiinarioMessageBox = (text, title, flags) => postMessage({ type: 'message-box', text, title, flags });
 
+globalThis.shiinarioEdit = (window, text, x, y, width, height) => postMessage({ type: 'edit-create', window, text, x, y, width, height });
+globalThis.shiinarioDestroyEdit = window => postMessage({ type: 'edit-destroy', window });
 function stop(error) {
   if (stopping) return;
   stopping = true;
@@ -72,6 +74,7 @@ onmessage = async ({ data }) => {
       }
       case 'pointer': player?.pointer(data.x, data.y, data.button, data.pressed); wake(); break;
       case 'key': player?.key(data.scan, data.vk, data.pressed, data.text); wake(); break;
+      case 'edit-text': player?.edit_text(data.window, data.text); wake(); break;
       case 'clock': audioClock = data.time; break;
       case 'focus': player?.focus(data.focused); wake(); break;
       case 'message-box-reply': player?.message_box_reply(data.value); wake(); break;

@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod compat;
 mod native_helper;
+mod ransem;
 pub mod scan;
 mod text_execution;
 use text_execution::{AsyncText, StagedText, TextCallback, TextStringIndex};
@@ -197,6 +198,31 @@ pub enum MovieCommand {
 /// Requests are explicit so a headless trace cannot invent operating-system results.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum PlatformRequest {
+    FadeFrame {
+        from: u32,
+        to: u32,
+        duration: u32,
+    },
+    CreateEdit {
+        text: String,
+        rect: [i32; 4],
+    },
+    DestroyEdit {
+        window: u32,
+    },
+    WindowText {
+        window: u32,
+        capacity: u32,
+    },
+    ImageStride {
+        image: u32,
+        frame: u32,
+    },
+    ImagePixels {
+        image: u32,
+        frame: u32,
+        position: [u32; 2],
+    },
     PostWindowMessage {
         window: u32,
         message: u32,
@@ -798,6 +824,7 @@ pub struct BinaryVm {
     pending: Option<(Event, Option<Destination>)>,
     allocations: std::collections::BTreeMap<u32, Vec<u8>>,
     shared_regions: std::collections::BTreeMap<u32, SharedMemory>,
+    raw_image_regions: std::collections::BTreeMap<(u32, u32), u32>,
     surface_regions: std::collections::BTreeMap<u32, u32>,
     image_regions: std::collections::BTreeMap<u32, (u32, SharedMemory)>,
     next_shared: u32,
@@ -819,6 +846,8 @@ pub struct BinaryVm {
     registry_path: String,
     ini_path: String,
     pending_bytes: Option<u32>,
+    pending_counter: Option<(usize, u32)>,
+    counters: [ransem::Counter; 256],
     asset_load_address: u32,
     font_allocation: Option<u32>,
     pending_bounds: Option<[Destination; 4]>,
@@ -940,6 +969,7 @@ impl BinaryVm {
             pending: None,
             allocations: Default::default(),
             shared_regions: Default::default(),
+            raw_image_regions: Default::default(),
             surface_regions: Default::default(),
             image_regions: Default::default(),
             next_shared: 0x9000_0000,
@@ -960,6 +990,8 @@ impl BinaryVm {
             registry_path: String::new(),
             ini_path: String::new(),
             pending_bytes: None,
+            pending_counter: None,
+            counters: [ransem::Counter::default(); 256],
             asset_load_address: 0,
             font_allocation: None,
             pending_bounds: None,
@@ -1347,7 +1379,10 @@ impl BinaryVm {
             "platform request requires a byte-string reply"
         );
         if let Some((Event::Platform { location, request }, _)) = &self.pending {
-            if matches!(request, PlatformRequest::WaitControl { .. }) {
+            if matches!(
+                request,
+                PlatformRequest::WaitControl { .. } | PlatformRequest::FadeFrame { .. }
+            ) {
                 ensure!(value <= 1, "control wait requires a Boolean reply");
                 if value == 0 {
                     return Ok(());
@@ -1423,6 +1458,17 @@ impl BinaryVm {
                 None,
             ));
             return Ok(());
+        }
+        if let Some((index, initial)) = self.pending_counter.take() {
+            self.counters[index].reset(initial, value);
+        }
+        if let Event::Platform {
+            request: PlatformRequest::FadeFrame { to, .. },
+            ..
+        } = &event
+        {
+            self.frame_blend_level = *to;
+            self.last_frame_blend = None;
         }
         self.text_response(&event, value)?;
         if let Some((mut style, clock)) = self.pending_text_style.take() {
@@ -1515,6 +1561,24 @@ impl BinaryVm {
                 self.image_regions.remove(id);
             }
             _ => {}
+        }
+        if let Event::Platform {
+            request:
+                PlatformRequest::CreateImage { id, .. }
+                | PlatformRequest::CreateImageFromSurface { id, .. }
+                | PlatformRequest::LoadImage { id, .. }
+                | PlatformRequest::BindImageMemory { id, .. }
+                | PlatformRequest::ReleaseImage { id },
+            ..
+        } = &event
+        {
+            self.raw_image_regions.retain(|&(slot, _), base| {
+                let keep = slot != *id && *id != 256;
+                if !keep {
+                    self.shared_regions.remove(base);
+                }
+                keep
+            });
         }
         if let Event::Platform {
             request:
@@ -1826,6 +1890,19 @@ impl BinaryVm {
             bytes.len() < 256 && !bytes.contains(&0),
             "platform string exceeds 255 bytes or contains NUL"
         );
+        if let Some((
+            Event::Platform {
+                request: PlatformRequest::WindowText { capacity, .. },
+                ..
+            },
+            _,
+        )) = &self.pending
+        {
+            ensure!(
+                bytes.len() < *capacity as usize,
+                "window text exceeds destination capacity"
+            );
+        }
         let range = self.memory_range(address, bytes.len() + 1)?;
         let mut terminated = bytes.to_vec();
         terminated.push(0);
@@ -2524,6 +2601,9 @@ impl BinaryVm {
         let mut request = None;
         let mut response_destination = None;
         let mut memory_write = None;
+        let mut native_writes = Vec::new();
+        let mut counter_setting = None;
+        let mut counter_reset = None;
         let mut byte_destination = None;
         let mut bounds_destinations = None;
         let mut point_destinations = None;
@@ -2597,7 +2677,9 @@ impl BinaryVm {
             },
             0x0276 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
-                if let Some((range, bytes)) = self.effect_native_helper(address)? {
+                if let Some(writes) = self.ransem_native_helper(address)? {
+                    native_writes = writes;
+                } else if let Some((range, bytes)) = self.effect_native_helper(address)? {
                     memory_write = Some((range, bytes));
                 } else if self
                     .memory_read(address, native_helper::SAVE_XOR_CODE_SIZE)
@@ -3582,6 +3664,44 @@ impl BinaryVm {
                 let id = self.read(&mut cursor)?;
                 ensure!(id < 256, "clear surface slot out of bounds");
                 request = Some(PlatformRequest::ClearSurface { id });
+            },
+            0x0320 | 0x0321 => scan::Layout::Operands(2) => {
+                let index = self.read(&mut cursor)? as usize;
+                ensure!(index < self.counters.len(), "counter index exceeds 255");
+                let value = self.read(&mut cursor)?;
+                if opcode == 0x0320 {
+                    counter_setting = Some((index, value.max(1)));
+                } else {
+                    counter_reset = Some((index, value));
+                    request = Some(PlatformRequest::ClockMilliseconds);
+                }
+            },
+            0x04ee => scan::Layout::Operands(4) => {
+                for value in [0, 0, self.viewport[0], self.viewport[1]] {
+                    writes.push((self.destination(&mut cursor)?, value));
+                }
+            },
+            0x04f0 => scan::Layout::Operands(2) => {
+                for _ in 0..2 {
+                    writes.push((self.destination(&mut cursor)?, 1.0f32.to_bits()));
+                }
+            },
+            0x0502 => scan::Layout::Operands(2) => {
+                let duration = self.read(&mut cursor)?;
+                let to = self.read(&mut cursor)?;
+                ensure!(to <= 255, "fade level exceeds 255");
+                request = Some(PlatformRequest::FadeFrame { from: self.frame_blend_level.min(255), to, duration });
+            },
+            0x0fd4 | 0x0fd5 => scan::Layout::Operands(if opcode == 0x0fd4 { 3 } else { 5 }) => {
+                let image = self.read(&mut cursor)?;
+                let frame = self.read(&mut cursor)?;
+                ensure!(image < 256, "image slot exceeds 255");
+                request = Some(if opcode == 0x0fd4 {
+                    PlatformRequest::ImageStride { image, frame }
+                } else {
+                    PlatformRequest::ImagePixels { image, frame, position: [self.read(&mut cursor)?, self.read(&mut cursor)?] }
+                });
+                response_destination = Some(self.destination(&mut cursor)?);
             },
             0x0500 => scan::Layout::Operands(1) => {
                 // v2.48 4261ba -> 412770 updates surface zero from surface one.
@@ -5032,6 +5152,26 @@ impl BinaryVm {
                 response_destination = Some(self.destination(&mut cursor)?);
                 request = Some(PlatformRequest::FindWindow { class, title });
             },
+            0x0960 => scan::Layout::Operands(6) => {
+                let text = self.window_title(self.read(&mut cursor)?)?;
+                let mut rect = [0; 4];
+                for value in &mut rect { *value = self.read(&mut cursor)? as i32; }
+                ensure!(rect[2] > 0 && rect[3] > 0, "edit control size must be positive");
+                response_destination = Some(self.destination(&mut cursor)?);
+                request = Some(PlatformRequest::CreateEdit { text, rect });
+            },
+            0x097e => scan::Layout::Operands(1) => {
+                request = Some(PlatformRequest::DestroyEdit { window: self.read(&mut cursor)? });
+            },
+            0x07a9 => scan::Layout::Operands(3) => {
+                let window = self.read(&mut cursor)?;
+                let address = self.read(&mut cursor)?;
+                let capacity = self.read(&mut cursor)?;
+                ensure!(capacity > 0 && capacity <= 256, "window text capacity must be 1..256");
+                self.memory_range(address, capacity as usize)?;
+                byte_destination = Some(address);
+                request = Some(PlatformRequest::WindowText { window, capacity });
+            },
             0x07a8 => scan::Layout::Operands(2) => {
                 let window = self.read(&mut cursor)?;
                 let title = self.window_title(self.read(&mut cursor)?)?;
@@ -5088,6 +5228,9 @@ impl BinaryVm {
         self.pending_sizes = size_destinations;
         self.pending_calendar = calendar_destinations;
         self.pending_file = file_destinations;
+        if let Some((index, divisor)) = counter_setting { self.counters[index].divisor = divisor; }
+        self.pending_counter = counter_reset;
+        for (range, bytes) in native_writes { self.memory_write(range, &bytes); }
         self.pending_timer = timer_reply;
         self.pending_delay = delay;
         if let Some((range, bytes)) = memory_write {

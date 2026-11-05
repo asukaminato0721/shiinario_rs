@@ -7,6 +7,7 @@ mod browser;
 mod buffer_audio;
 mod calendar;
 mod dialog;
+mod edit;
 pub mod executor;
 #[cfg(not(target_arch = "wasm32"))]
 mod gamepad;
@@ -203,6 +204,7 @@ pub fn trace_with_options(
 }
 
 struct TracePlatform {
+    edits: edit::Edits,
     replay: replay::Replay,
     enabled: bool,
     joystick_enabled: bool,
@@ -214,6 +216,7 @@ struct TracePlatform {
 impl Default for TracePlatform {
     fn default() -> Self {
         Self {
+            edits: Default::default(),
             replay: Default::default(),
             enabled: true,
             joystick_enabled: false,
@@ -225,6 +228,9 @@ impl Default for TracePlatform {
     }
 }
 impl Host for TracePlatform {
+    fn window_text(&mut self, window: u32, capacity: u32) -> Result<Vec<u8>> {
+        self.edits.text(window, capacity)
+    }
     fn calendar(&mut self, time: bool) -> Result<[u32; 4]> {
         Ok(if time { [0; 4] } else { [2000, 1, 1, 6] })
     }
@@ -287,6 +293,9 @@ impl Host for TracePlatform {
         self.mixer.play(handle, stream, flags)
     }
     fn respond(&mut self, request: &PlatformRequest) -> Result<u32> {
+        if let Some(value) = self.edits.respond(request)? {
+            return Ok(value);
+        }
         match request {
             PlatformRequest::SetCursorPosition { position } => {
                 self.replay.cursor = *position;

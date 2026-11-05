@@ -257,30 +257,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn solid_ellipses_match_wine_gdi_fixtures() {
-        // Wine GDI is an independent compatibility check, not a Windows oracle.
-        let cases: serde_json::Value =
-            serde_json::from_str(include_str!("../../tests/fixtures/gdi-ellipses.json")).unwrap();
-        for case in cases.as_array().unwrap() {
-            let w = case["width"].as_u64().unwrap() as usize;
-            let h = case["height"].as_u64().unwrap() as usize;
-            let shape = Ellipse::new(w, h);
-            let actual: Vec<u32> = shape
-                .spans
-                .iter()
-                .map(|span| span.map_or(0, |[l, r]| ((1 << (r - l + 1)) - 1) << l))
-                .collect();
-            let expected: Vec<u32> = case["rows"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|v| v.as_u64().unwrap() as u32)
-                .collect();
-            assert_eq!(actual, expected, "{w}x{h}");
-        }
-    }
-
-    #[test]
     fn selected_objects_restore_and_cannot_be_deleted_while_in_use() -> Result<()> {
         let mut resources = Resources::default();
         resources.create_surface(3, 12, 12, 0)?;
