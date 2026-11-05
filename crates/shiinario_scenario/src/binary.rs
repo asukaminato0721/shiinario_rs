@@ -3,10 +3,10 @@ use crate::{Event, Location, SharedMemory};
 use anyhow::{Context, Result, bail, ensure};
 use shiinario_core::EngineVersion;
 mod compat;
-mod native_helper;
-mod ransem;
+mod image_memory;
 pub mod scan;
 mod text_execution;
+mod x86;
 use text_execution::{AsyncText, StagedText, TextCallback, TextStringIndex};
 
 /// The original engine stores the full operand and treats every nonzero value as
@@ -790,6 +790,28 @@ impl Cursor<'_> {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Counter {
+    divisor: u32,
+    value: u32,
+    epoch: u32,
+}
+impl Default for Counter {
+    fn default() -> Self {
+        Self {
+            divisor: 1,
+            value: 0,
+            epoch: 0,
+        }
+    }
+}
+impl Counter {
+    fn reset(&mut self, value: u32, epoch: u32) {
+        self.value = value;
+        self.epoch = epoch;
+    }
+}
+
 pub struct BinaryVm {
     version: EngineVersion,
     name: String,
@@ -847,9 +869,10 @@ pub struct BinaryVm {
     ini_path: String,
     pending_bytes: Option<u32>,
     pending_counter: Option<(usize, u32)>,
-    counters: [ransem::Counter; 256],
+    counters: [Counter; 256],
     asset_load_address: u32,
     font_allocation: Option<u32>,
+    riot_context: Option<u32>,
     pending_bounds: Option<[Destination; 4]>,
     pending_point: Option<[Destination; 2]>,
     pending_sizes: Option<[Destination; 2]>,
@@ -991,9 +1014,10 @@ impl BinaryVm {
             ini_path: String::new(),
             pending_bytes: None,
             pending_counter: None,
-            counters: [ransem::Counter::default(); 256],
+            counters: [Counter::default(); 256],
             asset_load_address: 0,
             font_allocation: None,
+            riot_context: None,
             pending_bounds: None,
             pending_point: None,
             pending_sizes: None,
@@ -2262,29 +2286,6 @@ impl BinaryVm {
         }
         bail!("unterminated string within 64 KiB cap")
     }
-    fn native_character_index(&self, source: u32, needle: u32, width: usize) -> Result<u32> {
-        ensure!(matches!(width, 1 | 2), "invalid native character width");
-        let needle = needle & if width == 1 { 0xff } else { 0xffff };
-        for index in 0..65536u32 {
-            let address = source
-                .checked_add(index * width as u32)
-                .context("native character search address overflow")?;
-            let bytes = self.memory_read(address, width)?;
-            let value = if width == 1 {
-                u32::from(bytes[0])
-            } else {
-                u32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
-            };
-            // Both native routines check the terminator before the needle.
-            if value == 0 {
-                return Ok(u32::MAX);
-            }
-            if value == needle {
-                return Ok(index);
-            }
-        }
-        bail!("native character search exceeds 65536 elements")
-    }
     fn expression_variable(&self, variable: crate::expression::Variable<'_>) -> Result<u32> {
         match variable {
             crate::expression::Variable::Named(name) => self.named_value(name),
@@ -2612,6 +2613,7 @@ impl BinaryVm {
         let mut collect_scopes = false;
         let mut released_scopes = Vec::new();
         let mut new_draw_list = None;
+        let mut new_riot_context = None;
         let mut draw_item = None;
         let mut new_text_context = None;
         let mut staged_text_address = None;
@@ -2677,131 +2679,7 @@ impl BinaryVm {
             },
             0x0276 => scan::Layout::Operands(1) => {
                 let address = self.read(&mut cursor)?;
-                if let Some(writes) = self.ransem_native_helper(address)? {
-                    native_writes = writes;
-                } else if let Some((range, bytes)) = self.effect_native_helper(address)? {
-                    memory_write = Some((range, bytes));
-                } else if self
-                    .memory_read(address, native_helper::SAVE_XOR_CODE_SIZE)
-                    .is_ok_and(|code| native_helper::is_save_xor(&code))
-                {
-                    // HANAOTO start.SCN:0x48a98 uses the current task stack.
-                    let key = self.banks[&8][self.bank_index(8, 0)?];
-                    let buffer = self.banks[&8][self.bank_index(8, 1)?];
-                    let destination = self.memory_range(buffer, native_helper::SAVE_XOR_SIZE)?;
-                    let mut bytes = self.memory_read(buffer, native_helper::SAVE_XOR_SIZE)?;
-                    native_helper::save_xor(&mut bytes, key)?;
-                    memory_write = Some((destination, bytes));
-                } else if self
-                    .memory_read(address, native_helper::INVERT_COPY_CODE_SIZE)
-                    .is_ok_and(|code| native_helper::is_invert_copy(&code))
-                {
-                    // HANAOTO start.SCN:0x48df4 inverts complete 8-byte or
-                    // 4-byte groups. The native loop leaves the tail unchanged.
-                    let argument =
-                        |index| -> Result<u32> { Ok(self.banks[&8][self.bank_index(8, index)?]) };
-                    let target = argument(0)?;
-                    let source = argument(1)?;
-                    let count = argument(2)? as usize;
-                    let group = if argument(3)? == 0 { 8 } else { 4 };
-                    let count = count / group * group;
-                    ensure!(count != 0, "native invert copy has no complete groups");
-                    ensure!(
-                        source == target
-                            || u64::from(source) + count as u64 <= u64::from(target)
-                            || u64::from(target) + count as u64 <= u64::from(source),
-                        "overlapping native invert copy buffers are unresolved"
-                    );
-                    let destination = self.memory_range(target, count)?;
-                    let mut bytes = self.memory_read(source, count)?;
-                    for byte in &mut bytes {
-                        *byte = !*byte;
-                    }
-                    memory_write = Some((destination, bytes));
-                } else if self
-                    .memory_read(address, native_helper::IMAGE_COPY_CODE_SIZE)
-                    .is_ok_and(|code| native_helper::is_image_copy(&code))
-                {
-                    // HANAOTO start.SCN:0x48c83 reads the current task stack.
-                    let target = self.banks[&8][self.bank_index(8, 0)?];
-                    let source = self.banks[&8][self.bank_index(8, 1)?];
-                    ensure!(
-                        u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
-                            || u64::from(target) + native_helper::IMAGE_COPY_TARGET_SIZE as u64
-                                <= u64::from(source),
-                        "overlapping native image copy buffers are unresolved"
-                    );
-                    let destination =
-                        self.memory_range(target, native_helper::IMAGE_COPY_TARGET_SIZE)?;
-                    let mut bytes =
-                        self.memory_read(target, native_helper::IMAGE_COPY_TARGET_SIZE)?;
-                    native_helper::copy_image_rows(
-                        &self.memory_read(source, native_helper::SOURCE_SIZE)?,
-                        &mut bytes,
-                    )?;
-                    memory_write = Some((destination, bytes));
-                } else if self
-                    .memory_read(address, native_helper::THUMBNAIL_COPY_CODE_SIZE)
-                    .is_ok_and(|code| native_helper::is_thumbnail_copy(&code))
-                {
-                    // HANAOTO start.SCN:0x48d21 copies packed 100x75 BGR24
-                    // into an 800-pixel-wide surface at the supplied pointer.
-                    let source = self.banks[&8][self.bank_index(8, 0)?];
-                    let target = self.banks[&8][self.bank_index(8, 1)?];
-                    ensure!(
-                        u64::from(source) + native_helper::TARGET_SIZE as u64 <= u64::from(target)
-                            || u64::from(target) + native_helper::THUMBNAIL_COPY_TARGET_SIZE as u64
-                                <= u64::from(source),
-                        "overlapping native thumbnail copy buffers are unresolved"
-                    );
-                    let destination =
-                        self.memory_range(target, native_helper::THUMBNAIL_COPY_TARGET_SIZE)?;
-                    let mut bytes =
-                        self.memory_read(target, native_helper::THUMBNAIL_COPY_TARGET_SIZE)?;
-                    native_helper::copy_thumbnail_rows(
-                        &self.memory_read(source, native_helper::TARGET_SIZE)?,
-                        &mut bytes,
-                    )?;
-                    memory_write = Some((destination, bytes));
-                } else if let Some(width) = native_helper::CHARACTER_SEARCH_CODE_SIZES
-                    .iter()
-                    .find_map(|&size| {
-                        self.memory_read(address, size)
-                            .ok()
-                            .and_then(|code| native_helper::character_search_width(&code))
-                    })
-                {
-                    // HANAOTO start.SCN:0x48db3/0x48d6c use local bank 12,
-                    // independent of the current task stack pointer.
-                    let needle = self.banks[&12][0];
-                    let source = self.banks[&12][1];
-                    let index = self.native_character_index(source, needle, width)?;
-                    writes.push((Destination::Bank(12, 2), index));
-                } else {
-                    let (bank, [source_index, target_index]) = native_helper::THUMBNAIL_CODE_SIZES
-                        .iter()
-                        .find_map(|&size| {
-                            self.memory_read(address, size)
-                                .ok()
-                                .and_then(|code| native_helper::thumbnail_arguments(&code))
-                        })
-                        .with_context(|| {
-                            format!("unsupported native SCN helper at {address:#x}")
-                        })?;
-                    let source = self.banks[&bank][self.bank_index(bank, source_index)?];
-                    let target = self.banks[&bank][self.bank_index(bank, target_index)?];
-                    ensure!(
-                        u64::from(source) + native_helper::SOURCE_SIZE as u64 <= u64::from(target)
-                            || u64::from(target) + native_helper::TARGET_SIZE as u64
-                                <= u64::from(source),
-                        "overlapping native thumbnail buffers are unresolved"
-                    );
-                    let destination = self.memory_range(target, native_helper::TARGET_SIZE)?;
-                    let bytes = native_helper::thumbnail(
-                        &self.memory_read(source, native_helper::SOURCE_SIZE)?,
-                    )?;
-                    memory_write = Some((destination, bytes));
-                }
+                native_writes = self.emulate_native(address)?;
             },
             0x05b4..=0x05c3 => scan::Layout::Movie => {
                 if opcode == 0x05be {
@@ -4383,6 +4261,32 @@ impl BinaryVm {
                 }
                 memory_write = Some((self.memory_range(destination, bytes.len())?, bytes));
             },
+            0xfdf2 | 0xfe10 => scan::Layout::Operands(1) => {
+                // v2.49 42f625/42f667 both call 4266e0. The native handler
+                // evaluates one operand and discards it without any side effect.
+                self.read(&mut cursor)?;
+            },
+            0xfe2e => scan::Layout::Operands(1) => {
+                // 426740 returns the stable three-word RIOT debugger context.
+                // No RIOT debugger is attached to the portable VM.
+                let destination = self.destination(&mut cursor)?;
+                let address = if let Some(address) = self.riot_context {
+                    self.memory_range(address, 12)?;
+                    address
+                } else {
+                    let address = self.allocation_address(12)?;
+                    new_riot_context = Some(address);
+                    address
+                };
+                writes.push((destination, address));
+            },
+            0xfe2f => scan::Layout::Operands(0) => {
+                // 426770 clears the RIOT context and notifies attached debugger
+                // windows. The portable VM has no external debugger windows.
+                if let Some(address) = self.riot_context {
+                    memory_write = Some((self.memory_range(address, 12)?, vec![0; 12]));
+                }
+            },
             0x0208 => scan::Layout::Operands(1) => {
                 // The marker evaluates its operand but does not retain it.
                 self.read(&mut cursor)?;
@@ -5223,6 +5127,10 @@ impl BinaryVm {
             self.memory_write(range, &bytes);
             self.draw_lists.get_mut(&self.draw_list_id).unwrap().1 += 1;
         }
+        if let Some(address) = new_riot_context {
+            self.allocations.insert(address, vec![0; 12]);
+            self.riot_context = Some(address);
+        }
         self.pending_bounds = bounds_destinations;
         self.pending_point = point_destinations;
         self.pending_sizes = size_destinations;
@@ -5230,7 +5138,9 @@ impl BinaryVm {
         self.pending_file = file_destinations;
         if let Some((index, divisor)) = counter_setting { self.counters[index].divisor = divisor; }
         self.pending_counter = counter_reset;
-        for (range, bytes) in native_writes { self.memory_write(range, &bytes); }
+        for write in native_writes {
+            write.apply(self);
+        }
         self.pending_timer = timer_reply;
         self.pending_delay = delay;
         if let Some((range, bytes)) = memory_write {
@@ -5929,403 +5839,6 @@ mod tests {
         let mut vm = BinaryVm::new("blend.scn", code[..code.len() - 1].to_vec())?;
         assert!(vm.step().is_err());
         assert_eq!(vm.pc, 0);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires extracted TANEGAME start.SCN; set SHIINARIO_TANE_START_SCN"]
-    fn original_v248_save_thumbnail_consumes_helper_and_preserves_buffers() -> Result<()> {
-        check_original_thumbnail(
-            "SHIINARIO_TANE_START_SCN",
-            0xb1eeb,
-            115,
-            0xb0a2e,
-            12,
-            [0, 1],
-        )
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_character_search_uses_local_bank_and_matches_native_results() -> Result<()>
-    {
-        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
-            .context("set SHIINARIO_HANAOTO_START_SCN")?;
-        let original = std::fs::read(path)?;
-        for (width, helper, size, call) in [(1, 0x48db3, 65, 0x1457d), (2, 0x48d6c, 71, 0x14595)] {
-            // These results come from the two original i386 helpers.
-            for (needle, expected) in [
-                (0x61, 0),
-                (0x62, 1),
-                (0xff, 3),
-                (0, u32::MAX),
-                (0x12340062, 1),
-            ] {
-                for case in 0..4 {
-                    let mut code = original[..helper + size].to_vec();
-                    if case == 1 {
-                        code[helper + 40] ^= 1;
-                    } else if case == 2 {
-                        code.pop();
-                    }
-                    let mut vm = BinaryVm::new("start.scn", code)?;
-                    vm.pc = call;
-                    vm.sp = 863;
-                    vm.banks.get_mut(&12).unwrap()[..3].copy_from_slice(&[
-                        needle,
-                        0x5000_0011,
-                        0xdeadbeef,
-                    ]);
-                    vm.banks.get_mut(&8).unwrap()[863..866].fill(0xbad);
-                    let values: &[u16] = if case == 3 {
-                        &[0x70]
-                    } else {
-                        &[0x61, 0x62, 0x61, 0xff, 0, 0x62]
-                    };
-                    let mut input = vec![0xa5; 17];
-                    for value in values {
-                        input.extend_from_slice(&value.to_le_bytes()[..width]);
-                    }
-                    vm.allocations.insert(0x5000_0000, input);
-                    let allocations = vm.allocations.clone();
-                    let mut banks = vm.banks.clone();
-                    if case == 0 {
-                        vm.step()?;
-                        assert_eq!(vm.pc, call + 7);
-                        banks.get_mut(&12).unwrap()[2] = expected;
-                    } else {
-                        assert!(vm.step().is_err());
-                        assert_eq!(vm.pc, call);
-                    }
-                    assert_eq!(vm.banks, banks);
-                    assert_eq!(vm.sp, 863);
-                    assert_eq!(vm.allocations, allocations);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn native_character_search_checks_units_terminators_addresses_and_limit() -> Result<()> {
-        let mut vm = BinaryVm::new("search.scn", vec![0, 0])?;
-        let base = 0x5000_0000;
-        for width in [1, 2] {
-            let values: [u16; 6] = [0x61, 0x62, 0x61, 0xff, 0, 0x63];
-            let input = values
-                .iter()
-                .flat_map(|v| v.to_le_bytes()[..width].to_vec())
-                .collect();
-            vm.allocations.insert(base, input);
-            for (needle, expected) in [
-                (0x61, 0),
-                (0x62, 1),
-                (0xff, 3),
-                (0, u32::MAX),
-                (0x63, u32::MAX),
-                (0x12340062, 1),
-            ] {
-                assert_eq!(vm.native_character_index(base, needle, width)?, expected);
-            }
-        }
-        vm.allocations.insert(base, vec![0x34, 0x12, 0, 0]);
-        assert_eq!(vm.native_character_index(base, 0x1234, 2)?, 0);
-        assert_eq!(vm.native_character_index(base, 0x34, 2)?, u32::MAX);
-        vm.allocations.insert(base, vec![0x62]);
-        assert_eq!(vm.native_character_index(base, 0x62, 1)?, 0);
-        assert!(vm.native_character_index(base, 0x63, 1).is_err());
-        assert!(vm.native_character_index(base, 0x62, 2).is_err());
-        assert!(vm.native_character_index(base, 0x62, 3).is_err());
-        vm.allocations.insert(u32::MAX, vec![0x61]);
-        assert!(vm.native_character_index(u32::MAX, 0x62, 1).is_err());
-        vm.allocations.insert(base, vec![0x61; 65537]);
-        assert!(vm.native_character_index(base, 0x62, 1).is_err());
-        vm.allocations.get_mut(&base).unwrap()[65535] = 0;
-        assert_eq!(vm.native_character_index(base, 0x62, 1)?, u32::MAX);
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_image_copy_checks_code_and_preserves_padding() -> Result<()> {
-        check_original_image_copy(false)
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_thumbnail_copy_checks_code_and_preserves_other_columns() -> Result<()> {
-        check_original_image_copy(true)
-    }
-
-    fn check_original_image_copy(thumbnail: bool) -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let (helper, code_size, call, sp, source_size, target_size, digest) = if thumbnail {
-            (
-                0x48d21,
-                native_helper::THUMBNAIL_COPY_CODE_SIZE,
-                0x23c09,
-                863,
-                native_helper::TARGET_SIZE,
-                native_helper::THUMBNAIL_COPY_TARGET_SIZE,
-                "f5f0c3d474566787ca1543fe168da47a655edc3f78fdceda87dc62e90fbe71bb",
-            )
-        } else {
-            (
-                0x48c83,
-                native_helper::IMAGE_COPY_CODE_SIZE,
-                0xe1a1,
-                962,
-                native_helper::SOURCE_SIZE,
-                native_helper::IMAGE_COPY_TARGET_SIZE,
-                "d6bfb24b587525c1d890152ab8fbe5dce1e62d997b150934a2dc512a96dd86a3",
-            )
-        };
-        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
-            .context("set SHIINARIO_HANAOTO_START_SCN")?;
-        let original = std::fs::read(path)?;
-        let source: Vec<_> = (0..source_size)
-            .map(|i| (i * 37 + (i / 97) * 13) as u8)
-            .collect();
-        for alignment in 0..4 {
-            // 0: normal, 1: changed code, 2: incomplete code, 3/4: short
-            // source/target, 5: overlapping buffers, 6: exact target extent.
-            for case in 0..7 {
-                let mut code = original[..helper + code_size].to_vec();
-                if case == 1 {
-                    code[helper + 50] ^= 1;
-                } else if case == 2 {
-                    code.pop();
-                }
-                let mut vm = BinaryVm::new("start.scn", code)?;
-                vm.pc = call;
-                vm.sp = sp;
-                let target_offset = 16 + alignment;
-                let target = if case == 5 {
-                    0x5000_0020
-                } else {
-                    0x6000_0000 + target_offset as u32
-                };
-                let arguments = if thumbnail {
-                    [0x5000_0010, target]
-                } else {
-                    [target, 0x5000_0010]
-                };
-                vm.banks.get_mut(&8).unwrap()[sp..sp + 2].copy_from_slice(&arguments);
-                let mut input = vec![0xa5; 16];
-                input.extend_from_slice(&source);
-                if case == 3 {
-                    input.pop();
-                } else {
-                    input.extend_from_slice(&[0xa5; 16]);
-                }
-                let extent = target_offset + target_size;
-                let output_size = match case {
-                    4 => extent - 1,
-                    6 => extent,
-                    _ => extent + 20,
-                };
-                vm.allocations.insert(0x5000_0000, input);
-                vm.allocations.insert(0x6000_0000, vec![0xa5; output_size]);
-                let allocations = vm.allocations.clone();
-                let banks = vm.banks.clone();
-                if (1..=5).contains(&case) {
-                    assert!(vm.step().is_err());
-                    assert_eq!(vm.pc, call);
-                    assert_eq!(vm.allocations, allocations);
-                } else {
-                    vm.step()?;
-                    assert_eq!(vm.pc, call + 7);
-                    let output = &vm.allocations[&0x6000_0000];
-                    assert!(output[..target_offset].iter().all(|&b| b == 0xa5));
-                    assert!(output[extent..].iter().all(|&b| b == 0xa5));
-                    let mut image = output[target_offset..extent].to_vec();
-                    if !thumbnail {
-                        image.extend_from_slice(&[0xa5; 4]);
-                    }
-                    assert_eq!(format!("{:x}", Sha256::digest(&image)), digest);
-                    assert_eq!(vm.allocations[&0x5000_0000], allocations[&0x5000_0000]);
-                }
-                assert_eq!(vm.sp, sp);
-                assert_eq!(vm.banks, banks);
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_invert_copy_preserves_tail_and_validates_ranges() -> Result<()> {
-        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
-            .context("set SHIINARIO_HANAOTO_START_SCN")?;
-        let original = std::fs::read(path)?;
-        for mode in [0, 1, 5] {
-            for in_place in [false, true] {
-                for length in [4, 12, 15] {
-                    let mut code = original[..0x48e50].to_vec();
-                    code[0..2].copy_from_slice(&0x0276u16.to_le_bytes());
-                    code[2..7].copy_from_slice(&[0x84, 0xf4, 0x8d, 4, 0]);
-                    let mut vm = BinaryVm::new("invert.scn", code)?;
-                    vm.sp = 980;
-                    let source = 0x2000_0000u32;
-                    let target = if in_place { source } else { 0x2000_0100 };
-                    vm.banks.get_mut(&8).unwrap()[980..984]
-                        .copy_from_slice(&[target, source, 12, mode]);
-                    let bytes: Vec<u8> = (0..length).collect();
-                    vm.allocations.insert(source, bytes.clone());
-                    if !in_place {
-                        vm.allocations.insert(target, vec![0xa5; 15]);
-                    }
-                    let original_memory = vm.allocations.clone();
-                    let count = if mode == 0 { 8 } else { 12 };
-                    if length < count {
-                        assert!(vm.step().is_err());
-                        assert_eq!(vm.pc, 0);
-                        assert_eq!(vm.allocations, original_memory);
-                    } else {
-                        vm.step()?;
-                        let result = &vm.allocations[&target];
-                        assert_eq!(
-                            &result[..count as usize],
-                            &(0..count).map(|b| !b).collect::<Vec<u8>>()
-                        );
-                        assert_eq!(
-                            &result[count as usize..],
-                            &original_memory[&target][count as usize..]
-                        );
-                        if !in_place {
-                            assert_eq!(vm.allocations[&source], bytes);
-                        }
-                        assert_eq!(vm.pc, 7);
-                    }
-                    assert_eq!(vm.sp, 980);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_save_xor_checks_code_and_buffers_before_writing() -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let path = std::env::var_os("SHIINARIO_HANAOTO_START_SCN")
-            .context("set SHIINARIO_HANAOTO_START_SCN")?;
-        let original = std::fs::read(path)?;
-        let source: Vec<_> = (0..native_helper::SAVE_XOR_SIZE)
-            .map(|i| (i * 37 + (i / 97) * 13) as u8)
-            .collect();
-        for (corrupt, short_buffer) in [(false, false), (true, false), (false, true)] {
-            // Recognize the helper even when it ends at the script boundary.
-            let mut code = original[..0x48a98 + native_helper::SAVE_XOR_CODE_SIZE].to_vec();
-            if corrupt {
-                code[0x48a98 + 50] ^= 1;
-            }
-            let mut vm = BinaryVm::new("start.scn", code)?;
-            vm.pc = 0x13ead;
-            vm.sp = 965;
-            vm.banks.get_mut(&8).unwrap()[965..967].copy_from_slice(&[0x8765_4321, 0x2000_0010]);
-            let mut allocation = vec![0xa5; 16];
-            allocation.extend_from_slice(&source);
-            if short_buffer {
-                allocation.pop();
-            } else {
-                allocation.extend_from_slice(&[0xa5; 16]);
-            }
-            vm.allocations.insert(0x2000_0000, allocation.clone());
-            let banks = vm.banks.clone();
-            if corrupt || short_buffer {
-                assert!(vm.step().is_err());
-                assert_eq!(vm.pc, 0x13ead);
-                assert_eq!(vm.allocations[&0x2000_0000], allocation);
-            } else {
-                vm.step()?;
-                assert_eq!(vm.pc, 0x13eb4);
-                let result = &vm.allocations[&0x2000_0000];
-                assert_eq!(&result[..16], &[0xa5; 16]);
-                assert_eq!(&result[result.len() - 16..], &[0xa5; 16]);
-                assert_eq!(
-                    format!("{:x}", Sha256::digest(&result[16..result.len() - 16])),
-                    "a09129ecc17781f702c24e0ec7cd78e44e1f5f242a93f12ff81c2430d4d8f416"
-                );
-            }
-            assert_eq!(vm.sp, 965);
-            assert_eq!(vm.banks, banks);
-        }
-        Ok(())
-    }
-
-    #[test]
-    #[ignore = "requires extracted HANAOTO start.SCN; set SHIINARIO_HANAOTO_START_SCN"]
-    fn original_hanaoto_thumbnail_uses_stack_four_as_source() -> Result<()> {
-        check_original_thumbnail(
-            "SHIINARIO_HANAOTO_START_SCN",
-            0x489b0,
-            114,
-            0x247e9,
-            8,
-            [4, 0],
-        )
-    }
-
-    fn check_original_thumbnail(
-        variable: &str,
-        helper: usize,
-        size: usize,
-        call: usize,
-        bank: u8,
-        arguments: [u16; 2],
-    ) -> Result<()> {
-        use sha2::{Digest, Sha256};
-        let path = std::env::var_os(variable).with_context(|| format!("set {variable}"))?;
-        let original = std::fs::read(path)?;
-        let source: Vec<_> = (0..native_helper::SOURCE_SIZE)
-            .map(|i| (i * 37 + (i / 97) * 13) as u8)
-            .collect();
-        for (truncate, corrupt, overlap) in [
-            (false, false, false),
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
-            let mut code = original.clone();
-            if truncate {
-                code.truncate(helper + size);
-            }
-            if corrupt {
-                code[helper + 50] ^= 1;
-            }
-            let mut vm = BinaryVm::with_version("start.SCN", code, EngineVersion::V2_48)?;
-            vm.pc = call;
-            vm.sp = 969;
-            vm.allocations.insert(0x50000000, source.clone());
-            vm.allocations
-                .insert(0x60000000, vec![0xa5; native_helper::TARGET_SIZE + 32]);
-            let source_index = vm.bank_index(bank, arguments[0])?;
-            let target_index = vm.bank_index(bank, arguments[1])?;
-            vm.banks.get_mut(&bank).unwrap()[source_index] = 0x50000000;
-            vm.banks.get_mut(&bank).unwrap()[target_index] =
-                if overlap { 0x50000010 } else { 0x60000010 };
-            let banks = vm.banks.clone();
-            let stack = vm.sp;
-            if corrupt || overlap {
-                assert!(vm.step().is_err());
-                assert_eq!(vm.pc, call);
-                assert!(vm.allocations[&0x60000000].iter().all(|&b| b == 0xa5));
-            } else {
-                vm.step()?;
-                assert_eq!(vm.pc, call + 7);
-                let output = &vm.allocations[&0x60000000];
-                assert_eq!(&output[..16], &[0xa5; 16]);
-                assert_eq!(&output[output.len() - 16..], &[0xa5; 16]);
-                assert_eq!(
-                    format!("{:x}", Sha256::digest(&output[16..output.len() - 16])),
-                    "0bb94390c77516c6feac5317cf1f3eb1c1f9f0a2be1e7bf32210ce918f38ce4a"
-                );
-            }
-            assert_eq!(vm.allocations[&0x50000000], source);
-            assert_eq!(vm.banks, banks);
-            assert_eq!(vm.sp, stack);
-        }
         Ok(())
     }
 

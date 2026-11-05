@@ -1,69 +1,7 @@
 //! Bounded replacements for the additional v2.48 interface operations.
 use super::*;
-use sha2::{Digest, Sha256};
 
 impl BinaryVm {
-    pub(super) fn effect_native_helper(
-        &self,
-        address: u32,
-    ) -> Result<Option<(MemoryRange, Vec<u8>)>> {
-        let matches = |length, digest: &str| {
-            self.memory_read(address, length)
-                .is_ok_and(|code| format!("{:x}", Sha256::digest(code)) == digest)
-        };
-        let copy = matches(
-            69,
-            "b88bd818e6b19cdbe8c5cbb3752218f325a494e6f27f0021c3e4b2a2a267ab41",
-        );
-        let copy = copy
-            || matches(
-                65,
-                "db47590e865774d818edd187d3e22ad243db2a5789f05794c1569dc2d3539074",
-            );
-        let invert = matches(
-            49,
-            "8ac6574da39cbf8f6ca928f3b4c06693a50ee8a7236fd2ba75f97568d4db5786",
-        );
-        if !copy && !invert {
-            return Ok(None);
-        }
-        let argument = |index| -> Result<u32> { Ok(self.banks[&8][self.bank_index(8, index)?]) };
-        let target = argument(0)?;
-        let words = argument(if copy { 3 } else { 1 })? as usize;
-        ensure!(
-            words > 0 && words <= 4 * 1024 * 1024,
-            "native XOR word count out of bounds"
-        );
-        let length = words * 4;
-        let range = self.memory_range(target, length)?;
-        let source = if copy { argument(4)? } else { target };
-        let input = self.memory_read(source, length)?;
-        let mask = if copy {
-            let value = argument(5)?;
-            let value = value | value.wrapping_shl(8);
-            (value | value.wrapping_shl(16)).to_le_bytes()
-        } else {
-            [255; 4]
-        };
-        let mut output = vec![0; length];
-        // The original copies forward. Earlier writes remain visible to later
-        // reads when the two validated regions overlap.
-        for word in 0..words {
-            let value: [u8; 4] = std::array::from_fn(|byte| {
-                let offset = word * 4 + byte;
-                let at = u64::from(source) + offset as u64;
-                let previous = at.checked_sub(u64::from(target));
-                let value = match previous {
-                    Some(index) if index < (word * 4) as u64 => output[index as usize],
-                    _ => input[offset],
-                };
-                value ^ mask[byte]
-            });
-            output[word * 4..word * 4 + 4].copy_from_slice(&value);
-        }
-        Ok(Some((range, output)))
-    }
-
     /// Store CP932 family names in the original 32-byte record format.
     pub fn respond_font_names(&mut self, names: &[String]) -> Result<u32> {
         ensure!(
