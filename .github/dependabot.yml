@@ -5,8 +5,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    # Bump the version requirement in Cargo.toml too, not only Cargo.lock.
-    versioning-strategy: increase
     open-pull-requests-limit: 10
     groups:
       # Compatible updates rarely need code changes; land them as one PR.
