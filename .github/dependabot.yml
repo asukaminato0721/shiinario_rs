@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Rust workspace: one Cargo.lock at the repository root covers every crate.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # Bump the version requirement in Cargo.toml too, not only Cargo.lock.
+    versioning-strategy: increase
+    open-pull-requests-limit: 10
+    groups:
+      # Compatible updates rarely need code changes; land them as one PR.
+      cargo-compatible:
+        update-types:
+          - minor
+          - patch
+    # Semver-major updates are left ungrouped so each breaking API change gets its own PR.
+
+  # Actions used by .github/workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
