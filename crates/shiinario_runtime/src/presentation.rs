@@ -5,6 +5,9 @@ use std::sync::Arc;
 use winit::{dpi::PhysicalSize, window::Window};
 
 pub struct Presentation {
+    /// Kept to recreate `surface` after `CurrentSurfaceTexture::Lost`.
+    instance: wgpu::Instance,
+    window: Arc<dyn Window>,
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -18,14 +21,16 @@ pub struct Presentation {
 impl Presentation {
     pub async fn new(window: Arc<dyn Window>, logical: [u32; 2]) -> Result<Self> {
         let size = window.surface_size();
+        let descriptor =
+            wgpu::InstanceDescriptor::new_with_display_handle(Box::new(window.clone()));
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             #[cfg(target_os = "windows")]
-            backends: wgpu::util::backend_bits_from_env().unwrap_or(wgpu::Backends::DX12),
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::DX12),
             #[cfg(not(target_os = "windows"))]
-            backends: wgpu::util::backend_bits_from_env().unwrap_or_default(),
-            ..Default::default()
+            backends: wgpu::Backends::from_env().unwrap_or_default(),
+            ..descriptor
         });
-        let surface = instance.create_surface(window)?;
+        let surface = instance.create_surface(window.clone())?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 compatible_surface: Some(&surface),
@@ -34,15 +39,13 @@ impl Presentation {
             .await
             .context("no compatible graphics adapter")?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Shiina Rio presentation"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Shiina Rio presentation"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                ..Default::default()
+            })
             .await?;
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -55,9 +58,9 @@ impl Presentation {
             .find(wgpu::TextureFormat::is_srgb)
             .context("window surface has no sRGB format")?;
         config.present_mode = wgpu::PresentMode::Fifo;
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         surface.configure(&device, &config);
-        if let Some(error) = device.pop_error_scope().await {
+        if let Some(error) = scope.pop().await {
             anyhow::bail!("configure presentation surface: {error}");
         }
         let texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -121,21 +124,21 @@ impl Presentation {
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: None,
-            bind_group_layouts: &[&layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: None,
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
-                entry_point: "vertex",
+                entry_point: Some("vertex"),
                 compilation_options: Default::default(),
                 buffers: &[],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fragment",
+                entry_point: Some("fragment"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
@@ -146,9 +149,12 @@ impl Presentation {
             primitive: Default::default(),
             depth_stencil: None,
             multisample: Default::default(),
-            multiview: None,
+            multiview_mask: None,
+            cache: None,
         });
         Ok(Self {
+            instance,
+            window,
             surface,
             device,
             queue,
@@ -187,19 +193,34 @@ impl Presentation {
             canvas.rgba.len() == canvas.width as usize * canvas.height as usize * 4,
             "invalid presentation pixels"
         );
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+        // A surface cannot be reconfigured while one of its frames is held, so a
+        // suboptimal frame is presented first and the surface reconfigured after.
+        let (frame, freshness) = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame) => (frame, Freshness::Current),
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => (frame, Freshness::Stale),
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(false);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(false),
-            Err(error) => return Err(error.into()),
+            wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface = self
+                    .instance
+                    .create_surface(self.window.clone())
+                    .context("recreate lost presentation surface")?;
+                self.surface.configure(&self.device, &self.config);
+                return Ok(false);
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(false);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                anyhow::bail!("acquire presentation surface texture: validation error")
+            }
         };
         self.queue.write_texture(
             self.texture.as_image_copy(),
             &canvas.rgba,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(canvas.width * 4),
                 rows_per_image: Some(canvas.height),
@@ -219,6 +240,7 @@ impl Presentation {
                 label: None,
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
@@ -228,6 +250,7 @@ impl Presentation {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&self.pipeline);
             pass.set_bind_group(0, &self.bind_group, &[]);
@@ -242,7 +265,17 @@ impl Presentation {
             pass.draw(0..3, 0..1);
         }
         self.queue.submit([encoder.finish()]);
-        frame.present();
+        self.queue.present(frame);
+        match freshness {
+            Freshness::Current => {}
+            Freshness::Stale => self.surface.configure(&self.device, &self.config),
+        }
         Ok(true)
     }
+}
+
+/// Whether an acquired frame still matches the surface's current properties.
+enum Freshness {
+    Current,
+    Stale,
 }
