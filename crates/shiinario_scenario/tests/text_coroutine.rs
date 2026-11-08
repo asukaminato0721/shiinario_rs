@@ -210,7 +210,7 @@ fn text_events_match_the_previous_scheduler_for_all_supported_versions() {
                 hash.update(serde_json::to_vec(&trace).unwrap());
             }
         }
-        let digest = format!("{:x}", hash.finalize());
+        let digest = base16ct::lower::encode_string(&hash.finalize());
         assert_eq!(digest, case.digest, "{}", case.name);
     }
 }

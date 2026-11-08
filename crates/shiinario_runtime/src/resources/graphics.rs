@@ -347,7 +347,7 @@ mod tests {
         // Both original branches produced this digest. Their row guards also
         // remained unchanged. Each image used its own width and row stride.
         assert_eq!(
-            format!("{:x}", Sha256::digest(&output)),
+            base16ct::lower::encode_string(&Sha256::digest(&output)),
             "74a3ec22bc9d85648181cd6f9293e34041a8bfd69734ee9d6205a1df21d7e350"
         );
         let original = resources.frame(1, 0).unwrap().surface;
@@ -408,7 +408,7 @@ mod tests {
         // Original 4440c0, with synthetic S25 method-4 rows on Linux i386.
         // The probe checked all row guards and converted native ABGR to RGBA.
         assert_eq!(
-            format!("{:x}", Sha256::digest(&pixels)),
+            base16ct::lower::encode_string(&Sha256::digest(&pixels)),
             "9bcd1ef843442ff678b70811d87e00d0fbed0b458144aaf2f4f90437e39f0298"
         );
     }

@@ -145,7 +145,7 @@ impl Session {
         for (name, data) in self.vm.scenario_buffers() {
             emit(&Event::ScenarioDigest {
                 name: name.to_owned(),
-                sha256: format!("{:x}", Sha256::digest(data)),
+                sha256: base16ct::lower::encode_string(&Sha256::digest(data)),
             })?;
         }
         Ok(())
@@ -253,7 +253,7 @@ impl Session {
                 for (name, data) in vm.scenario_buffers() {
                     emit(&Event::ScenarioDigest {
                         name: name.to_owned(),
-                        sha256: format!("{:x}", Sha256::digest(data)),
+                        sha256: base16ct::lower::encode_string(&Sha256::digest(data)),
                     })?;
                 }
                 return Err(error);
@@ -1034,7 +1034,8 @@ impl Session {
                 let memory = resources
                     .surface_memory(*id)
                     .context("draw surface missing")?;
-                let bgr_sha256 = format!("{:x}", Sha256::digest(memory.read(0, memory.len())?));
+                let bgr_sha256 =
+                    base16ct::lower::encode_string(&Sha256::digest(memory.read(0, memory.len())?));
                 emit(&Event::SurfaceDigest {
                     id: *id,
                     bgr_sha256,

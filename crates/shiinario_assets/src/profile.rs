@@ -636,7 +636,7 @@ mod tests {
         // Independent GARbro reference values for the pinned catalog. Keep these
         // expectations separate from the reader and synthetic catalog builder.
         assert_eq!(
-            format!("{:x}", Sha256::digest(BUNDLED_DATABASE)),
+            base16ct::lower::encode_string(&Sha256::digest(BUNDLED_DATABASE)),
             "54039fde222592c911536b0bd3f4d931bd580c66afd96eaefece34ea872f2982"
         );
         assert_eq!(
@@ -670,7 +670,7 @@ mod tests {
             ),
         ] {
             assert_eq!(bytes.len(), size);
-            assert_eq!(format!("{:x}", Sha256::digest(bytes)), hash);
+            assert_eq!(base16ct::lower::encode_string(&Sha256::digest(bytes)), hash);
         }
     }
 }

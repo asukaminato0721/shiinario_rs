@@ -444,17 +444,17 @@ fn main() -> Result<()> {
                 }
                 if media {
                     eprintln!(
-                        "{}\t{frames} frames\t{:x}",
+                        "{}\t{frames} frames\t{}",
                         path.file_name().unwrap().to_string_lossy(),
-                        pixels.finalize()
+                        base16ct::lower::encode_string(&pixels.finalize())
                     );
                 }
                 println!(
-                    "{}\t{} entries\t{} decoded bytes\t{:x}",
+                    "{}\t{} entries\t{} decoded bytes\t{}",
                     path.file_name().unwrap().to_string_lossy(),
                     a.entries.len(),
                     total,
-                    hash.finalize()
+                    base16ct::lower::encode_string(&hash.finalize())
                 );
             }
         }

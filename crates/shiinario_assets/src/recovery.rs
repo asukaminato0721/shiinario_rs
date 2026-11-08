@@ -1159,11 +1159,11 @@ mod tests {
                     hash.update(&data);
                 }
                 println!(
-                    "{}: {} entries, {} bytes, {:x}",
+                    "{}: {} entries, {} bytes, {}",
                     path.file_name().unwrap().to_string_lossy(),
                     actual.entries.len(),
                     total,
-                    hash.finalize()
+                    base16ct::lower::encode_string(&hash.finalize())
                 );
             }
             // Renaming the EXE must not change selection, including icon lookup.

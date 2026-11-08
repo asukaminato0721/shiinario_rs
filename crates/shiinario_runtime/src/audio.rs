@@ -431,21 +431,21 @@ impl AudioOutput {
             match format {
                 cpal::SampleFormat::F32 => build::<f32>(
                     &device,
-                    &config.clone().into(),
+                    config.config(),
                     mixer.clone(),
                     error.clone(),
                     frames.clone(),
                 ),
                 cpal::SampleFormat::I16 => build::<i16>(
                     &device,
-                    &config.clone().into(),
+                    config.config(),
                     mixer.clone(),
                     error.clone(),
                     frames.clone(),
                 ),
                 cpal::SampleFormat::U16 => build::<u16>(
                     &device,
-                    &config.clone().into(),
+                    config.config(),
                     mixer.clone(),
                     error.clone(),
                     frames.clone(),
@@ -510,13 +510,13 @@ impl AudioOutput {
 #[cfg(not(target_arch = "wasm32"))]
 fn build<T: cpal::SizedSample + cpal::FromSample<f32>>(
     device: &cpal::Device,
-    config: &cpal::StreamConfig,
+    config: cpal::StreamConfig,
     mixer: Arc<Mutex<Mixer>>,
     error: Arc<Mutex<Option<String>>>,
     frames: Arc<AtomicU64>,
 ) -> Result<cpal::Stream> {
     let channels = usize::from(config.channels);
-    let rate = config.sample_rate.0;
+    let rate = config.sample_rate;
     let callback_error = error.clone();
     Ok(device.build_output_stream(
         config,

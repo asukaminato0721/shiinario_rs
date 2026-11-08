@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 
 use crate::error::{AvError, Result};
 
-use symphonia::core::audio::{SampleBuffer, SignalSpec};
-use symphonia::core::codecs::{
-    CODEC_TYPE_MP1, CODEC_TYPE_MP2, CODEC_TYPE_MP3, CodecParameters, CodecType, Decoder,
-    DecoderOptions,
+use symphonia::core::codecs::audio::well_known::{CODEC_ID_MP1, CODEC_ID_MP2, CODEC_ID_MP3};
+use symphonia::core::codecs::audio::{
+    AudioCodecId, AudioCodecParameters, AudioDecoder, AudioDecoderOptions,
 };
-use symphonia::core::formats::Packet;
+use symphonia::core::packet::PacketRef;
+use symphonia::core::units::{Duration, Timestamp};
 
 #[derive(Clone)]
 pub struct MpaAudioChunk {
@@ -21,10 +21,8 @@ pub struct MpaAudioChunk {
 pub struct MpaAudioDecoder {
     buf: Vec<u8>,
 
-    dec: Option<Box<dyn Decoder>>,
-    dec_codec: Option<CodecType>,
-    sample_buf: Option<SampleBuffer<f32>>,
-    sample_spec: Option<SignalSpec>,
+    dec: Option<Box<dyn AudioDecoder>>,
+    dec_codec: Option<AudioCodecId>,
 
     // PES anchors belong to the first frame starting at or after their byte
     // offset. Between anchors, retain exact sample durations: rounding each
@@ -43,8 +41,6 @@ impl MpaAudioDecoder {
             buf: Vec::new(),
             dec: None,
             dec_codec: None,
-            sample_buf: None,
-            sample_spec: None,
             next_pts_ticks: None,
             pts_anchors: VecDeque::new(),
             buffer_stream_offset: 0,
@@ -117,11 +113,11 @@ impl MpaAudioDecoder {
     {
         let codec_type = header.codec_type;
         if self.dec.is_none() || self.dec_codec != Some(codec_type) {
-            let mut cp = CodecParameters::new();
+            let mut cp = AudioCodecParameters::new();
             cp.for_codec(codec_type);
 
             let dec = match symphonia::default::get_codecs()
-                .make(&cp, &DecoderOptions::default())
+                .make_audio_decoder(&cp, &AudioDecoderOptions::default())
                 .map_err(AvError::from)
             {
                 Ok(dec) => dec,
@@ -133,54 +129,36 @@ impl MpaAudioDecoder {
                     }
                     self.dec = None;
                     self.dec_codec = None;
-                    self.sample_buf = None;
-                    self.sample_spec = None;
                     self.advance_pts_after_drop(header);
                     return Ok(());
                 }
             };
             self.dec = Some(dec);
             self.dec_codec = Some(codec_type);
-            self.sample_buf = None;
-            self.sample_spec = None;
         }
 
-        let pkt = Packet::new_from_boxed_slice(
+        let pkt = PacketRef::new(
             self.track_id,
-            0,
-            0,
-            pkt_bytes.to_vec().into_boxed_slice(),
+            Timestamp::new(0),
+            Duration::new(0),
+            pkt_bytes,
         );
 
         let dec = self.dec.as_mut().expect("decoder must be initialized");
-        match dec.decode(&pkt) {
-            Ok(decoded) => {
-                let spec = *decoded.spec();
-                let duration = decoded.capacity();
-                let duration_u64 = duration as u64;
-
-                let need_new_buf = match (self.sample_buf.as_ref(), self.sample_spec.as_ref()) {
-                    (Some(sb), Some(cur_spec)) => {
-                        sb.capacity() < duration || !same_signal_spec(cur_spec, &spec)
-                    }
-                    _ => true,
-                };
-                if need_new_buf {
-                    self.sample_buf = Some(SampleBuffer::<f32>::new(duration_u64, spec));
-                    self.sample_spec = Some(spec);
-                }
-
-                let sb = self.sample_buf.as_mut().expect("sample buffer must exist");
-                sb.copy_interleaved_ref(decoded.clone());
-
-                let channels = spec.channels.count() as u16;
-                let frames = decoded.frames();
-                let valid_sample_count = frames.saturating_mul(channels as usize);
-                let all_samples = sb.samples();
-                let sample_count = valid_sample_count.min(all_samples.len());
-                let samples = all_samples[..sample_count].to_vec();
-
-                let sample_rate = spec.rate;
+        // Copy out of the decoder-owned buffer so its borrow ends before `self` is used again.
+        let decoded = dec.decode_ref(&pkt).map(|decoded| {
+            let mut samples = Vec::<f32>::new();
+            decoded.copy_to_vec_interleaved(&mut samples);
+            let spec = decoded.spec();
+            (
+                spec.rate(),
+                spec.channels().count() as u16,
+                decoded.frames(),
+                samples,
+            )
+        });
+        match decoded {
+            Ok((sample_rate, channels, frames, samples)) => {
                 if channels != 0 && sample_rate != 0 && !samples.is_empty() {
                     on_chunk(MpaAudioChunk {
                         pts_ms,
@@ -200,8 +178,6 @@ impl MpaAudioDecoder {
                 }
                 self.dec = None;
                 self.dec_codec = None;
-                self.sample_buf = None;
-                self.sample_spec = None;
                 self.advance_pts_after_drop(header);
             }
         }
@@ -233,14 +209,10 @@ impl MpaAudioDecoder {
 const TICKS_PER_SECOND: i128 = 14_112_000;
 const TICKS_PER_MILLISECOND: i128 = TICKS_PER_SECOND / 1000;
 
-fn same_signal_spec(a: &SignalSpec, b: &SignalSpec) -> bool {
-    a.rate == b.rate && a.channels == b.channels
-}
-
 #[derive(Clone, Copy)]
 struct MpaHeader {
     frame_len: usize,
-    codec_type: CodecType,
+    codec_type: AudioCodecId,
     sample_rate: u32,
     samples_per_frame: u32,
     channels: u16,
@@ -353,7 +325,7 @@ impl MpaHeader {
                 };
                 let fl =
                     (((12u64 * (br as u64) * 1000u64) / (sr as u64)) + (padding as u64)) * 4u64;
-                (CODEC_TYPE_MP1, br, fl as usize, 384)
+                (CODEC_ID_MP1, br, fl as usize, 384)
             }
             0x02 => {
                 // Layer II
@@ -363,7 +335,7 @@ impl MpaHeader {
                     BITRATES_V2_L2L3[bitrate_idx as usize]
                 };
                 let fl = ((144u64 * (br as u64) * 1000u64) / (sr as u64)) + (padding as u64);
-                (CODEC_TYPE_MP2, br, fl as usize, 1152)
+                (CODEC_ID_MP2, br, fl as usize, 1152)
             }
             0x01 => {
                 // Layer III
@@ -375,7 +347,7 @@ impl MpaHeader {
                 let coeff: u64 = if is_v1 { 144 } else { 72 };
                 let fl = ((coeff * (br as u64) * 1000u64) / (sr as u64)) + (padding as u64);
                 (
-                    CODEC_TYPE_MP3,
+                    CODEC_ID_MP3,
                     br,
                     fl as usize,
                     if is_v1 { 1152 } else { 576 },

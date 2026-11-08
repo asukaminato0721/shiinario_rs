@@ -370,7 +370,7 @@ mod tests {
             data[2] = 255;
             extra.decrypt(&mut data, post).unwrap();
             assert_eq!(
-                format!("{:x}", Sha256::digest(&data)),
+                base16ct::lower::encode_string(&Sha256::digest(&data)),
                 fields[3],
                 "{kind:?} length={length} post={post}"
             );

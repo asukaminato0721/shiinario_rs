@@ -779,7 +779,7 @@ mod tests {
         }
         // Original 4336e6 and 431d60 executed for all eight cases.
         assert_eq!(
-            format!("{:x}", digest.finalize()),
+            base16ct::lower::encode_string(&digest.finalize()),
             "903d19c2ce20075b455338e11a529a5e67eb13bf38c600d32487e920547e2ffe"
         );
         for source in [b"+257bad/".as_slice(), b"+-1bad/", b"+{1}bad/"] {

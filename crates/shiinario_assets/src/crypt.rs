@@ -403,7 +403,7 @@ mod tests {
             let mut data: Vec<_> = (0..length).map(|i| (i * 37 + 11) as u8).collect();
             decrypt(&crate::profile::oracle_profile(scheme), version, &mut data).unwrap();
             assert_eq!(
-                format!("{:x}", Sha256::digest(&data)),
+                base16ct::lower::encode_string(&Sha256::digest(&data)),
                 fields[3],
                 "WARC={version} scheme={scheme} length={length}"
             );

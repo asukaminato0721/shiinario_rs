@@ -16,25 +16,26 @@ shiinario_scenario.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+base16ct.workspace = true
 libc = "0.2"
 ab_glyph = "0.2.32"
 encoding_rs.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-cpal = "0.15.3"
+cpal = "0.18.2"
 wgpu = "30"
-winit = "=0.31.0-beta.3"
-pollster = "0.3"
+winit = "=0.31.0-beta.4"
+pollster = "1"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-fontdb = { version = "0.23", default-features = false, features = ["fs"] }
+fontdb = { version = "0.24", default-features = false, features = ["fs"] }
 wgpu = { version = "30", features = ["angle"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 gilrs-core = "0.6.8"
 
 [target.'cfg(target_os = "android")'.dependencies]
-winit = { version = "=0.31.0-beta.3", features = ["android-native-activity"] }
+winit = { version = "=0.31.0-beta.4", features = ["android-native-activity"] }
 android_logger = "0.15"
 log = "0.4"
 
@@ -45,4 +46,4 @@ console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 flate2.workspace = true
-fontdb = { version = "0.23", default-features = false, features = ["fs"] }
+fontdb = { version = "0.24", default-features = false, features = ["fs"] }
