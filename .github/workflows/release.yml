@@ -40,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +98,7 @@ jobs:
           ) -DestinationPath "dist/$env:ARTIFACT_NAME.zip"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shiinario-${{ matrix.name }}
           path: dist/*
@@ -109,7 +109,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build FreeBSD artifact
         uses: vmactions/freebsd-vm@v1
@@ -135,7 +135,7 @@ jobs:
               shiinario_engine shiinario_tool
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shiinario-freebsd-x86_64
           path: dist/shiinario-freebsd-x86_64.tar.gz
@@ -146,7 +146,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Rust (stable)
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -156,19 +156,19 @@ jobs:
         with:
           key: wasm
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22"
       - name: Test browser filesystem
         run: node --test platform/wasm/vfs.test.mjs
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Build browser package
         run: ./platform/scripts/build_wasm.sh
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shiinario-wasm
           path: dist/wasm/shiinario-wasm.zip
@@ -179,9 +179,9 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: "17"
@@ -194,9 +194,9 @@ jobs:
         with:
           key: android
       - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: platform-tools
       - name: Install Android components
@@ -207,7 +207,7 @@ jobs:
           VARIANT: debug
         run: ./platform/scripts/package_android_apk.sh
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: shiinario-android
           path: dist/android/shiinario-android-debug.apk
@@ -225,7 +225,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Read workspace version
         id: version
@@ -239,7 +239,7 @@ jobs:
           PY
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: shiinario-*
           path: dist
