@@ -1,6 +1,6 @@
 name: Autofix
 
-# Apply `cargo clippy --fix` and `cargo fmt`, then commit the result directly to master.
+# Apply `cargo clippy --fix` and `cargo fmt`, then open (or refresh) one PR against master.
 on:
   schedule:
     - cron: "0 3 * * 1" # Mondays 03:00 UTC
@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: autofix
@@ -59,13 +60,15 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all
 
-      - name: Commit and push to master
-        run: |
-          if git diff --quiet; then
-            echo "Nothing to fix."
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -am "autofix: cargo clippy --fix + cargo fmt"
-            git push origin HEAD:master
-          fi
+      - name: Open pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          base: master
+          branch: autofix/clippy-fmt
+          delete-branch: true
+          commit-message: "autofix: cargo clippy --fix + cargo fmt"
+          title: "autofix: cargo clippy --fix + cargo fmt"
+          body: |
+            Automated run of `cargo clippy --fix --workspace --all-targets` followed by `cargo fmt --all`.
+
+            Clippy fixes were applied for the Linux host target only.
