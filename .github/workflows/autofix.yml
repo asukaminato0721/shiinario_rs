@@ -1,0 +1,71 @@
+name: Autofix
+
+# Apply `cargo clippy --fix` and `cargo fmt`, then commit the result directly to master.
+on:
+  schedule:
+    - cron: "0 3 * * 1" # Mondays 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: autofix
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  autofix:
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: master
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: autofix
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            libasound2-dev \
+            libudev-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxi-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcb1-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            libvulkan-dev
+
+      # Clippy first: its rewrites are not guaranteed to be rustfmt-clean.
+      - name: cargo clippy --fix
+        run: cargo clippy --fix --allow-dirty --locked --workspace --all-targets
+
+      - name: cargo fmt
+        run: cargo fmt --all
+
+      - name: Commit and push to master
+        run: |
+          if git diff --quiet; then
+            echo "Nothing to fix."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "autofix: cargo clippy --fix + cargo fmt"
+            git push origin HEAD:master
+          fi
