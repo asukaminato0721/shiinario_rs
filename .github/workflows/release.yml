@@ -20,7 +20,7 @@ jobs:
       matrix:
         include:
           - name: linux-x86_64
-            os: ubuntu-26.04
+            os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
           - name: linux-aarch64
             os: ubuntu-26.04-arm
@@ -106,7 +106,7 @@ jobs:
 
   freebsd:
     name: freebsd-x86_64
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -143,7 +143,7 @@ jobs:
 
   wasm:
     name: wasm
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -176,7 +176,7 @@ jobs:
 
   android:
     name: android (arm64 + x86_64)
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7

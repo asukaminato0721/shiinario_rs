@@ -19,7 +19,7 @@ env:
 
 jobs:
   autofix:
-    runs-on: ubuntu-26.04
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v7
